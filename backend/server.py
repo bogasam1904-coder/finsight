@@ -141,7 +141,7 @@ async def analyze(file: UploadFile = File(...), user=Depends(get_current_user)):
             raise ValueError("Gemini API key not configured")
 
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash-001")
 
         if file_type == "pdf":
             try:
