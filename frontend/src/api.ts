@@ -10,7 +10,7 @@ export async function apiFetch(path: string, options: RequestInit = {}): Promise
     ...(options.headers as Record<string, string>),
   };
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  return fetch(`${BASE_URL}/api${path}`, { ...options, headers, credentials: 'include' });
+  return fetch(`${BASE_URL}/api${path}`, { ...options, headers });
 }
 
 export async function saveToken(token: string) {
