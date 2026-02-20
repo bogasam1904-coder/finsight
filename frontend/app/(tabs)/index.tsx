@@ -35,7 +35,7 @@ export default function HomeScreen() {
     } catch (e) { Alert.alert("Error", "Failed to pick document"); }
   };
 
-  const handlePickImage = async () => {
+  const handlePickImage = async () => { 
     try {
       const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], quality: 0.8 });
       if (!result.canceled && result.assets?.[0]) {
@@ -61,7 +61,7 @@ export default function HomeScreen() {
       const response = await fetch(`${BASE_URL}/api/analyze`, {
         method: "POST", body: formData,
         headers: token ? { Authorization: `Bearer ${token}` } : {},
-        credentials: "include",
+        
       });
 
       if (!response.ok) { const err = await response.json().catch(() => ({ detail: "Upload failed" })); throw new Error(err.detail || "Upload failed"); }
