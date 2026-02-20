@@ -6,11 +6,11 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional, Any
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
+from fastapi.responses import Response, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 import motor.motor_asyncio
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -18,36 +18,36 @@ import google.generativeai as genai
 import pypdf
 import io
 
-# — Config ————————————————————————————————————————
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MONGO_URL       = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 JWT_SECRET      = os.getenv("JWT_SECRET", "change-me-in-production")
 JWT_ALGORITHM   = "HS256"
-JWT_EXPIRE_MIN  = 60 * 24 * 7   # 7 days
+JWT_EXPIRE_MIN  = 60 * 24 * 7
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-
-# — App & DB ——————————————————————————————————————
 
 app = FastAPI(title="FinSight - Financial Analyzer", version="1.0.0")
 
-# CORS - allow all origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, Origin, X-Requested-With"
+        response.headers["Access-Control-Max-Age"] = "3600"
+        return response
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, Origin, X-Requested-With"
+    return response
 
 client       = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db           = client.finsight
 users_col    = db.users
 analyses_col = db.analyses
-
-# — Auth helpers ——————————————————————————————————
 
 pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
@@ -77,8 +77,6 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# — Models ————————————————————————————————————————
-
 class RegisterRequest(BaseModel):
     name: str
     email: str
@@ -87,8 +85,6 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
-
-# — Routes ————————————————————————————————————————
 
 @app.get("/api/health")
 async def health():
@@ -152,39 +148,24 @@ async def analyze(file: UploadFile = File(...), user=Depends(get_current_user)):
                 reader = pypdf.PdfReader(io.BytesIO(content))
                 text = "\n".join(page.extract_text() or "" for page in reader.pages)
                 if not text.strip():
-                    raise ValueError("No text extracted from PDF")
-                prompt = f"""Analyze this financial statement and return ONLY valid JSON with this exact structure:
-{{
-  "company_name": "string",
-  "statement_type": "income_statement|balance_sheet|cash_flow|other",
-  "period": "string",
-  "currency": "string",
-  "summary": "2-3 sentence summary",
-  "health_score": 75,
-  "health_label": "Good|Excellent|Fair|Poor|Critical",
-  "key_metrics": [{{"label": "Revenue", "value": "$1M", "change": "+10%", "trend": "up"}}],
-  "highlights": ["positive point 1", "positive point 2"],
-  "risks": ["risk 1", "risk 2"]
-}}
+                    raise ValueError("No text extracted")
+                prompt = f"""Analyze this financial statement and return ONLY valid JSON:
+{{"company_name": "string", "statement_type": "income_statement", "period": "string", "currency": "USD", "summary": "2-3 sentence summary", "health_score": 75, "health_label": "Good", "key_metrics": [{{"label": "Revenue", "value": "$1M", "change": "+10%", "trend": "up"}}], "highlights": ["point 1"], "risks": ["risk 1"]}}
 
-Financial statement text:
-{text[:8000]}"""
+Text: {text[:6000]}"""
                 response = model.generate_content(prompt)
-            except Exception as e:
+            except Exception:
                 b64 = base64.b64encode(content).decode()
-                prompt = """Analyze this financial document image and return ONLY valid JSON with this exact structure:
-{"company_name": "string", "statement_type": "income_statement", "period": "string", "currency": "USD", "summary": "string", "health_score": 70, "health_label": "Good", "key_metrics": [{"label": "Revenue", "value": "N/A", "change": "N/A", "trend": "neutral"}], "highlights": ["See document for details"], "risks": ["Manual review recommended"]}"""
-                img_part = {"mime_type": file.content_type or "image/jpeg", "data": b64}
+                prompt = 'Analyze this financial document and return ONLY valid JSON: {"company_name": "Unknown", "statement_type": "income_statement", "period": "Unknown", "currency": "USD", "summary": "Financial document analyzed.", "health_score": 70, "health_label": "Good", "key_metrics": [{"label": "N/A", "value": "N/A", "change": "N/A", "trend": "neutral"}], "highlights": ["Document processed"], "risks": ["Manual review recommended"]}'
+                img_part = {"mime_type": "application/pdf", "data": b64}
                 response = model.generate_content([prompt, img_part])
         else:
             b64 = base64.b64encode(content).decode()
-            prompt = """Analyze this financial statement image and return ONLY valid JSON:
-{"company_name": "string", "statement_type": "income_statement", "period": "string", "currency": "USD", "summary": "Brief summary of the financial statement", "health_score": 70, "health_label": "Good", "key_metrics": [{"label": "Key Metric", "value": "Value", "change": "N/A", "trend": "neutral"}], "highlights": ["Highlight 1"], "risks": ["Risk 1"]}"""
+            prompt = 'Analyze this financial statement image and return ONLY valid JSON: {"company_name": "string", "statement_type": "income_statement", "period": "string", "currency": "USD", "summary": "Brief summary", "health_score": 70, "health_label": "Good", "key_metrics": [{"label": "Key Metric", "value": "Value", "change": "N/A", "trend": "neutral"}], "highlights": ["Highlight 1"], "risks": ["Risk 1"]}'
             img_part = {"mime_type": file.content_type or "image/jpeg", "data": b64}
             response = model.generate_content([prompt, img_part])
 
-        raw = response.text.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
+        raw = response.text.strip().replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
 
         await analyses_col.update_one(
