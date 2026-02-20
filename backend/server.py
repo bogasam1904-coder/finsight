@@ -137,44 +137,89 @@ async def analyze(file: UploadFile = File(...), user=Depends(get_current_user)):
 
         groq_client = Groq(api_key=GROQ_API_KEY)
 
-        # Extract text from PDF
         if file_type == "pdf":
             reader = pypdf.PdfReader(io.BytesIO(content))
             text = "\n".join(page.extract_text() or "" for page in reader.pages)
         else:
-            # For images, convert to base64 and use as text description
-            text = f"[Image file: {filename}. Please analyze based on the filename and provide a general financial analysis template.]"
+            text = f"[Image file: {filename}]"
 
-        prompt = f"""You are a financial analyst. Analyze this financial statement and return ONLY valid JSON with no other text.
+        prompt = f"""You are a senior financial analyst at a top investment bank. Analyze this financial statement in depth and return ONLY valid JSON with no other text, no markdown, no explanation.
 
-Return exactly this JSON structure:
+Return exactly this JSON structure with as much detail as possible from the document:
 {{
-  "company_name": "Company name or Unknown",
-  "statement_type": "income_statement",
-  "period": "Period covered",
-  "currency": "Currency used",
-  "summary": "2-3 sentence summary of financial health",
+  "company_name": "Exact company name",
+  "statement_type": "income_statement or balance_sheet or cash_flow or annual_report",
+  "period": "Exact period e.g. Q3 FY2024 or FY2023-24",
+  "currency": "Currency e.g. INR or USD",
+  "summary": "3-4 sentence executive summary covering overall financial health, key trends, and outlook",
   "health_score": 75,
   "health_label": "Good",
   "key_metrics": [
-    {{"label": "Revenue", "value": "$1M", "change": "+10%", "trend": "up"}},
-    {{"label": "Net Profit", "value": "$100K", "change": "+5%", "trend": "up"}},
-    {{"label": "Operating Margin", "value": "10%", "change": "+1%", "trend": "up"}}
+    {{"label": "Revenue", "value": "exact value", "change": "% change if available", "trend": "up or down or neutral"}},
+    {{"label": "Net Profit", "value": "exact value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Operating Profit (EBIT)", "value": "exact value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "EBITDA", "value": "exact value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Gross Margin", "value": "% value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Net Profit Margin", "value": "% value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Operating Margin", "value": "% value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "EPS", "value": "exact value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Total Assets", "value": "exact value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Total Debt", "value": "exact value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Cash & Equivalents", "value": "exact value", "change": "% change", "trend": "up or down or neutral"}},
+    {{"label": "Return on Equity (ROE)", "value": "% value", "change": "% change", "trend": "up or down or neutral"}}
   ],
-  "highlights": ["Positive point 1", "Positive point 2", "Positive point 3"],
-  "risks": ["Risk 1", "Risk 2"]
+  "profitability": {{
+    "analysis": "2-3 sentences on profitability trends, margins, and comparison to industry norms",
+    "gross_margin": "value",
+    "net_margin": "value",
+    "operating_margin": "value",
+    "roe": "value",
+    "roa": "value"
+  }},
+  "growth": {{
+    "analysis": "2-3 sentences on revenue growth, profit growth, and future growth prospects",
+    "revenue_growth": "% value",
+    "profit_growth": "% value",
+    "yoy_comparison": "Brief year-over-year comparison"
+  }},
+  "liquidity": {{
+    "analysis": "2-3 sentences on liquidity position, ability to meet short-term obligations",
+    "current_ratio": "value or N/A",
+    "quick_ratio": "value or N/A",
+    "cash_position": "value"
+  }},
+  "debt": {{
+    "analysis": "2-3 sentences on debt levels, debt-to-equity, interest coverage",
+    "debt_to_equity": "value or N/A",
+    "interest_coverage": "value or N/A",
+    "total_debt": "value"
+  }},
+  "highlights": [
+    "Specific positive point 1 with actual numbers",
+    "Specific positive point 2 with actual numbers",
+    "Specific positive point 3 with actual numbers",
+    "Specific positive point 4 with actual numbers"
+  ],
+  "risks": [
+    "Specific risk 1 with context",
+    "Specific risk 2 with context",
+    "Specific risk 3 with context"
+  ],
+  "investor_verdict": "2-3 sentence plain English verdict for a non-finance person explaining whether this company looks financially strong or weak and why",
+  "segments": []
 }}
 
+Only include metrics that are actually present in the document. Use "N/A" for missing values.
 Health score guide: 90-100=Excellent, 75-89=Good, 60-74=Fair, 40-59=Poor, 0-39=Critical
 
 Financial statement:
-{text[:6000]}"""
+{text[:8000]}"""
 
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=2000
         )
 
         raw = response.choices[0].message.content.strip()
