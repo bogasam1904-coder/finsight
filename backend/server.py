@@ -23,6 +23,7 @@ JWT_SECRET     = os.getenv("JWT_SECRET", "change-me")
 JWT_ALGORITHM  = "HS256"
 JWT_EXPIRE_MIN = 60 * 24 * 7
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 app = FastAPI(title="FinSight")
 
@@ -82,6 +83,215 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+def extract_text_from_pdf(content: bytes) -> str:
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        pages_text = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages_text.append(text)
+        return "\n".join(pages_text)
+    except Exception as e:
+        logger.error(f"PDF extraction error: {e}")
+        return ""
+
+def build_prompt(text: str) -> str:
+    return f"""You are a world-class senior financial analyst and CFA charterholder with 20+ years experience. Analyze this financial document comprehensively and return ONLY valid JSON — no markdown, no extra text.
+
+CRITICAL: The health_score_breakdown must show SPECIFIC numbers and reasons from the actual document — not generic placeholders. Each factor must reference actual data found in the document.
+
+Return this exact JSON structure:
+
+{{
+  "company_name": "Full company name",
+  "statement_type": "Annual Report / Quarterly Results / Income Statement / Balance Sheet",
+  "period": "Exact period e.g. Q3 FY2024, FY2023-24",
+  "currency": "Currency with unit e.g. INR Crores, USD Millions",
+  "health_score": 75,
+  "health_label": "Excellent / Good / Fair / Poor / Critical",
+  "health_score_breakdown": {{
+    "total": 75,
+    "components": [
+      {{
+        "category": "Profitability",
+        "weight": 30,
+        "score": 22,
+        "max": 30,
+        "rating": "Strong / Moderate / Weak",
+        "reasoning": "Specific reasoning with actual numbers e.g. Net margin of 18.4% is strong, up from 16.2% last year. EBITDA margin at 24% indicates efficient cost management. ROE of 22% exceeds industry average of 15%."
+      }},
+      {{
+        "category": "Revenue Growth",
+        "weight": 25,
+        "score": 18,
+        "max": 25,
+        "rating": "Strong / Moderate / Weak",
+        "reasoning": "Specific reasoning with actual numbers e.g. Revenue grew 14.2% YoY to ₹4,250 Cr. Growth is broad-based across segments. However, Q3 growth of 8% shows slight deceleration from Q2's 16%."
+      }},
+      {{
+        "category": "Debt & Leverage",
+        "weight": 20,
+        "score": 14,
+        "max": 20,
+        "rating": "Strong / Moderate / Weak",
+        "reasoning": "Specific reasoning e.g. Debt-to-equity at 0.4x is conservative. Net debt reduced by ₹320 Cr this quarter. Interest coverage of 8.2x provides comfortable buffer. Company is actively deleveraging."
+      }},
+      {{
+        "category": "Liquidity",
+        "weight": 15,
+        "score": 12,
+        "max": 15,
+        "rating": "Strong / Moderate / Weak",
+        "reasoning": "Specific reasoning e.g. Current ratio of 2.1x is healthy. Cash and equivalents of ₹1,240 Cr is sufficient for 6 months operations. Strong operating cash flow of ₹680 Cr this year."
+      }},
+      {{
+        "category": "Management & Outlook",
+        "weight": 10,
+        "score": 9,
+        "max": 10,
+        "rating": "Strong / Moderate / Weak",
+        "reasoning": "Specific reasoning e.g. Management tone is confident with specific growth guidance of 15-18% for next year. New capacity expansion announced. Order book at all-time high of ₹8,500 Cr."
+      }}
+    ]
+  }},
+  "executive_summary": "5-6 sentence comprehensive summary: what company does, overall performance this period, key wins, key concerns, what numbers mean for future",
+  "investor_verdict": "3-4 sentence plain English for non-finance person: is company doing well or not, 2-3 most important things to know, what to watch",
+  "key_metrics": [
+    {{"label": "Revenue / Total Income", "current": "value", "previous": "value", "change": "+X% YoY", "trend": "up/down/neutral", "comment": "one line context with actual driver"}},
+    {{"label": "Net Profit / PAT", "current": "value", "previous": "value", "change": "+X%", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "EBITDA", "current": "value", "previous": "value", "change": "+X%", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "EBITDA Margin", "current": "X%", "previous": "X%", "change": "+X bps", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Gross Margin", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Net Profit Margin", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "EPS (Basic)", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Total Assets", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Total Debt", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Cash & Equivalents", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "ROE", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "ROCE", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Debt to Equity", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Interest Coverage", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
+    {{"label": "Operating Cash Flow", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}}
+  ],
+  "profitability": {{
+    "analysis": "3-4 sentences on margin trends with specific numbers, cost structure, comparison to previous period",
+    "gross_margin_current": "X%",
+    "gross_margin_previous": "X%",
+    "net_margin_current": "X%",
+    "net_margin_previous": "X%",
+    "ebitda_margin_current": "X%",
+    "ebitda_margin_previous": "X%",
+    "roe": "X%",
+    "roa": "X%",
+    "key_cost_drivers": ["Specific cost item 1 with actual impact e.g. Raw material costs fell 3% reducing COGS by ₹120 Cr", "Cost item 2"]
+  }},
+  "growth": {{
+    "analysis": "3-4 sentences on revenue/profit growth with specific numbers, which segments/geographies drove it, deceleration or acceleration",
+    "revenue_growth_yoy": "X%",
+    "profit_growth_yoy": "X%",
+    "volume_growth": "X% or N/A",
+    "price_realization": "context or N/A",
+    "guidance": "Exact guidance from management if mentioned"
+  }},
+  "liquidity": {{
+    "analysis": "2-3 sentences on liquidity with specific numbers",
+    "current_ratio": "value or N/A",
+    "quick_ratio": "value or N/A",
+    "cash_position": "value",
+    "operating_cash_flow": "value or N/A",
+    "free_cash_flow": "value or N/A"
+  }},
+  "debt": {{
+    "analysis": "2-3 sentences on debt with specific numbers and trend",
+    "total_debt": "value",
+    "debt_to_equity": "value or N/A",
+    "interest_coverage": "value or N/A",
+    "net_debt": "value or N/A",
+    "debt_trend": "Increasing / Decreasing / Stable"
+  }},
+  "management_commentary": {{
+    "overall_tone": "Positive / Cautious / Neutral / Concerned",
+    "key_points": ["Specific verbatim or paraphrased point from management 1", "Point 2", "Point 3", "Point 4", "Point 5"],
+    "outlook_statement": "What management said about future performance",
+    "concerns_raised": ["Specific concern management acknowledged 1", "Concern 2"]
+  }},
+  "segments": [
+    {{"name": "Segment name", "revenue": "value", "growth": "X%", "margin": "X%", "comment": "key observation"}}
+  ],
+  "highlights": [
+    "Specific strength with exact numbers e.g. Revenue grew 18% YoY to ₹4,250 Cr driven by North India expansion",
+    "Strength 2 with numbers",
+    "Strength 3",
+    "Strength 4",
+    "Strength 5"
+  ],
+  "risks": [
+    "Specific risk with context and potential impact",
+    "Risk 2",
+    "Risk 3",
+    "Risk 4"
+  ],
+  "what_to_watch": [
+    "Forward looking item 1 e.g. Watch margin recovery in Q4 as management guided 50-100 bps improvement",
+    "Item 2",
+    "Item 3"
+  ],
+  "chart_data": {{
+    "revenue_trend": [
+      {{"period": "Q1", "value": 0}},
+      {{"period": "Q2", "value": 0}},
+      {{"period": "Q3", "value": 0}},
+      {{"period": "Q4", "value": 0}}
+    ],
+    "margin_trend": [
+      {{"period": "Q1", "gross": 0, "net": 0, "ebitda": 0}},
+      {{"period": "Q2", "gross": 0, "net": 0, "ebitda": 0}},
+      {{"period": "Q3", "gross": 0, "net": 0, "ebitda": 0}},
+      {{"period": "Q4", "gross": 0, "net": 0, "ebitda": 0}}
+    ]
+  }}
+}}
+
+Rules:
+- Use ONLY actual data from the document. Never invent numbers.
+- health_score_breakdown reasoning MUST reference specific numbers from the document.
+- Use "N/A" only when genuinely not present.
+- For chart_data: fill in actual quarterly/yearly values if available, otherwise leave as 0.
+- Include ALL segment data if present in document.
+- Score components must add up to health_score total.
+
+Document:
+{text[:10000]}"""
+
+async def analyze_with_groq(text: str) -> dict:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": build_prompt(text)}],
+        temperature=0.1,
+        max_tokens=3500
+    )
+    raw = response.choices[0].message.content.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    start = raw.find('{')
+    end = raw.rfind('}') + 1
+    if start != -1 and end > start:
+        raw = raw[start:end]
+    return json.loads(raw)
+
+async def analyze_with_gemini(text: str) -> dict:
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(build_prompt(text))
+    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+    start = raw.find('{')
+    end = raw.rfind('}') + 1
+    if start != -1 and end > start:
+        raw = raw[start:end]
+    return json.loads(raw)
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
@@ -114,31 +324,15 @@ async def login(req: LoginRequest):
 async def me(user=Depends(get_current_user)):
     return {"user_id": user["user_id"], "name": user["name"], "email": user["email"]}
 
-def extract_text_from_pdf(content: bytes) -> str:
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(content))
-        pages_text = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                pages_text.append(text)
-        return "\n".join(pages_text)
-    except Exception as e:
-        logger.error(f"PDF extraction error: {e}")
-        return ""
-
-def encode_image(content: bytes) -> str:
-    return base64.b64encode(content).decode("utf-8")
-
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...), user=Depends(get_current_user)):
     content = await file.read()
     filename = file.filename or "upload"
     filename_lower = filename.lower()
-    
+
     if filename_lower.endswith(".pdf"):
         file_type = "pdf"
-    elif filename_lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+    elif filename_lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
         file_type = "image"
     else:
         file_type = "pdf"
@@ -155,160 +349,41 @@ async def analyze(file: UploadFile = File(...), user=Depends(get_current_user)):
     })
 
     try:
-        if not GROQ_API_KEY:
-            raise ValueError("Groq API key not configured")
-
-        groq_client = Groq(api_key=GROQ_API_KEY)
-
-        # Extract text
         if file_type == "pdf":
             text = extract_text_from_pdf(content)
             if not text.strip():
-                text = "Unable to extract text from PDF. Please ensure the PDF is not scanned/image-based."
+                text = "Unable to extract text from this PDF."
         else:
-            # For images, use vision model via base64
-            text = f"[Image file uploaded: {filename}. Analyze as a financial document image.]"
+            text = f"[Image file: {filename}. Analyze as financial document.]"
 
-        prompt = f"""You are a world-class senior financial analyst and CFA charterholder with 20+ years of experience analyzing company results, annual reports, and financial statements. Your job is to produce a comprehensive, insightful analysis that allows ANY reader — investor, student, business owner — to fully understand the company's financial position WITHOUT reading the original document.
+        result = None
+        ai_used = None
 
-Analyze the entire document including:
-- All financial statements (P&L, Balance Sheet, Cash Flow)
-- Management commentary and MD&A sections
-- Business segment performance
-- Outlook and guidance statements
-- Any auditor remarks or notes
-- Comparison figures (current vs previous period)
+        # Try Groq first
+        if GROQ_API_KEY:
+            try:
+                logger.info("Attempting analysis with Groq...")
+                result = await analyze_with_groq(text)
+                ai_used = "groq"
+                logger.info("Groq analysis successful")
+            except Exception as e:
+                logger.warning(f"Groq failed: {e}. Falling back to Gemini...")
 
-Return ONLY valid JSON — no markdown, no extra text. Use this exact structure:
+        # Fallback to Gemini
+        if result is None and GEMINI_API_KEY:
+            try:
+                logger.info("Attempting analysis with Gemini...")
+                result = await analyze_with_gemini(text)
+                ai_used = "gemini"
+                logger.info("Gemini analysis successful")
+            except Exception as e:
+                logger.error(f"Gemini also failed: {e}")
+                raise Exception("Both AI providers failed. Please try again later.")
 
-{{
-  "company_name": "Full company name",
-  "statement_type": "Type: Annual Report / Quarterly Results / Income Statement / Balance Sheet etc",
-  "period": "Exact period e.g. Q3 FY2024, FY2023-24, Year ended March 31 2024",
-  "currency": "Currency with unit e.g. INR Crores, USD Millions",
-  "health_score": 75,
-  "health_score_derivation": "Explain exactly how this score was calculated — which metrics drove it up or down, what weightage was given e.g. Revenue growth +5pts, Margin compression -3pts, Strong cash flow +4pts, High debt -6pts etc",
-  "health_label": "Excellent / Good / Fair / Poor / Critical",
-  "executive_summary": "5-6 sentence comprehensive summary covering: what the company does, overall financial performance this period, key wins, key concerns, and what the numbers mean for the company's future",
-  "investor_verdict": "3-4 sentence plain English verdict written for someone with no finance background. Should clearly state: is this company doing well or not, what are the 2-3 most important things to know, and what should someone watching this company look out for next",
-  "key_metrics": [
-    {{"label": "Revenue / Total Income", "current": "value with unit", "previous": "value with unit", "change": "+X% YoY", "trend": "up/down/neutral", "comment": "1 line context e.g. Driven by strong volume growth in North India"}},
-    {{"label": "Net Profit / PAT", "current": "value", "previous": "value", "change": "+X%", "trend": "up/down/neutral", "comment": "1 line context"}},
-    {{"label": "EBITDA", "current": "value", "previous": "value", "change": "+X%", "trend": "up/down/neutral", "comment": "1 line context"}},
-    {{"label": "EBITDA Margin", "current": "X%", "previous": "X%", "change": "+X bps", "trend": "up/down/neutral", "comment": "1 line context"}},
-    {{"label": "Gross Margin", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Net Profit Margin", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Operating Profit (EBIT)", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "EPS (Basic)", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Total Assets", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Total Debt / Borrowings", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Cash & Cash Equivalents", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Return on Equity (ROE)", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Return on Capital Employed (ROCE)", "current": "X%", "previous": "X%", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Debt to Equity Ratio", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Interest Coverage Ratio", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}}
-  ],
-  "profitability": {{
-    "analysis": "3-4 sentences covering margin trends, what drove profitability changes, cost structure, and comparison to previous period with specific numbers",
-    "gross_margin_current": "X%",
-    "gross_margin_previous": "X%",
-    "net_margin_current": "X%",
-    "net_margin_previous": "X%",
-    "ebitda_margin_current": "X%",
-    "ebitda_margin_previous": "X%",
-    "roe": "X%",
-    "roa": "X%",
-    "key_cost_drivers": ["Cost item 1 with impact", "Cost item 2 with impact"]
-  }},
-  "growth": {{
-    "analysis": "3-4 sentences on revenue and profit growth, what segments or geographies drove it, and management's guidance for future growth",
-    "revenue_growth_yoy": "X%",
-    "profit_growth_yoy": "X%",
-    "volume_growth": "X% or N/A",
-    "price_realization": "context or N/A",
-    "guidance": "Management guidance if mentioned, else N/A"
-  }},
-  "liquidity": {{
-    "analysis": "2-3 sentences on company's ability to meet short-term obligations, working capital situation, and cash generation",
-    "current_ratio": "value or N/A",
-    "quick_ratio": "value or N/A",
-    "cash_position": "value",
-    "operating_cash_flow": "value or N/A",
-    "free_cash_flow": "value or N/A"
-  }},
-  "debt": {{
-    "analysis": "2-3 sentences on debt levels, whether debt increased or decreased, interest burden, and whether debt is manageable",
-    "total_debt": "value",
-    "debt_to_equity": "value or N/A",
-    "interest_coverage": "value or N/A",
-    "net_debt": "value or N/A",
-    "debt_trend": "Increasing / Decreasing / Stable"
-  }},
-  "management_commentary": {{
-    "overall_tone": "Positive / Cautious / Neutral / Concerned",
-    "key_points": [
-      "Specific point from MD&A or management commentary 1",
-      "Specific point 2",
-      "Specific point 3",
-      "Specific point 4",
-      "Specific point 5"
-    ],
-    "outlook_statement": "What management said about future performance, guidance, or strategic priorities",
-    "concerns_raised": ["Any concern or challenge management acknowledged 1", "Concern 2"]
-  }},
-  "segments": [
-    {{"name": "Segment name", "revenue": "value", "growth": "X%", "margin": "X%", "comment": "key observation"}}
-  ],
-  "highlights": [
-    "Specific strength 1 with exact numbers e.g. Revenue grew 18% YoY to ₹4,250 Cr driven by...",
-    "Specific strength 2 with numbers",
-    "Specific strength 3 with numbers",
-    "Specific strength 4 with numbers",
-    "Specific strength 5 with numbers"
-  ],
-  "risks": [
-    "Specific risk 1 with context and potential impact",
-    "Specific risk 2 with context",
-    "Specific risk 3 with context",
-    "Specific risk 4 with context"
-  ],
-  "what_to_watch": [
-    "Forward-looking item to monitor 1 e.g. Margin recovery in Q4 as raw material costs ease",
-    "Forward-looking item 2",
-    "Forward-looking item 3"
-  ]
-}}
+        if result is None:
+            raise Exception("No AI provider available. Please check API keys.")
 
-IMPORTANT RULES:
-- Use ONLY data from the document. Never make up numbers.
-- Always include previous period comparison figures wherever available.
-- Use "N/A" only when data is genuinely not present.
-- Write comments and analysis in simple, clear English anyone can understand.
-- For health_score (0-100): weight profitability 30%, growth 25%, debt/leverage 20%, liquidity 15%, management quality 10%.
-- Explain the health score derivation clearly showing which factors increased or decreased it.
-- Extract and include ALL segment data if present.
-- Include management commentary insights — these are often more important than the numbers.
-
-Document content:
-{text[:10000]}"""
-
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=3000
-        )
-
-        raw = response.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        
-        # Find JSON object
-        start = raw.find('{')
-        end = raw.rfind('}') + 1
-        if start != -1 and end > start:
-            raw = raw[start:end]
-        
-        result = json.loads(raw)
+        result["_ai_used"] = ai_used
 
         await analyses_col.update_one(
             {"analysis_id": analysis_id},
@@ -316,13 +391,6 @@ Document content:
         )
         return {"analysis_id": analysis_id, "status": "completed", "result": result}
 
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e}")
-        await analyses_col.update_one(
-            {"analysis_id": analysis_id},
-            {"$set": {"status": "failed", "message": "Failed to parse AI response"}}
-        )
-        return {"analysis_id": analysis_id, "status": "failed", "message": "Failed to parse AI response"}
     except Exception as e:
         logger.error(f"Analysis error: {e}")
         await analyses_col.update_one(
