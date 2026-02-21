@@ -1,11 +1,14 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useContext, createContext } from 'react';
 import {
   View, Text, ScrollView, StyleSheet, ActivityIndicator,
-  TouchableOpacity, Switch, Platform, Alert, Linking, Share
+  TouchableOpacity, Switch, Share, Platform, Alert, Linking
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { apiFetch } from '../../src/api';
+import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
 
-const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://loyal-integrity-production-2b54.up.railway.app';
+const ThemeContext = createContext({ dark: false });
 
 const lightTheme = {
   bg: '#F0F4FF', card: '#FFFFFF', cardAlt: '#F8FAFF',
@@ -49,12 +52,14 @@ const ScoreBreakdown = ({ breakdown, t }: any) => {
   );
 };
 
-export default function PublicAnalysisScreen() {
+export default function AnalysisScreen() {
   const { id } = useLocalSearchParams();
   const router = useRouter();
   const [analysis, setAnalysis] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [dark, setDark] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
   const t = dark ? darkTheme : lightTheme;
 
@@ -62,64 +67,216 @@ export default function PublicAnalysisScreen() {
 
   const fetchAnalysis = async () => {
     try {
-      // PUBLIC endpoint — no auth needed
-      const res = await fetch(`${BACKEND}/api/public/analyses/${id}`);
-      if (!res.ok) throw new Error('Not found');
+      const res = await apiFetch(`/analyses/${id}`);
       const data = await res.json();
       setAnalysis(data);
     } catch (e) {
-      setAnalysis(null);
+      setError('Failed to load analysis');
     } finally {
       setLoading(false);
     }
   };
 
-  const shareLink = `https://finsight-vert.vercel.app/share/${id}`;
+  const generateHTML = (r: any) => {
+    const scoreColor = r.health_score >= 80 ? '#22c55e' : r.health_score >= 60 ? '#f59e0b' : '#ef4444';
+    const metricRows = (r.key_metrics || []).filter((m: any) => m.current && m.current !== 'N/A').map((m: any) => `
+      <tr>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-size:13px">${m.label}<br/><span style="font-size:11px;color:#999;font-style:italic">${m.comment || ''}</span></td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-size:13px;font-weight:700;text-align:right">${m.current}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-size:12px;color:#888;text-align:right">${m.previous || '-'}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #eee;font-size:12px;font-weight:600;text-align:right;color:${m.trend === 'up' ? '#22c55e' : m.trend === 'down' ? '#ef4444' : '#888'}">${m.change || '-'}</td>
+      </tr>`).join('');
 
-  const handleCopyLink = async () => {
+    const scoreRows = (r.health_score_breakdown?.components || []).map((c: any) => {
+      const color = c.rating === 'Strong' ? '#22c55e' : c.rating === 'Moderate' ? '#f59e0b' : '#ef4444';
+      const pct = c.max > 0 ? Math.round((c.score / c.max) * 100) : 0;
+      return `<div style="background:#f8faff;border-radius:10px;padding:14px;margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+          <span style="font-weight:700">${c.category}</span>
+          <span style="font-weight:700;color:${color}">${c.score}/${c.max} — ${c.rating}</span>
+        </div>
+        <div style="background:#e5e7eb;border-radius:4px;height:6px;margin-bottom:8px">
+          <div style="background:${color};height:6px;border-radius:4px;width:${pct}%"></div>
+        </div>
+        <p style="margin:0;font-size:12px;color:#555;line-height:1.6">${c.reasoning}</p>
+      </div>`;
+    }).join('');
+
+    const listItems = (arr: string[]) => (arr || []).map((h: string) => `<li style="margin-bottom:6px;font-size:13px">${h}</li>`).join('');
+    const mgmtPoints = (r.management_commentary?.key_points || []).map((p: string) => `<li style="margin-bottom:6px;font-size:13px">${p}</li>`).join('');
+    const segments = (r.segments || []).filter((s: any) => s.name).map((s: any) => `
+      <div style="background:#f8faff;border-radius:8px;padding:12px;margin-bottom:8px">
+        <strong>${s.name}</strong>
+        <div style="margin-top:6px">
+          ${s.revenue ? `<span style="background:#eef4ff;color:#0052ff;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:6px">Rev: ${s.revenue}</span>` : ''}
+          ${s.growth ? `<span style="background:#f0fdf4;color:#22c55e;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:6px">Growth: ${s.growth}</span>` : ''}
+          ${s.margin ? `<span style="background:#fffbeb;color:#f59e0b;padding:2px 8px;border-radius:4px;font-size:11px">Margin: ${s.margin}</span>` : ''}
+        </div>
+        ${s.comment ? `<p style="margin:6px 0 0;font-size:12px;color:#666">${s.comment}</p>` : ''}
+      </div>`).join('');
+
+    return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"/>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,'Segoe UI',sans-serif;margin:0;padding:0;background:#fff;color:#0a0e1a;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .page{max-width:800px;margin:0 auto;padding:32px}
+  .header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:28px;padding-bottom:20px;border-bottom:3px solid #0052ff}
+  .logo{font-size:20px;font-weight:900;color:#0052ff}
+  .company{font-size:26px;font-weight:800;margin:0 0 4px}
+  .score-card{text-align:center;background:#f0f4ff;border-radius:16px;padding:28px;margin-bottom:24px}
+  .section{margin-bottom:24px;page-break-inside:avoid}
+  .section-title{font-size:15px;font-weight:700;margin-bottom:12px;padding-bottom:6px;border-bottom:2px solid #f0f4ff}
+  table{width:100%;border-collapse:collapse}
+  th{background:#f8faff;padding:8px;font-size:11px;color:#888;text-align:left;text-transform:uppercase;letter-spacing:.5px}
+  .verdict{background:#eef4ff;border-left:4px solid #0052ff;padding:14px;border-radius:0 8px 8px 0;font-size:13px;line-height:1.7}
+  .footer{text-align:center;color:#999;font-size:11px;margin-top:32px;padding-top:16px;border-top:1px solid #eee}
+  ul{padding-left:18px;margin:8px 0}
+</style></head>
+<body><div class="page">
+  <div class="header">
+    <div class="logo">📊 FinSight<br/><span style="font-size:12px;color:#888;font-weight:400">AI Financial Analysis</span></div>
+    <div style="text-align:right">
+      <div class="company">${r.company_name || 'Financial Analysis'}</div>
+      <div style="font-size:13px;color:#666">${r.statement_type || ''} · ${r.period || ''} · ${r.currency || ''}</div>
+      <div style="font-size:11px;color:#999;margin-top:4px">Generated ${new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })}</div>
+    </div>
+  </div>
+
+  <div class="score-card">
+    <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px">Financial Health Score</div>
+    <div style="font-size:72px;font-weight:900;color:${scoreColor};line-height:1">${r.health_score}<span style="font-size:28px;color:#888">/100</span></div>
+    <div style="display:inline-block;background:${scoreColor}20;color:${scoreColor};font-weight:700;font-size:16px;padding:4px 16px;border-radius:20px;margin-top:8px">${r.health_label}</div>
+  </div>
+
+  ${scoreRows ? `<div class="section"><div class="section-title">📐 Score Derivation</div>${scoreRows}</div>` : ''}
+  <div class="section"><div class="section-title">📋 Executive Summary</div><p style="font-size:13px;line-height:1.8;margin:0">${r.executive_summary || ''}</p></div>
+  ${r.investor_verdict ? `<div class="section"><div class="section-title">💡 Plain English Verdict</div><div class="verdict">${r.investor_verdict}</div></div>` : ''}
+  ${metricRows ? `<div class="section"><div class="section-title">📊 Key Financial Metrics</div><table><tr><th>Metric</th><th style="text-align:right">Current</th><th style="text-align:right">Previous</th><th style="text-align:right">Change</th></tr>${metricRows}</table></div>` : ''}
+  ${r.profitability?.analysis ? `<div class="section"><div class="section-title">💰 Profitability</div><p style="font-size:13px;line-height:1.8;margin:0 0 10px">${r.profitability.analysis}</p>${r.profitability.key_cost_drivers?.length ? `<strong style="font-size:12px">Cost Drivers:</strong><ul>${(r.profitability.key_cost_drivers || []).map((c: string) => `<li>${c}</li>`).join('')}</ul>` : ''}</div>` : ''}
+  ${r.growth?.analysis ? `<div class="section"><div class="section-title">📈 Growth</div><p style="font-size:13px;line-height:1.8;margin:0 0 10px">${r.growth.analysis}</p>${r.growth.guidance && r.growth.guidance !== 'N/A' ? `<div style="background:#f0f9ff;border-radius:8px;padding:10px"><strong>Guidance:</strong> ${r.growth.guidance}</div>` : ''}</div>` : ''}
+  ${r.debt?.analysis ? `<div class="section"><div class="section-title">🏦 Debt & Leverage</div><p style="font-size:13px;line-height:1.8;margin:0">${r.debt.analysis}</p></div>` : ''}
+  ${r.management_commentary ? `<div class="section"><div class="section-title">🎙️ Management Commentary</div>${r.management_commentary.overall_tone ? `<p style="margin:0 0 8px"><strong>Tone:</strong> ${r.management_commentary.overall_tone}</p>` : ''}${mgmtPoints ? `<strong style="font-size:12px">Key Points:</strong><ul>${mgmtPoints}</ul>` : ''}${r.management_commentary.outlook_statement && r.management_commentary.outlook_statement !== 'N/A' ? `<div style="background:#f0f9ff;border-radius:8px;padding:10px;margin-top:8px"><strong>Outlook:</strong> ${r.management_commentary.outlook_statement}</div>` : ''}</div>` : ''}
+  ${segments ? `<div class="section"><div class="section-title">🏢 Business Segments</div>${segments}</div>` : ''}
+  ${listItems(r.highlights) ? `<div class="section"><div class="section-title">✅ Key Strengths</div><ul>${listItems(r.highlights)}</ul></div>` : ''}
+  ${listItems(r.risks) ? `<div class="section"><div class="section-title">⚠️ Key Risks</div><ul>${listItems(r.risks)}</ul></div>` : ''}
+  ${listItems(r.what_to_watch) ? `<div class="section"><div class="section-title">🔭 What to Watch</div><ul>${listItems(r.what_to_watch)}</ul></div>` : ''}
+
+  <div class="footer">Generated by FinSight · AI-Powered Financial Analysis · finsight-vert.vercel.app<br/>For informational purposes only. Not financial advice.</div>
+</div></body></html>`;
+  };
+
+  // INSTANT PDF DOWNLOAD — no print dialog
+  const handleDownloadPDF = async () => {
+    if (!analysis?.result) return;
+    setDownloading(true);
     try {
-      if (Platform.OS === 'web' && (navigator as any)?.clipboard) {
-        await (navigator as any).clipboard.writeText(shareLink);
-        setLinkCopied(true);
-        setTimeout(() => setLinkCopied(false), 3000);
+      const html = generateHTML(analysis.result);
+      const filename = `${(analysis.result.company_name || 'FinSight').replace(/[^a-z0-9]/gi, '_')}_Analysis.pdf`;
+
+      if (Platform.OS === 'web') {
+        // Web: use browser print-to-PDF with automatic trigger
+        const printWindow = (window as any).open('', '_blank');
+        printWindow.document.write(`
+          <html><head><title>${filename}</title>
+          <script>
+            window.onload = function() {
+              window.print();
+              setTimeout(function(){ window.close(); }, 1000);
+            }
+          <\/script>
+          </head><body>${html.replace(/<html>.*<body>/s, '').replace(/<\/body><\/html>/s, '')}</body></html>
+        `);
+        printWindow.document.close();
       } else {
-        await Share.share({ message: shareLink });
+        // Mobile: generate PDF file and share/save directly
+        const { uri } = await Print.printToFileAsync({ html, base64: false });
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(uri, {
+            mimeType: 'application/pdf',
+            dialogTitle: `Save ${filename}`,
+            UTI: 'com.adobe.pdf'
+          });
+        }
       }
-    } catch { }
+    } catch (e) {
+      Alert.alert('Error', 'Could not generate PDF. Please try again.');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const getShareText = () => {
+    const r = analysis?.result;
+    if (!r) return '';
+    return `📊 FinSight Analysis: ${r.company_name}\n\nPeriod: ${r.period}\nHealth Score: ${r.health_score}/100 (${r.health_label})\n\n${r.investor_verdict?.substring(0, 200) || ''}...\n\nAnalyzed by FinSight — AI Financial Analysis\nhttps://finsight-vert.vercel.app`;
   };
 
   const handleShareWhatsApp = async () => {
-    const r = analysis?.result;
-    const msg = encodeURIComponent(`📊 FinSight Analysis: ${r?.company_name}\n\nHealth Score: ${r?.health_score}/100 (${r?.health_label})\n\nView full analysis: ${shareLink}`);
-    const url = Platform.OS === 'web' ? `https://wa.me/?text=${msg}` : `whatsapp://send?text=${msg}`;
-    if (Platform.OS === 'web') { window.open(`https://wa.me/?text=${msg}`, '_blank'); }
-    else { await Linking.openURL(url).catch(() => Linking.openURL(`https://wa.me/?text=${msg}`)); }
+    const msg = encodeURIComponent(getShareText());
+    try {
+      const appUrl = `whatsapp://send?text=${msg}`;
+      const webUrl = `https://wa.me/?text=${msg}`;
+      if (Platform.OS !== 'web') {
+        const can = await Linking.canOpenURL(appUrl);
+        await Linking.openURL(can ? appUrl : webUrl);
+      } else {
+        window.open(webUrl, '_blank');
+      }
+    } catch {
+      Alert.alert('WhatsApp', 'Could not open WhatsApp. Please make sure it is installed.');
+    }
   };
 
   const handleShareTwitter = async () => {
     const r = analysis?.result;
-    const text = encodeURIComponent(`📊 ${r?.company_name} — Financial Health Score: ${r?.health_score}/100 (${r?.health_label})\n\nAnalyzed by FinSight`);
-    const url = `https://twitter.com/intent/tweet?text=${text}&url=${encodeURIComponent(shareLink)}`;
-    if (Platform.OS === 'web') { window.open(url, '_blank'); }
-    else { await Linking.openURL(url); }
+    const text = encodeURIComponent(`📊 ${r?.company_name} Financial Analysis\nHealth Score: ${r?.health_score}/100 (${r?.health_label})\n\nAnalyzed by FinSight — AI-powered financial analysis`);
+    const url = `https://twitter.com/intent/tweet?text=${text}`;
+    if (Platform.OS === 'web') {
+      window.open(url, '_blank');
+    } else {
+      await Linking.openURL(url);
+    }
+  };
+
+  const handleShareNative = async () => {
+    try {
+      await Share.share({
+        message: getShareText(),
+        title: `${analysis?.result?.company_name} — FinSight Analysis`,
+      });
+    } catch (e) {}
+  };
+
+  const handleCopyLink = async () => {
+    // Share the app homepage since analysis requires login
+    const url = `https://finsight-vert.vercel.app`;
+    const textToCopy = `${getShareText()}\n\nView on FinSight: ${url}`;
+    try {
+      if (Platform.OS === 'web' && (navigator as any)?.clipboard) {
+        await (navigator as any).clipboard.writeText(textToCopy);
+        setLinkCopied(true);
+        setTimeout(() => setLinkCopied(false), 3000);
+      } else {
+        await Share.share({ message: textToCopy });
+      }
+    } catch {
+      Alert.alert('Copy failed', 'Please try the Share button instead.');
+    }
   };
 
   if (loading) return (
     <View style={[styles.center, { backgroundColor: t.bg }]}>
       <ActivityIndicator size="large" color={t.accent} />
-      <Text style={[{ color: t.textSecondary, marginTop: 12, fontSize: 16 }]}>Loading analysis...</Text>
+      <Text style={[styles.loadingText, { color: t.textSecondary }]}>Loading analysis...</Text>
     </View>
   );
 
-  if (!analysis || !analysis.result) return (
+  if (error || !analysis || !analysis.result) return (
     <View style={[styles.center, { backgroundColor: t.bg }]}>
-      <Text style={{ fontSize: 48, marginBottom: 16 }}>📊</Text>
-      <Text style={{ fontSize: 20, fontWeight: '800', color: t.text, marginBottom: 8 }}>Analysis Not Found</Text>
-      <Text style={{ fontSize: 14, color: t.textSecondary, textAlign: 'center', marginBottom: 24, lineHeight: 22 }}>
-        This analysis may have been deleted or the link is incorrect.
-      </Text>
-      <TouchableOpacity style={[styles.btn, { backgroundColor: t.accent }]} onPress={() => router.replace('/')}>
-        <Text style={styles.btnText}>Go to FinSight</Text>
+      <Text style={styles.errorText}>No results found</Text>
+      <TouchableOpacity style={[styles.btn, { backgroundColor: t.accent }]} onPress={() => router.back()}>
+        <Text style={styles.btnText}>Go Back</Text>
       </TouchableOpacity>
     </View>
   );
@@ -170,215 +327,271 @@ export default function PublicAnalysisScreen() {
   };
 
   return (
-    <ScrollView style={[styles.container, { backgroundColor: t.bg }]} showsVerticalScrollIndicator={false}>
+    <ThemeContext.Provider value={{ dark }}>
+      <ScrollView style={[styles.container, { backgroundColor: t.bg }]} showsVerticalScrollIndicator={false}>
 
-      {/* Top bar */}
-      <View style={styles.topBar}>
-        <View style={styles.logoRow}>
-          <Text style={styles.logoEmoji}>📊</Text>
-          <Text style={[styles.logoText, { color: t.accent }]}>FinSight</Text>
+        <View style={styles.topBar}>
+          <TouchableOpacity onPress={() => router.back()}>
+            <Text style={[styles.backText, { color: t.accent }]}>← Back</Text>
+          </TouchableOpacity>
+          <View style={styles.themeToggle}>
+            <Text style={{ fontSize: 16 }}>{dark ? '🌙' : '☀️'}</Text>
+            <Switch value={dark} onValueChange={setDark} trackColor={{ false: '#CBD5E1', true: '#4F8AFF' }} thumbColor='#fff' />
+          </View>
         </View>
-        <View style={styles.themeToggle}>
-          <Text style={{ fontSize: 14 }}>{dark ? '🌙' : '☀️'}</Text>
-          <Switch value={dark} onValueChange={setDark} trackColor={{ false: '#CBD5E1', true: '#4F8AFF' }} thumbColor='#fff' />
+
+        <View style={styles.header}>
+          <Text style={[styles.company, { color: t.text }]}>{r.company_name || 'Financial Analysis'}</Text>
+          <Text style={[styles.period, { color: t.textSecondary }]}>{r.statement_type} · {r.period}</Text>
+          <Text style={[styles.currency, { color: t.textSecondary }]}>{r.currency}</Text>
         </View>
-      </View>
 
-      {/* Shared by banner */}
-      <View style={[styles.sharedBanner, { backgroundColor: t.accentLight }]}>
-        <Text style={[styles.sharedBannerText, { color: t.accent }]}>
-          📤 Shared via FinSight · AI-Powered Financial Analysis
-        </Text>
-      </View>
-
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={[styles.company, { color: t.text }]}>{r.company_name || 'Financial Analysis'}</Text>
-        <Text style={[styles.period, { color: t.textSecondary }]}>{r.statement_type} · {r.period}</Text>
-        <Text style={[styles.currency, { color: t.textSecondary }]}>{r.currency}</Text>
-      </View>
-
-      {/* Health Score */}
-      <View style={[styles.scoreCard, { backgroundColor: t.card }]}>
-        <Text style={[styles.scoreLabel, { color: t.textSecondary }]}>FINANCIAL HEALTH SCORE</Text>
-        <View style={styles.scoreCircle}>
-          <Text style={[styles.score, { color: scoreColor }]}>{r.health_score}</Text>
-          <Text style={[styles.scoreMax, { color: t.textSecondary }]}>/100</Text>
+        <View style={[styles.scoreCard, { backgroundColor: t.card }]}>
+          <Text style={[styles.scoreLabel, { color: t.textSecondary }]}>FINANCIAL HEALTH SCORE</Text>
+          <View style={styles.scoreCircle}>
+            <Text style={[styles.score, { color: scoreColor }]}>{r.health_score}</Text>
+            <Text style={[styles.scoreMax, { color: t.textSecondary }]}>/100</Text>
+          </View>
+          <View style={[styles.scoreBadge, { backgroundColor: scoreColor + '20' }]}>
+            <Text style={[styles.scoreTag, { color: scoreColor }]}>{r.health_label}</Text>
+          </View>
+          <ScoreBreakdown breakdown={r.health_score_breakdown} t={t} />
         </View>
-        <View style={[styles.scoreBadge, { backgroundColor: scoreColor + '20' }]}>
-          <Text style={[styles.scoreTag, { color: scoreColor }]}>{r.health_label}</Text>
-        </View>
-        <ScoreBreakdown breakdown={r.health_score_breakdown} t={t} />
-      </View>
 
-      <Card title="📋 Executive Summary">
-        <Text style={[styles.bodyText, { color: t.text }]}>{r.executive_summary}</Text>
-      </Card>
+        <Card title="📋 Executive Summary">
+          <Text style={[styles.bodyText, { color: t.text }]}>{r.executive_summary}</Text>
+        </Card>
 
-      {r.investor_verdict && (
-        <Card title="💡 Plain English Verdict" accent={t.accent}>
-          <View style={[styles.verdictBox, { backgroundColor: t.accentLight }]}>
-            <Text style={[styles.bodyText, { color: t.text }]}>{r.investor_verdict}</Text>
+        {r.investor_verdict && (
+          <Card title="💡 Plain English Verdict" accent={t.accent}>
+            <View style={[styles.verdictBox, { backgroundColor: t.accentLight }]}>
+              <Text style={[styles.bodyText, { color: t.text }]}>{r.investor_verdict}</Text>
+            </View>
+          </Card>
+        )}
+
+        {r.key_metrics?.length > 0 && (
+          <Card title="📊 Key Financial Metrics">
+            <View style={[styles.metricsHeader, { borderBottomColor: t.border }]}>
+              <Text style={[styles.metricsHeaderText, { color: t.textSecondary }]}>Metric</Text>
+              <Text style={[styles.metricsHeaderText, { color: t.textSecondary }]}>Current · Prev · Change</Text>
+            </View>
+            {r.key_metrics.filter((m: any) => m.current && m.current !== 'N/A').map((m: any, i: number) => (
+              <MetricRow key={i} metric={m} />
+            ))}
+          </Card>
+        )}
+
+        {r.profitability && (
+          <Card title="💰 Profitability">
+            <Text style={[styles.bodyText, { color: t.text }]}>{r.profitability.analysis}</Text>
+            <View style={styles.statsGrid}>
+              <StatBox label="Gross Margin" val={r.profitability.gross_margin_current} prev={r.profitability.gross_margin_previous} />
+              <StatBox label="EBITDA Margin" val={r.profitability.ebitda_margin_current} prev={r.profitability.ebitda_margin_previous} />
+              <StatBox label="Net Margin" val={r.profitability.net_margin_current} prev={r.profitability.net_margin_previous} />
+              <StatBox label="ROE" val={r.profitability.roe} color="#22c55e" />
+              <StatBox label="ROA" val={r.profitability.roa} color="#22c55e" />
+            </View>
+            {r.profitability.key_cost_drivers?.length > 0 && (
+              <View style={{ marginTop: 12 }}>
+                <Text style={[styles.subTitle, { color: t.text }]}>Key Cost Drivers:</Text>
+                {r.profitability.key_cost_drivers.map((c: string, i: number) => (
+                  <Text key={i} style={[styles.bulletItem, { color: t.textSecondary }]}>• {c}</Text>
+                ))}
+              </View>
+            )}
+          </Card>
+        )}
+
+        {r.growth && (
+          <Card title="📈 Growth">
+            <Text style={[styles.bodyText, { color: t.text }]}>{r.growth.analysis}</Text>
+            <View style={styles.statsGrid}>
+              <StatBox label="Revenue Growth YoY" val={r.growth.revenue_growth_yoy} color="#22c55e" />
+              <StatBox label="Profit Growth YoY" val={r.growth.profit_growth_yoy} color="#22c55e" />
+            </View>
+            {r.growth.guidance && r.growth.guidance !== 'N/A' && (
+              <View style={[styles.guidanceBox, { backgroundColor: t.accentLight, marginTop: 12 }]}>
+                <Text style={[styles.subTitle, { color: t.text }]}>📌 Management Guidance:</Text>
+                <Text style={[styles.bodyText, { color: t.text }]}>{r.growth.guidance}</Text>
+              </View>
+            )}
+          </Card>
+        )}
+
+        {r.liquidity && (
+          <Card title="💧 Liquidity & Cash">
+            <Text style={[styles.bodyText, { color: t.text }]}>{r.liquidity.analysis}</Text>
+            <View style={styles.statsGrid}>
+              <StatBox label="Current Ratio" val={r.liquidity.current_ratio} />
+              <StatBox label="Quick Ratio" val={r.liquidity.quick_ratio} />
+              <StatBox label="Cash" val={r.liquidity.cash_position} />
+              <StatBox label="Operating CF" val={r.liquidity.operating_cash_flow} />
+              <StatBox label="Free CF" val={r.liquidity.free_cash_flow} />
+            </View>
+          </Card>
+        )}
+
+        {r.debt && (
+          <Card title="🏦 Debt & Leverage">
+            <Text style={[styles.bodyText, { color: t.text }]}>{r.debt.analysis}</Text>
+            <View style={styles.statsGrid}>
+              <StatBox label="Total Debt" val={r.debt.total_debt} />
+              <StatBox label="Net Debt" val={r.debt.net_debt} />
+              <StatBox label="D/E Ratio" val={r.debt.debt_to_equity} />
+              <StatBox label="Interest Coverage" val={r.debt.interest_coverage} />
+            </View>
+            {r.debt.debt_trend && (
+              <View style={[styles.trendPill, { backgroundColor: r.debt.debt_trend === 'Decreasing' ? '#22c55e20' : r.debt.debt_trend === 'Increasing' ? '#ef444420' : '#88888820' }]}>
+                <Text style={{ fontWeight: '700', fontSize: 13, color: r.debt.debt_trend === 'Decreasing' ? '#22c55e' : r.debt.debt_trend === 'Increasing' ? '#ef4444' : '#888' }}>
+                  Debt Trend: {r.debt.debt_trend}
+                </Text>
+              </View>
+            )}
+          </Card>
+        )}
+
+        {r.management_commentary && (
+          <Card title="🎙️ Management Commentary">
+            {r.management_commentary.overall_tone && (
+              <View style={[styles.toneBadge, { backgroundColor: r.management_commentary.overall_tone === 'Positive' ? '#22c55e20' : r.management_commentary.overall_tone === 'Concerned' ? '#ef444420' : '#f59e0b20' }]}>
+                <Text style={{ fontWeight: '700', fontSize: 13, color: r.management_commentary.overall_tone === 'Positive' ? '#22c55e' : r.management_commentary.overall_tone === 'Concerned' ? '#ef4444' : '#f59e0b' }}>
+                  Tone: {r.management_commentary.overall_tone}
+                </Text>
+              </View>
+            )}
+            {r.management_commentary.key_points?.length > 0 && (
+              <View style={{ marginTop: 10 }}>
+                <Text style={[styles.subTitle, { color: t.text }]}>Key Points:</Text>
+                {r.management_commentary.key_points.map((p: string, i: number) => (
+                  <Text key={i} style={[styles.bulletItem, { color: t.text }]}>• {p}</Text>
+                ))}
+              </View>
+            )}
+            {r.management_commentary.outlook_statement && r.management_commentary.outlook_statement !== 'N/A' && (
+              <View style={[styles.guidanceBox, { backgroundColor: t.accentLight, marginTop: 10 }]}>
+                <Text style={[styles.subTitle, { color: t.text }]}>Outlook:</Text>
+                <Text style={[styles.bodyText, { color: t.text }]}>{r.management_commentary.outlook_statement}</Text>
+              </View>
+            )}
+            {r.management_commentary.concerns_raised?.length > 0 && (
+              <View style={{ marginTop: 10 }}>
+                <Text style={[styles.subTitle, { color: '#ef4444' }]}>Concerns:</Text>
+                {r.management_commentary.concerns_raised.map((c: string, i: number) => (
+                  <Text key={i} style={[styles.bulletItem, { color: '#ef4444' }]}>• {c}</Text>
+                ))}
+              </View>
+            )}
+          </Card>
+        )}
+
+        {r.segments?.length > 0 && (
+          <Card title="🏢 Business Segments">
+            {r.segments.map((seg: any, i: number) => (
+              <View key={i} style={[styles.segmentBox, { backgroundColor: t.cardAlt }]}>
+                <Text style={[styles.segmentName, { color: t.text }]}>{seg.name}</Text>
+                <View style={styles.segmentStats}>
+                  {seg.revenue && <View style={[styles.segmentPill, { backgroundColor: t.accentLight }]}><Text style={{ color: t.accent, fontSize: 11 }}>Rev: {seg.revenue}</Text></View>}
+                  {seg.growth && <View style={[styles.segmentPill, { backgroundColor: '#22c55e20' }]}><Text style={{ color: '#22c55e', fontSize: 11 }}>Growth: {seg.growth}</Text></View>}
+                  {seg.margin && <View style={[styles.segmentPill, { backgroundColor: '#f59e0b20' }]}><Text style={{ color: '#f59e0b', fontSize: 11 }}>Margin: {seg.margin}</Text></View>}
+                </View>
+                {seg.comment && <Text style={[styles.metricComment, { color: t.textSecondary }]}>{seg.comment}</Text>}
+              </View>
+            ))}
+          </Card>
+        )}
+
+        {r.highlights?.length > 0 && (
+          <Card title="✅ Key Strengths">
+            {r.highlights.map((h: string, i: number) => (
+              <View key={i} style={styles.bulletRow}>
+                <View style={[styles.bulletDotCircle, { backgroundColor: '#22c55e20' }]}><Text style={{ color: '#22c55e', fontSize: 10 }}>✓</Text></View>
+                <Text style={[styles.bulletText, { color: t.text }]}>{h}</Text>
+              </View>
+            ))}
+          </Card>
+        )}
+
+        {r.risks?.length > 0 && (
+          <Card title="⚠️ Key Risks">
+            {r.risks.map((risk: string, i: number) => (
+              <View key={i} style={styles.bulletRow}>
+                <View style={[styles.bulletDotCircle, { backgroundColor: '#ef444420' }]}><Text style={{ color: '#ef4444', fontSize: 10 }}>!</Text></View>
+                <Text style={[styles.bulletText, { color: t.text }]}>{risk}</Text>
+              </View>
+            ))}
+          </Card>
+        )}
+
+        {r.what_to_watch?.length > 0 && (
+          <Card title="🔭 What to Watch Next">
+            {r.what_to_watch.map((w: string, i: number) => (
+              <View key={i} style={styles.bulletRow}>
+                <View style={[styles.bulletDotCircle, { backgroundColor: t.accentLight }]}><Text style={{ color: t.accent, fontSize: 10 }}>→</Text></View>
+                <Text style={[styles.bulletText, { color: t.text }]}>{w}</Text>
+              </View>
+            ))}
+          </Card>
+        )}
+
+        {/* BOTTOM ACTIONS — only here */}
+        <View style={[styles.bottomActions, { backgroundColor: t.card }]}>
+          <Text style={[styles.bottomActionsTitle, { color: t.textSecondary }]}>SAVE & SHARE</Text>
+
+          <TouchableOpacity
+            style={[styles.downloadBtn, { backgroundColor: t.accent, opacity: downloading ? 0.7 : 1 }]}
+            onPress={handleDownloadPDF}
+            disabled={downloading}
+          >
+            {downloading
+              ? <ActivityIndicator size="small" color="#fff" />
+              : <Text style={styles.downloadBtnText}>⬇️  Download PDF Report</Text>
+            }
+          </TouchableOpacity>
+
+          <View style={styles.shareRow}>
+            <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#25D366' }]} onPress={handleShareWhatsApp}>
+              <Text style={styles.shareBtnText}>💬{'\n'}WhatsApp</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#000' }]} onPress={handleShareTwitter}>
+              <Text style={styles.shareBtnText}>𝕏{'\n'}Twitter</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#0052FF' }]} onPress={handleShareNative}>
+              <Text style={styles.shareBtnText}>📤{'\n'}More Apps</Text>
+            </TouchableOpacity>
           </View>
-        </Card>
-      )}
 
-      {r.key_metrics?.length > 0 && (
-        <Card title="📊 Key Financial Metrics">
-          <View style={[styles.metricsHeader, { borderBottomColor: t.border }]}>
-            <Text style={[styles.metricsHeaderText, { color: t.textSecondary }]}>Metric</Text>
-            <Text style={[styles.metricsHeaderText, { color: t.textSecondary }]}>Current · Prev · Change</Text>
-          </View>
-          {r.key_metrics.filter((m: any) => m.current && m.current !== 'N/A').map((m: any, i: number) => (
-            <MetricRow key={i} metric={m} />
-          ))}
-        </Card>
-      )}
+          <TouchableOpacity
+            style={[styles.copyLinkBtn, { borderColor: linkCopied ? '#22c55e' : t.border, backgroundColor: linkCopied ? '#22c55e10' : t.cardAlt }]}
+            onPress={handleCopyLink}
+          >
+            <Text style={[styles.copyLinkText, { color: linkCopied ? '#22c55e' : t.text }]}>
+              {linkCopied ? '✅ Copied to clipboard!' : '🔗 Copy & Share Summary'}
+            </Text>
+          </TouchableOpacity>
 
-      {r.profitability && (
-        <Card title="💰 Profitability">
-          <Text style={[styles.bodyText, { color: t.text }]}>{r.profitability.analysis}</Text>
-          <View style={styles.statsGrid}>
-            <StatBox label="Gross Margin" val={r.profitability.gross_margin_current} prev={r.profitability.gross_margin_previous} />
-            <StatBox label="EBITDA Margin" val={r.profitability.ebitda_margin_current} prev={r.profitability.ebitda_margin_previous} />
-            <StatBox label="Net Margin" val={r.profitability.net_margin_current} prev={r.profitability.net_margin_previous} />
-            <StatBox label="ROE" val={r.profitability.roe} color="#22c55e" />
-            <StatBox label="ROA" val={r.profitability.roa} color="#22c55e" />
-          </View>
-        </Card>
-      )}
-
-      {r.growth && (
-        <Card title="📈 Growth">
-          <Text style={[styles.bodyText, { color: t.text }]}>{r.growth.analysis}</Text>
-          <View style={styles.statsGrid}>
-            <StatBox label="Revenue Growth YoY" val={r.growth.revenue_growth_yoy} color="#22c55e" />
-            <StatBox label="Profit Growth YoY" val={r.growth.profit_growth_yoy} color="#22c55e" />
-          </View>
-          {r.growth.guidance && r.growth.guidance !== 'N/A' && (
-            <View style={[styles.guidanceBox, { backgroundColor: t.accentLight, marginTop: 12 }]}>
-              <Text style={[styles.subTitle, { color: t.text }]}>📌 Management Guidance:</Text>
-              <Text style={[styles.bodyText, { color: t.text }]}>{r.growth.guidance}</Text>
-            </View>
-          )}
-        </Card>
-      )}
-
-      {r.debt && (
-        <Card title="🏦 Debt & Leverage">
-          <Text style={[styles.bodyText, { color: t.text }]}>{r.debt.analysis}</Text>
-          <View style={styles.statsGrid}>
-            <StatBox label="Total Debt" val={r.debt.total_debt} />
-            <StatBox label="D/E Ratio" val={r.debt.debt_to_equity} />
-            <StatBox label="Interest Coverage" val={r.debt.interest_coverage} />
-          </View>
-        </Card>
-      )}
-
-      {r.management_commentary && (
-        <Card title="🎙️ Management Commentary">
-          {r.management_commentary.overall_tone && (
-            <View style={[styles.toneBadge, { backgroundColor: r.management_commentary.overall_tone === 'Positive' ? '#22c55e20' : r.management_commentary.overall_tone === 'Concerned' ? '#ef444420' : '#f59e0b20' }]}>
-              <Text style={{ fontWeight: '700', fontSize: 13, color: r.management_commentary.overall_tone === 'Positive' ? '#22c55e' : r.management_commentary.overall_tone === 'Concerned' ? '#ef4444' : '#f59e0b' }}>
-                Tone: {r.management_commentary.overall_tone}
-              </Text>
-            </View>
-          )}
-          {r.management_commentary.key_points?.length > 0 && (
-            <View style={{ marginTop: 10 }}>
-              <Text style={[styles.subTitle, { color: t.text }]}>Key Points:</Text>
-              {r.management_commentary.key_points.map((p: string, i: number) => (
-                <Text key={i} style={[styles.bulletItem, { color: t.text }]}>• {p}</Text>
-              ))}
-            </View>
-          )}
-          {r.management_commentary.outlook_statement && r.management_commentary.outlook_statement !== 'N/A' && (
-            <View style={[styles.guidanceBox, { backgroundColor: t.accentLight, marginTop: 10 }]}>
-              <Text style={[styles.subTitle, { color: t.text }]}>Outlook:</Text>
-              <Text style={[styles.bodyText, { color: t.text }]}>{r.management_commentary.outlook_statement}</Text>
-            </View>
-          )}
-        </Card>
-      )}
-
-      {r.highlights?.length > 0 && (
-        <Card title="✅ Key Strengths">
-          {r.highlights.map((h: string, i: number) => (
-            <View key={i} style={styles.bulletRow}>
-              <View style={[styles.bulletDotCircle, { backgroundColor: '#22c55e20' }]}><Text style={{ color: '#22c55e', fontSize: 10 }}>✓</Text></View>
-              <Text style={[styles.bulletText, { color: t.text }]}>{h}</Text>
-            </View>
-          ))}
-        </Card>
-      )}
-
-      {r.risks?.length > 0 && (
-        <Card title="⚠️ Key Risks">
-          {r.risks.map((risk: string, i: number) => (
-            <View key={i} style={styles.bulletRow}>
-              <View style={[styles.bulletDotCircle, { backgroundColor: '#ef444420' }]}><Text style={{ color: '#ef4444', fontSize: 10 }}>!</Text></View>
-              <Text style={[styles.bulletText, { color: t.text }]}>{risk}</Text>
-            </View>
-          ))}
-        </Card>
-      )}
-
-      {r.what_to_watch?.length > 0 && (
-        <Card title="🔭 What to Watch Next">
-          {r.what_to_watch.map((w: string, i: number) => (
-            <View key={i} style={styles.bulletRow}>
-              <View style={[styles.bulletDotCircle, { backgroundColor: t.accentLight }]}><Text style={{ color: t.accent, fontSize: 10 }}>→</Text></View>
-              <Text style={[styles.bulletText, { color: t.text }]}>{w}</Text>
-            </View>
-          ))}
-        </Card>
-      )}
-
-      {/* Share section */}
-      <View style={[styles.shareSection, { backgroundColor: t.card }]}>
-        <Text style={[styles.shareSectionTitle, { color: t.text }]}>Share This Analysis</Text>
-        <TouchableOpacity
-          style={[styles.copyLinkBtn, { borderColor: linkCopied ? '#22c55e' : t.accent, backgroundColor: linkCopied ? '#22c55e10' : t.accentLight }]}
-          onPress={handleCopyLink}
-        >
-          <Text style={[styles.copyLinkText, { color: linkCopied ? '#22c55e' : t.accent }]}>
-            {linkCopied ? '✅ Link Copied!' : '🔗 Copy Shareable Link'}
+          <Text style={[styles.shareNote, { color: t.textSecondary }]}>
+            Note: Recipients need to sign in to view full analyses on FinSight
           </Text>
-        </TouchableOpacity>
-        <View style={styles.shareRow}>
-          <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#25D366' }]} onPress={handleShareWhatsApp}>
-            <Text style={styles.shareBtnText}>💬 WhatsApp</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[styles.shareBtn, { backgroundColor: '#000' }]} onPress={handleShareTwitter}>
-            <Text style={styles.shareBtnText}>𝕏 Twitter</Text>
-          </TouchableOpacity>
         </View>
-      </View>
 
-      {/* CTA to sign up */}
-      <View style={[styles.ctaCard, { backgroundColor: t.accent }]}>
-        <Text style={styles.ctaTitle}>📊 Analyze Your Own Financial Documents</Text>
-        <Text style={styles.ctaSubtitle}>Upload any PDF and get AI-powered analysis in seconds</Text>
-        <TouchableOpacity style={styles.ctaBtn} onPress={() => router.replace('/')}>
-          <Text style={styles.ctaBtnText}>Try FinSight Free →</Text>
+        <TouchableOpacity style={[styles.backHomeBtn, { borderColor: t.border }]} onPress={() => router.back()}>
+          <Text style={[styles.backHomeBtnText, { color: t.textSecondary }]}>← Back to Home</Text>
         </TouchableOpacity>
-      </View>
-
-      <View style={{ height: 40 }} />
-    </ScrollView>
+        <View style={{ height: 40 }} />
+      </ScrollView>
+    </ThemeContext.Provider>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, padding: 16 },
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
-  topBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, marginTop: 8 },
-  logoRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  logoEmoji: { fontSize: 22 },
-  logoText: { fontSize: 20, fontWeight: '900' },
+  loadingText: { marginTop: 12, fontSize: 16 },
+  errorText: { color: '#ef4444', fontSize: 16, textAlign: 'center', marginBottom: 16 },
+  topBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, marginTop: 8 },
+  backText: { fontSize: 16, fontWeight: '600' },
   themeToggle: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  sharedBanner: { borderRadius: 10, padding: 10, marginBottom: 16, alignItems: 'center' },
-  sharedBannerText: { fontSize: 12, fontWeight: '600' },
   header: { marginBottom: 16 },
   company: { fontSize: 24, fontWeight: '800', letterSpacing: -0.5 },
   period: { fontSize: 13, marginTop: 4 },
@@ -415,23 +628,28 @@ const styles = StyleSheet.create({
   statLabel: { fontSize: 10, marginTop: 4, textAlign: 'center' },
   subTitle: { fontSize: 13, fontWeight: '700', marginBottom: 6 },
   guidanceBox: { borderRadius: 10, padding: 12 },
+  trendPill: { borderRadius: 8, padding: 10, marginTop: 10, alignSelf: 'flex-start' },
   toneBadge: { borderRadius: 8, padding: 10, marginBottom: 8, alignSelf: 'flex-start' },
   bulletRow: { flexDirection: 'row', marginBottom: 10, alignItems: 'flex-start' },
   bulletDotCircle: { width: 20, height: 20, borderRadius: 10, alignItems: 'center', justifyContent: 'center', marginRight: 10, marginTop: 2, flexShrink: 0 },
   bulletText: { fontSize: 14, lineHeight: 22, flex: 1 },
   bulletItem: { fontSize: 13, lineHeight: 22, marginBottom: 4 },
-  shareSection: { borderRadius: 18, padding: 18, marginBottom: 14 },
-  shareSectionTitle: { fontSize: 15, fontWeight: '700', marginBottom: 12 },
+  segmentBox: { borderRadius: 10, padding: 12, marginBottom: 8 },
+  segmentName: { fontSize: 14, fontWeight: '700', marginBottom: 6 },
+  segmentStats: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 6 },
+  segmentPill: { borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3 },
+  bottomActions: { borderRadius: 20, padding: 20, marginBottom: 14, shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 12, elevation: 3 },
+  bottomActionsTitle: { fontSize: 11, fontWeight: '700', letterSpacing: 1.5, textTransform: 'uppercase', marginBottom: 14, textAlign: 'center' },
+  downloadBtn: { borderRadius: 14, padding: 16, alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
+  downloadBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  shareRow: { flexDirection: 'row', gap: 10, marginBottom: 12 },
+  shareBtn: { flex: 1, borderRadius: 14, padding: 14, alignItems: 'center', justifyContent: 'center' },
+  shareBtnText: { color: '#fff', fontSize: 12, fontWeight: '700', textAlign: 'center' },
   copyLinkBtn: { borderRadius: 12, padding: 14, alignItems: 'center', borderWidth: 1.5, marginBottom: 10 },
-  copyLinkText: { fontSize: 14, fontWeight: '700' },
-  shareRow: { flexDirection: 'row', gap: 10 },
-  shareBtn: { flex: 1, borderRadius: 12, padding: 14, alignItems: 'center' },
-  shareBtnText: { color: '#fff', fontSize: 13, fontWeight: '700' },
-  ctaCard: { borderRadius: 18, padding: 24, marginBottom: 14, alignItems: 'center' },
-  ctaTitle: { fontSize: 16, fontWeight: '800', color: '#fff', textAlign: 'center', marginBottom: 6 },
-  ctaSubtitle: { fontSize: 13, color: 'rgba(255,255,255,0.8)', textAlign: 'center', marginBottom: 16 },
-  ctaBtn: { backgroundColor: '#fff', borderRadius: 12, paddingHorizontal: 24, paddingVertical: 12 },
-  ctaBtnText: { color: '#0052FF', fontSize: 15, fontWeight: '800' },
-  btn: { borderRadius: 14, padding: 16, alignItems: 'center', paddingHorizontal: 32 },
+  copyLinkText: { fontSize: 14, fontWeight: '600' },
+  shareNote: { fontSize: 11, textAlign: 'center', fontStyle: 'italic' },
+  backHomeBtn: { borderRadius: 12, padding: 14, alignItems: 'center', borderWidth: 1, marginBottom: 8 },
+  backHomeBtnText: { fontSize: 14, fontWeight: '600' },
+  btn: { borderRadius: 14, padding: 16, alignItems: 'center' },
   btnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
 });
