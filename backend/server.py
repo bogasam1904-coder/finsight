@@ -5,7 +5,7 @@ import logging
 import json
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import motor.motor_asyncio
@@ -99,7 +99,7 @@ def extract_text_from_pdf(content: bytes) -> str:
 def build_prompt(text: str) -> str:
     return f"""You are a world-class senior financial analyst and CFA charterholder with 20+ years experience. Analyze this financial document comprehensively and return ONLY valid JSON — no markdown, no extra text.
 
-CRITICAL: The health_score_breakdown must show SPECIFIC numbers and reasons from the actual document — not generic placeholders. Each factor must reference actual data found in the document.
+CRITICAL: The health_score_breakdown must show SPECIFIC numbers and reasons from the actual document — not generic placeholders.
 
 Return this exact JSON structure:
 
@@ -113,52 +113,17 @@ Return this exact JSON structure:
   "health_score_breakdown": {{
     "total": 75,
     "components": [
-      {{
-        "category": "Profitability",
-        "weight": 30,
-        "score": 22,
-        "max": 30,
-        "rating": "Strong / Moderate / Weak",
-        "reasoning": "Specific reasoning with actual numbers e.g. Net margin of 18.4% is strong, up from 16.2% last year. EBITDA margin at 24% indicates efficient cost management. ROE of 22% exceeds industry average of 15%."
-      }},
-      {{
-        "category": "Revenue Growth",
-        "weight": 25,
-        "score": 18,
-        "max": 25,
-        "rating": "Strong / Moderate / Weak",
-        "reasoning": "Specific reasoning with actual numbers e.g. Revenue grew 14.2% YoY to ₹4,250 Cr. Growth is broad-based across segments. However, Q3 growth of 8% shows slight deceleration from Q2's 16%."
-      }},
-      {{
-        "category": "Debt & Leverage",
-        "weight": 20,
-        "score": 14,
-        "max": 20,
-        "rating": "Strong / Moderate / Weak",
-        "reasoning": "Specific reasoning e.g. Debt-to-equity at 0.4x is conservative. Net debt reduced by ₹320 Cr this quarter. Interest coverage of 8.2x provides comfortable buffer. Company is actively deleveraging."
-      }},
-      {{
-        "category": "Liquidity",
-        "weight": 15,
-        "score": 12,
-        "max": 15,
-        "rating": "Strong / Moderate / Weak",
-        "reasoning": "Specific reasoning e.g. Current ratio of 2.1x is healthy. Cash and equivalents of ₹1,240 Cr is sufficient for 6 months operations. Strong operating cash flow of ₹680 Cr this year."
-      }},
-      {{
-        "category": "Management & Outlook",
-        "weight": 10,
-        "score": 9,
-        "max": 10,
-        "rating": "Strong / Moderate / Weak",
-        "reasoning": "Specific reasoning e.g. Management tone is confident with specific growth guidance of 15-18% for next year. New capacity expansion announced. Order book at all-time high of ₹8,500 Cr."
-      }}
+      {{"category": "Profitability", "weight": 30, "score": 22, "max": 30, "rating": "Strong / Moderate / Weak", "reasoning": "Specific reasoning with actual numbers from document"}},
+      {{"category": "Revenue Growth", "weight": 25, "score": 18, "max": 25, "rating": "Strong / Moderate / Weak", "reasoning": "Specific reasoning with actual numbers"}},
+      {{"category": "Debt & Leverage", "weight": 20, "score": 14, "max": 20, "rating": "Strong / Moderate / Weak", "reasoning": "Specific reasoning with actual numbers"}},
+      {{"category": "Liquidity", "weight": 15, "score": 12, "max": 15, "rating": "Strong / Moderate / Weak", "reasoning": "Specific reasoning with actual numbers"}},
+      {{"category": "Management & Outlook", "weight": 10, "score": 9, "max": 10, "rating": "Strong / Moderate / Weak", "reasoning": "Specific reasoning with actual numbers"}}
     ]
   }},
-  "executive_summary": "5-6 sentence comprehensive summary: what company does, overall performance this period, key wins, key concerns, what numbers mean for future",
-  "investor_verdict": "3-4 sentence plain English for non-finance person: is company doing well or not, 2-3 most important things to know, what to watch",
+  "executive_summary": "5-6 sentence comprehensive summary",
+  "investor_verdict": "3-4 sentence plain English for non-finance person",
   "key_metrics": [
-    {{"label": "Revenue / Total Income", "current": "value", "previous": "value", "change": "+X% YoY", "trend": "up/down/neutral", "comment": "one line context with actual driver"}},
+    {{"label": "Revenue / Total Income", "current": "value", "previous": "value", "change": "+X% YoY", "trend": "up/down/neutral", "comment": "one line context"}},
     {{"label": "Net Profit / PAT", "current": "value", "previous": "value", "change": "+X%", "trend": "up/down/neutral", "comment": "context"}},
     {{"label": "EBITDA", "current": "value", "previous": "value", "change": "+X%", "trend": "up/down/neutral", "comment": "context"}},
     {{"label": "EBITDA Margin", "current": "X%", "previous": "X%", "change": "+X bps", "trend": "up/down/neutral", "comment": "context"}},
@@ -175,91 +140,46 @@ Return this exact JSON structure:
     {{"label": "Operating Cash Flow", "current": "value", "previous": "value", "change": "change", "trend": "up/down/neutral", "comment": "context"}}
   ],
   "profitability": {{
-    "analysis": "3-4 sentences on margin trends with specific numbers, cost structure, comparison to previous period",
-    "gross_margin_current": "X%",
-    "gross_margin_previous": "X%",
-    "net_margin_current": "X%",
-    "net_margin_previous": "X%",
-    "ebitda_margin_current": "X%",
-    "ebitda_margin_previous": "X%",
-    "roe": "X%",
-    "roa": "X%",
-    "key_cost_drivers": ["Specific cost item 1 with actual impact e.g. Raw material costs fell 3% reducing COGS by ₹120 Cr", "Cost item 2"]
+    "analysis": "3-4 sentences with specific numbers",
+    "gross_margin_current": "X%", "gross_margin_previous": "X%",
+    "net_margin_current": "X%", "net_margin_previous": "X%",
+    "ebitda_margin_current": "X%", "ebitda_margin_previous": "X%",
+    "roe": "X%", "roa": "X%",
+    "key_cost_drivers": ["Cost item 1 with actual impact", "Cost item 2"]
   }},
   "growth": {{
-    "analysis": "3-4 sentences on revenue/profit growth with specific numbers, which segments/geographies drove it, deceleration or acceleration",
-    "revenue_growth_yoy": "X%",
-    "profit_growth_yoy": "X%",
-    "volume_growth": "X% or N/A",
-    "price_realization": "context or N/A",
+    "analysis": "3-4 sentences with specific numbers",
+    "revenue_growth_yoy": "X%", "profit_growth_yoy": "X%",
+    "volume_growth": "X% or N/A", "price_realization": "context or N/A",
     "guidance": "Exact guidance from management if mentioned"
   }},
   "liquidity": {{
-    "analysis": "2-3 sentences on liquidity with specific numbers",
-    "current_ratio": "value or N/A",
-    "quick_ratio": "value or N/A",
-    "cash_position": "value",
-    "operating_cash_flow": "value or N/A",
+    "analysis": "2-3 sentences with specific numbers",
+    "current_ratio": "value or N/A", "quick_ratio": "value or N/A",
+    "cash_position": "value", "operating_cash_flow": "value or N/A",
     "free_cash_flow": "value or N/A"
   }},
   "debt": {{
-    "analysis": "2-3 sentences on debt with specific numbers and trend",
-    "total_debt": "value",
-    "debt_to_equity": "value or N/A",
-    "interest_coverage": "value or N/A",
-    "net_debt": "value or N/A",
+    "analysis": "2-3 sentences with specific numbers",
+    "total_debt": "value", "debt_to_equity": "value or N/A",
+    "interest_coverage": "value or N/A", "net_debt": "value or N/A",
     "debt_trend": "Increasing / Decreasing / Stable"
   }},
   "management_commentary": {{
     "overall_tone": "Positive / Cautious / Neutral / Concerned",
-    "key_points": ["Specific verbatim or paraphrased point from management 1", "Point 2", "Point 3", "Point 4", "Point 5"],
-    "outlook_statement": "What management said about future performance",
-    "concerns_raised": ["Specific concern management acknowledged 1", "Concern 2"]
+    "key_points": ["Point 1", "Point 2", "Point 3", "Point 4", "Point 5"],
+    "outlook_statement": "What management said about future",
+    "concerns_raised": ["Concern 1", "Concern 2"]
   }},
   "segments": [
     {{"name": "Segment name", "revenue": "value", "growth": "X%", "margin": "X%", "comment": "key observation"}}
   ],
-  "highlights": [
-    "Specific strength with exact numbers e.g. Revenue grew 18% YoY to ₹4,250 Cr driven by North India expansion",
-    "Strength 2 with numbers",
-    "Strength 3",
-    "Strength 4",
-    "Strength 5"
-  ],
-  "risks": [
-    "Specific risk with context and potential impact",
-    "Risk 2",
-    "Risk 3",
-    "Risk 4"
-  ],
-  "what_to_watch": [
-    "Forward looking item 1 e.g. Watch margin recovery in Q4 as management guided 50-100 bps improvement",
-    "Item 2",
-    "Item 3"
-  ],
-  "chart_data": {{
-    "revenue_trend": [
-      {{"period": "Q1", "value": 0}},
-      {{"period": "Q2", "value": 0}},
-      {{"period": "Q3", "value": 0}},
-      {{"period": "Q4", "value": 0}}
-    ],
-    "margin_trend": [
-      {{"period": "Q1", "gross": 0, "net": 0, "ebitda": 0}},
-      {{"period": "Q2", "gross": 0, "net": 0, "ebitda": 0}},
-      {{"period": "Q3", "gross": 0, "net": 0, "ebitda": 0}},
-      {{"period": "Q4", "gross": 0, "net": 0, "ebitda": 0}}
-    ]
-  }}
+  "highlights": ["Strength 1 with numbers", "Strength 2", "Strength 3", "Strength 4", "Strength 5"],
+  "risks": ["Risk 1 with context", "Risk 2", "Risk 3", "Risk 4"],
+  "what_to_watch": ["Forward looking item 1", "Item 2", "Item 3"]
 }}
 
-Rules:
-- Use ONLY actual data from the document. Never invent numbers.
-- health_score_breakdown reasoning MUST reference specific numbers from the document.
-- Use "N/A" only when genuinely not present.
-- For chart_data: fill in actual quarterly/yearly values if available, otherwise leave as 0.
-- Include ALL segment data if present in document.
-- Score components must add up to health_score total.
+Rules: Use ONLY actual data. Never invent numbers. Use N/A only when genuinely missing. Score components must add up to health_score total.
 
 Document:
 {text[:10000]}"""
@@ -303,10 +223,8 @@ async def register(req: RegisterRequest):
         raise HTTPException(status_code=400, detail="Email already registered")
     user_id = str(uuid.uuid4())
     await users_col.insert_one({
-        "user_id": user_id,
-        "name": req.name,
-        "email": req.email.lower(),
-        "password": hash_password(req.password),
+        "user_id": user_id, "name": req.name,
+        "email": req.email.lower(), "password": hash_password(req.password),
         "created_at": datetime.utcnow().isoformat()
     })
     token = create_token(user_id)
@@ -328,63 +246,42 @@ async def me(user=Depends(get_current_user)):
 async def analyze(file: UploadFile = File(...), user=Depends(get_current_user)):
     content = await file.read()
     filename = file.filename or "upload"
-    filename_lower = filename.lower()
-
-    if filename_lower.endswith(".pdf"):
-        file_type = "pdf"
-    elif filename_lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
-        file_type = "image"
-    else:
-        file_type = "pdf"
+    file_type = "pdf" if filename.lower().endswith(".pdf") else "image"
 
     analysis_id = str(uuid.uuid4())
     await analyses_col.insert_one({
-        "analysis_id": analysis_id,
-        "user_id": user["user_id"],
-        "filename": filename,
-        "file_type": file_type,
-        "status": "processing",
-        "created_at": datetime.utcnow().isoformat(),
-        "result": None
+        "analysis_id": analysis_id, "user_id": user["user_id"],
+        "filename": filename, "file_type": file_type,
+        "status": "processing", "created_at": datetime.utcnow().isoformat(), "result": None
     })
 
     try:
-        if file_type == "pdf":
-            text = extract_text_from_pdf(content)
-            if not text.strip():
-                text = "Unable to extract text from this PDF."
-        else:
-            text = f"[Image file: {filename}. Analyze as financial document.]"
+        text = extract_text_from_pdf(content) if file_type == "pdf" else f"[Image file: {filename}]"
+        if not text.strip():
+            text = "Unable to extract text."
 
         result = None
         ai_used = None
 
-        # Try Groq first
         if GROQ_API_KEY:
             try:
-                logger.info("Attempting analysis with Groq...")
                 result = await analyze_with_groq(text)
                 ai_used = "groq"
-                logger.info("Groq analysis successful")
             except Exception as e:
-                logger.warning(f"Groq failed: {e}. Falling back to Gemini...")
+                logger.warning(f"Groq failed: {e}. Trying Gemini...")
 
-        # Fallback to Gemini
         if result is None and GEMINI_API_KEY:
             try:
-                logger.info("Attempting analysis with Gemini...")
                 result = await analyze_with_gemini(text)
                 ai_used = "gemini"
-                logger.info("Gemini analysis successful")
             except Exception as e:
-                logger.error(f"Gemini also failed: {e}")
-                raise Exception("Both AI providers failed. Please try again later.")
+                logger.error(f"Gemini failed: {e}")
+                raise Exception("Both AI providers failed.")
 
         if result is None:
-            raise Exception("No AI provider available. Please check API keys.")
+            raise Exception("No AI provider available.")
 
         result["_ai_used"] = ai_used
-
         await analyses_col.update_one(
             {"analysis_id": analysis_id},
             {"$set": {"status": "completed", "result": result}}
@@ -399,6 +296,19 @@ async def analyze(file: UploadFile = File(...), user=Depends(get_current_user)):
         )
         return {"analysis_id": analysis_id, "status": "failed", "message": str(e)}
 
+# ─── PUBLIC ENDPOINT — no login required ────────────────────────────────────
+@app.get("/api/public/analyses/{analysis_id}")
+async def get_public_analysis(analysis_id: str):
+    doc = await analyses_col.find_one({"analysis_id": analysis_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if doc.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Analysis not ready")
+    doc.pop("_id", None)
+    doc.pop("user_id", None)  # never expose user info publicly
+    return doc
+
+# ─── PRIVATE ENDPOINTS ───────────────────────────────────────────────────────
 @app.get("/api/analyses")
 async def get_analyses(user=Depends(get_current_user)):
     cursor = analyses_col.find({"user_id": user["user_id"]}).sort("created_at", -1)
