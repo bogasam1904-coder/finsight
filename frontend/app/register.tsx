@@ -1,15 +1,16 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
-  ActivityIndicator, KeyboardAvoidingView, Platform, Animated, StatusBar, ScrollView, Alert
+  ActivityIndicator, KeyboardAvoidingView, Platform, Animated, StatusBar, ScrollView
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://loyal-integrity-production-2b54.up.railway.app';
 
-export default function Login() {
+export default function Register() {
   const router = useRouter();
+  const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
@@ -17,7 +18,7 @@ export default function Login() {
   const shakeAnim = useRef(new Animated.Value(0)).current;
   const fadeAnim = useRef(new Animated.Value(0)).current;
 
-  React.useEffect(() => {
+  useEffect(() => {
     Animated.timing(fadeAnim, { toValue: 1, duration: 600, useNativeDriver: true }).start();
   }, []);
 
@@ -25,71 +26,41 @@ export default function Login() {
     Animated.timing(shakeAnim, { toValue: 14, duration: 55, useNativeDriver: true }),
     Animated.timing(shakeAnim, { toValue: -14, duration: 55, useNativeDriver: true }),
     Animated.timing(shakeAnim, { toValue: 10, duration: 55, useNativeDriver: true }),
-    Animated.timing(shakeAnim, { toValue: -10, duration: 55, useNativeDriver: true }),
     Animated.timing(shakeAnim, { toValue: 0, duration: 55, useNativeDriver: true }),
   ]).start();
 
-  const handleLogin = async () => {
-    const trimEmail = email.trim().toLowerCase();
-    if (!trimEmail || !password) {
-      setError('Please enter your email and password');
-      shake();
-      return;
+  const handleRegister = async () => {
+    if (!name.trim() || !email.trim() || !password) {
+      setError('Please fill in all fields'); shake(); return;
+    }
+    if (password.length < 6) {
+      setError('Password must be at least 6 characters'); shake(); return;
     }
     
-    setLoading(true);
-    setError('');
-    
+    setLoading(true); setError('');
     try {
-      const res = await fetch(`${BACKEND}/api/auth/login`, {
+      const res = await fetch(`${BACKEND}/api/auth/register`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify({ email: trimEmail, password }),
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ name: name.trim(), email: email.trim().toLowerCase(), password }),
       });
       
-      // Parse response
       let data: any;
       const text = await res.text();
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error(`Server error (${res.status}): ${text.substring(0, 100)}`);
-      }
+      try { data = JSON.parse(text); } catch { throw new Error(`Server error: ${text.substring(0, 100)}`); }
       
-      if (!res.ok) {
-        throw new Error(data.detail || data.message || `Login failed (${res.status})`);
-      }
+      if (!res.ok) throw new Error(data.detail || data.message || 'Registration failed');
+      if (!data.token) throw new Error('No token received');
       
-      if (!data.token) {
-        throw new Error('No token received from server');
-      }
-      
-      // Save to storage
       await AsyncStorage.setItem('token', data.token);
-      await AsyncStorage.setItem('user', JSON.stringify({
-        name: data.name,
-        email: data.email,
-        user_id: data.user_id
-      }));
-      
-      // Navigate to tabs
+      await AsyncStorage.setItem('user', JSON.stringify({ name: data.name, email: data.email, user_id: data.user_id }));
       router.replace('/(tabs)');
-      
     } catch (e: any) {
-      const msg = e.message || 'Sign in failed. Please try again.';
-      setError(msg);
-      shake();
-    } finally {
-      setLoading(false);
-    }
+      setError(e.message || 'Registration failed'); shake();
+    } finally { setLoading(false); }
   };
 
-  const continueAsGuest = () => {
-    router.replace('/(tabs)');
-  };
+  const continueAsGuest = () => router.replace('/(tabs)');
 
   return (
     <KeyboardAvoidingView style={s.root} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
@@ -98,13 +69,7 @@ export default function Login() {
         <View style={[s.blob, { width: 380, height: 380, backgroundColor: 'rgba(79,138,255,0.11)', top: -130, right: -110 }]} />
         <View style={[s.blob, { width: 260, height: 260, backgroundColor: 'rgba(34,197,94,0.07)', bottom: -60, left: -80 }]} />
       </View>
-      
-      <Animated.ScrollView
-        contentContainerStyle={s.scroll}
-        keyboardShouldPersistTaps="handled"
-        style={{ opacity: fadeAnim }}
-        showsVerticalScrollIndicator={false}
-      >
+      <Animated.ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled" style={{ opacity: fadeAnim }} showsVerticalScrollIndicator={false}>
         <TouchableOpacity style={s.back} onPress={() => router.canGoBack() ? router.back() : router.replace('/')}>
           <Text style={s.backText}>← Back</Text>
         </TouchableOpacity>
@@ -112,11 +77,11 @@ export default function Login() {
         <View style={s.logoArea}>
           <Text style={s.emoji}>📊</Text>
           <Text style={s.appName}>FinSight</Text>
-          <Text style={s.tagline}>Welcome back</Text>
+          <Text style={s.tagline}>Create your free account</Text>
         </View>
 
         <Animated.View style={[s.card, { transform: [{ translateX: shakeAnim }] }]}>
-          <Text style={s.cardTitle}>Sign In</Text>
+          <Text style={s.cardTitle}>Get Started Free</Text>
 
           {error ? (
             <View style={s.errorBox}>
@@ -124,6 +89,19 @@ export default function Login() {
               <Text style={s.errorText}>{error}</Text>
             </View>
           ) : null}
+
+          <View style={s.field}>
+            <Text style={s.label}>Full Name</Text>
+            <TextInput
+              style={s.input}
+              placeholder="Your name"
+              placeholderTextColor="rgba(255,255,255,0.2)"
+              value={name}
+              onChangeText={setName}
+              autoCapitalize="words"
+              textContentType="name"
+            />
+          </View>
 
           <View style={s.field}>
             <Text style={s.label}>Email</Text>
@@ -144,43 +122,28 @@ export default function Login() {
             <Text style={s.label}>Password</Text>
             <TextInput
               style={s.input}
-              placeholder="••••••••"
+              placeholder="Min 6 characters"
               placeholderTextColor="rgba(255,255,255,0.2)"
               value={password}
               onChangeText={setPassword}
               secureTextEntry
-              autoComplete="password"
-              textContentType="password"
-              onSubmitEditing={handleLogin}
+              textContentType="newPassword"
+              onSubmitEditing={handleRegister}
               returnKeyType="done"
             />
           </View>
 
-          <TouchableOpacity
-            style={[s.submitBtn, loading && s.btnDisabled]}
-            onPress={handleLogin}
-            disabled={loading}
-          >
-            {loading
-              ? <ActivityIndicator color="#fff" />
-              : <Text style={s.submitText}>Sign In →</Text>
-            }
+          <TouchableOpacity style={[s.submitBtn, loading && s.btnDisabled]} onPress={handleRegister} disabled={loading}>
+            {loading ? <ActivityIndicator color="#fff" /> : <Text style={s.submitText}>Create Account →</Text>}
           </TouchableOpacity>
 
           <TouchableOpacity style={s.guestBtn} onPress={continueAsGuest}>
             <Text style={s.guestBtnText}>Continue without account →</Text>
           </TouchableOpacity>
 
-          <View style={s.divider}>
-            <View style={s.line} />
-            <Text style={s.or}>or</Text>
-            <View style={s.line} />
-          </View>
-
-          <TouchableOpacity onPress={() => router.push('/register')} style={{ alignItems: 'center' }}>
-            <Text style={s.switchText}>
-              No account? <Text style={s.switchLink}>Create one free</Text>
-            </Text>
+          <View style={s.divider}><View style={s.line} /><Text style={s.or}>or</Text><View style={s.line} /></View>
+          <TouchableOpacity onPress={() => router.push('/login')} style={{ alignItems: 'center' }}>
+            <Text style={s.switchText}>Already have an account? <Text style={s.switchLink}>Sign in</Text></Text>
           </TouchableOpacity>
         </Animated.View>
       </Animated.ScrollView>
@@ -195,10 +158,10 @@ const s = StyleSheet.create({
   scroll: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 24, paddingTop: 70, paddingBottom: 40 },
   back: { marginBottom: 24 },
   backText: { color: 'rgba(255,255,255,0.4)', fontSize: 15, fontWeight: '600' },
-  logoArea: { alignItems: 'center', marginBottom: 36 },
+  logoArea: { alignItems: 'center', marginBottom: 32 },
   emoji: { fontSize: 52, marginBottom: 10 },
-  appName: { fontSize: 34, fontWeight: '900', color: '#fff', letterSpacing: -1, marginBottom: 4 },
-  tagline: { color: 'rgba(255,255,255,0.35)', fontSize: 15 },
+  appName: { fontSize: 32, fontWeight: '900', color: '#fff', letterSpacing: -1, marginBottom: 4 },
+  tagline: { color: 'rgba(255,255,255,0.35)', fontSize: 14 },
   card: { backgroundColor: '#0D1426', borderRadius: 24, padding: 28, borderWidth: 1, borderColor: 'rgba(255,255,255,0.07)' },
   cardTitle: { fontSize: 22, fontWeight: '900', color: '#fff', marginBottom: 20, letterSpacing: -0.5 },
   errorBox: { backgroundColor: 'rgba(239,68,68,0.1)', borderRadius: 14, padding: 14, marginBottom: 18, borderWidth: 1, borderColor: 'rgba(239,68,68,0.22)', flexDirection: 'row', gap: 10, alignItems: 'flex-start' },
@@ -211,7 +174,7 @@ const s = StyleSheet.create({
   btnDisabled: { opacity: 0.6 },
   submitText: { color: '#fff', fontSize: 16, fontWeight: '800' },
   guestBtn: { alignItems: 'center', paddingVertical: 14 },
-  guestBtnText: { color: 'rgba(255,255,255,0.35)', fontSize: 13, fontWeight: '500' },
+  guestBtnText: { color: 'rgba(255,255,255,0.35)', fontSize: 13 },
   divider: { flexDirection: 'row', alignItems: 'center', marginVertical: 10, gap: 12 },
   line: { flex: 1, height: 1, backgroundColor: 'rgba(255,255,255,0.06)' },
   or: { color: 'rgba(255,255,255,0.2)', fontSize: 12 },
