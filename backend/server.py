@@ -656,6 +656,20 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
     return []
 
 
+async def verify_pdf_url(client: httpx.AsyncClient, url: str) -> bool:
+    """
+    HEAD-check a PDF URL to confirm it actually exists (not 404/403).
+    Falls back to GET if HEAD is not supported.
+    """
+    try:
+        r = await client.head(url, headers=BSE_HEADERS, timeout=8)
+        if r.status_code == 405:  # HEAD not allowed — try GET with range
+            r = await client.get(url, headers={**BSE_HEADERS, "Range": "bytes=0-10"}, timeout=8)
+        return r.status_code in (200, 206)
+    except Exception:
+        return False
+
+
 async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
     if not bse_code:
         return []
@@ -671,22 +685,50 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
                 f"&strSearch=P&strToDate={to_dt}&strType=C"
             )
 
+        # BSE stores PDFs in two possible locations
+        def _pdf_urls(pdf_name: str) -> List[str]:
+            return [
+                f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_name}",
+                f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{pdf_name}",
+            ]
+
         filings: List[dict] = []
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            # Warm BSE session
+            await client.get("https://www.bseindia.com/", headers=BSE_HEADERS)
+
             for cat, max_items in [("Result", 15), ("Annual+Report", 5)]:
                 r = await client.get(_bse_url(cat), headers=BSE_HEADERS)
-                if r.status_code != 200: continue
+                if r.status_code != 200:
+                    continue
+
                 for item in (r.json().get("Table", []))[:max_items]:
                     pdf_name = item.get("ATTACHMENTNAME", "").strip()
-                    if not pdf_name: continue
+                    if not pdf_name:
+                        continue
+
                     title = item.get("SUBJECT", item.get("CATEGORYNAME", "Financial Results"))
+
+                    # Try both AttachLive and AttachHis locations
+                    working_url = None
+                    for candidate_url in _pdf_urls(pdf_name):
+                        if await verify_pdf_url(client, candidate_url):
+                            working_url = candidate_url
+                            break
+
+                    if not working_url:
+                        logger.warning(f"BSE PDF not found for {pdf_name} — skipping")
+                        continue
+
                     filings.append({
                         "title": title,
                         "date": item.get("NEWS_DT", ""),
-                        "pdf_url": f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_name}",
+                        "pdf_url": working_url,
                         "type": "Annual Report" if cat == "Annual+Report" else _classify_filing(title),
                         "source": "BSE", "symbol": symbol, "bse_code": bse_code,
                     })
+
+        logger.info(f"BSE: found {len(filings)} valid filings for {bse_code}")
         return filings[:12]
     except Exception as e:
         logger.warning(f"BSE filings error for {bse_code}: {e}")
