@@ -1013,3 +1013,291 @@ async def delete_analysis(analysis_id: str, user=Depends(get_current_user)):
     if r.deleted_count == 0:
         raise HTTPException(404, "Analysis not found or does not belong to you")
     return {"deleted": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PDF EXPORT  — converts analysis result to a styled PDF via WeasyPrint
+# ═══════════════════════════════════════════════════════════════════════════════
+@app.get("/api/analyses/{analysis_id}/export-pdf")
+async def export_pdf(analysis_id: str):
+    doc = await analyses_col.find_one({"analysis_id": analysis_id})
+    if not doc or doc.get("status") != "completed":
+        raise HTTPException(404, "Analysis not found")
+
+    result = doc.get("result", {})
+    filename = doc.get("filename", "report").replace(".pdf", "")
+
+    html = _build_report_html(result)
+
+    loop = asyncio.get_event_loop()
+    pdf_bytes = await loop.run_in_executor(executor, _render_pdf, html)
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}_finsight.pdf"',
+            "Content-Length": str(len(pdf_bytes)),
+        },
+    )
+
+
+def _render_pdf(html: str) -> bytes:
+    from weasyprint import HTML
+    return HTML(string=html).write_pdf()
+
+
+def _build_report_html(r: dict) -> str:
+    def val(v):
+        return v if v and v != "N/A" else "—"
+
+    # Build metrics rows
+    metrics_rows = ""
+    for m in r.get("key_metrics", []):
+        trend = m.get("trend", "neutral")
+        arrow = "▲" if trend == "up" else ("▼" if trend == "down" else "●")
+        color = "#16a34a" if trend == "up" else ("#dc2626" if trend == "down" else "#6b7280")
+        metrics_rows += f"""
+        <tr>
+            <td>{val(m.get('label'))}</td>
+            <td><strong>{val(m.get('current'))}</strong></td>
+            <td>{val(m.get('previous'))}</td>
+            <td style="color:{color}">{arrow} {val(m.get('change'))}</td>
+            <td style="color:#6b7280;font-size:11px">{val(m.get('comment'))}</td>
+        </tr>"""
+
+    # Score breakdown
+    score_rows = ""
+    for c in r.get("health_score_breakdown", {}).get("components", []):
+        pct = int((c.get("score", 0) / c.get("max", 1)) * 100)
+        bar_color = "#16a34a" if pct >= 70 else ("#f59e0b" if pct >= 40 else "#dc2626")
+        score_rows += f"""
+        <tr>
+            <td>{val(c.get('category'))}</td>
+            <td>{c.get('score')}/{c.get('max')}</td>
+            <td>{c.get('rating','')}</td>
+            <td>
+                <div style="background:#e5e7eb;border-radius:4px;height:8px;width:120px">
+                    <div style="background:{bar_color};width:{pct}%;height:8px;border-radius:4px"></div>
+                </div>
+            </td>
+            <td style="color:#6b7280;font-size:10px">{val(c.get('reasoning'))}</td>
+        </tr>"""
+
+    # Highlights, risks, what to watch
+    def bullet_list(items):
+        return "".join(f"<li>{i}</li>" for i in (items or []))
+
+    # Management key points
+    mgmt = r.get("management_commentary", {})
+    mgmt_points = bullet_list(mgmt.get("key_points", []))
+    concerns     = bullet_list(mgmt.get("concerns_raised", []))
+
+    # Segments
+    segment_rows = ""
+    for s in r.get("segments", []):
+        segment_rows += f"""
+        <tr>
+            <td>{val(s.get('name'))}</td>
+            <td>{val(s.get('revenue'))}</td>
+            <td>{val(s.get('growth'))}</td>
+            <td>{val(s.get('margin'))}</td>
+            <td style="color:#6b7280;font-size:11px">{val(s.get('comment'))}</td>
+        </tr>"""
+
+    health = r.get("health_score", 0)
+    health_color = (
+        "#16a34a" if health >= 75 else
+        "#65a30d" if health >= 60 else
+        "#f59e0b" if health >= 45 else
+        "#dc2626"
+    )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ font-family: Inter, Arial, sans-serif; font-size:13px; color:#1f2937; background:#fff; }}
+  .page {{ padding: 40px 48px; }}
+
+  /* Header */
+  .header {{ display:flex; justify-content:space-between; align-items:flex-start;
+             border-bottom:3px solid #2563eb; padding-bottom:20px; margin-bottom:28px; }}
+  .header-left h1 {{ font-size:22px; font-weight:700; color:#1e3a8a; }}
+  .header-left p  {{ font-size:12px; color:#6b7280; margin-top:4px; }}
+  .score-badge {{ text-align:center; background:{health_color}; color:#fff;
+                  border-radius:12px; padding:12px 20px; }}
+  .score-badge .num {{ font-size:36px; font-weight:700; line-height:1; }}
+  .score-badge .lbl {{ font-size:11px; margin-top:2px; }}
+
+  /* Meta */
+  .meta-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:24px; }}
+  .meta-box {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px; }}
+  .meta-box .label {{ font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; }}
+  .meta-box .value {{ font-size:13px; font-weight:600; color:#1e293b; margin-top:4px; }}
+
+  /* Sections */
+  .section {{ margin-bottom:24px; }}
+  .section-title {{ font-size:14px; font-weight:700; color:#1e3a8a;
+                    border-left:4px solid #2563eb; padding-left:10px; margin-bottom:12px; }}
+
+  /* Summary boxes */
+  .summary-box {{ background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px;
+                  padding:14px; margin-bottom:12px; line-height:1.7; color:#1e3a8a; }}
+  .verdict-box  {{ background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px;
+                   padding:14px; line-height:1.7; color:#14532d; }}
+
+  /* Tables */
+  table {{ width:100%; border-collapse:collapse; font-size:12px; }}
+  th {{ background:#1e3a8a; color:#fff; padding:8px 10px; text-align:left; font-weight:600; }}
+  td {{ padding:7px 10px; border-bottom:1px solid #f1f5f9; vertical-align:top; }}
+  tr:nth-child(even) td {{ background:#f8fafc; }}
+
+  /* Two col */
+  .two-col {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
+
+  /* Lists */
+  ul {{ padding-left:18px; line-height:1.9; }}
+  ul li {{ color:#374151; }}
+
+  /* Footer */
+  .footer {{ margin-top:32px; border-top:1px solid #e5e7eb; padding-top:12px;
+             font-size:10px; color:#9ca3af; display:flex; justify-content:space-between; }}
+
+  /* Page break */
+  .break {{ page-break-before: always; }}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="header-left">
+      <h1>FinSight Financial Analysis Report</h1>
+      <p>{val(r.get('company_name'))} &nbsp;|&nbsp; {val(r.get('period'))} &nbsp;|&nbsp; {val(r.get('statement_type'))}</p>
+      <p style="margin-top:6px;color:#94a3b8;font-size:11px">Generated on {datetime.utcnow().strftime('%d %b %Y %H:%M UTC')}</p>
+    </div>
+    <div class="score-badge">
+      <div class="num">{health}</div>
+      <div class="lbl">Health Score</div>
+      <div style="font-size:12px;margin-top:4px;font-weight:600">{val(r.get('health_label'))}</div>
+    </div>
+  </div>
+
+  <!-- META -->
+  <div class="meta-grid">
+    <div class="meta-box"><div class="label">Company</div><div class="value">{val(r.get('company_name'))}</div></div>
+    <div class="meta-box"><div class="label">Period</div><div class="value">{val(r.get('period'))}</div></div>
+    <div class="meta-box"><div class="label">Report Type</div><div class="value">{val(r.get('statement_type'))}</div></div>
+    <div class="meta-box"><div class="label">Currency</div><div class="value">{val(r.get('currency'))}</div></div>
+  </div>
+
+  <!-- SUMMARY -->
+  <div class="section">
+    <div class="section-title">Executive Summary</div>
+    <div class="summary-box">{val(r.get('executive_summary'))}</div>
+    <div class="verdict-box"><strong>Investor Verdict:</strong> {val(r.get('investor_verdict'))}</div>
+  </div>
+
+  <!-- SCORE BREAKDOWN -->
+  <div class="section">
+    <div class="section-title">Health Score Breakdown</div>
+    <table>
+      <tr><th>Category</th><th>Score</th><th>Rating</th><th>Progress</th><th>Reasoning</th></tr>
+      {score_rows}
+    </table>
+  </div>
+
+  <!-- KEY METRICS -->
+  <div class="section break">
+    <div class="section-title">Key Financial Metrics</div>
+    <table>
+      <tr><th>Metric</th><th>Current</th><th>Previous</th><th>Change</th><th>Comment</th></tr>
+      {metrics_rows}
+    </table>
+  </div>
+
+  <!-- PROFITABILITY + GROWTH -->
+  <div class="two-col section">
+    <div>
+      <div class="section-title">Profitability</div>
+      <div class="summary-box" style="font-size:12px">{val(r.get('profitability', {{}}).get('analysis'))}</div>
+    </div>
+    <div>
+      <div class="section-title">Growth</div>
+      <div class="summary-box" style="font-size:12px">{val(r.get('growth', {{}}).get('analysis'))}</div>
+    </div>
+  </div>
+
+  <!-- LIQUIDITY + DEBT -->
+  <div class="two-col section">
+    <div>
+      <div class="section-title">Liquidity</div>
+      <div class="summary-box" style="font-size:12px">{val(r.get('liquidity', {{}}).get('analysis'))}</div>
+    </div>
+    <div>
+      <div class="section-title">Debt & Leverage</div>
+      <div class="summary-box" style="font-size:12px">{val(r.get('debt', {{}}).get('analysis'))}</div>
+    </div>
+  </div>
+
+  <!-- SEGMENTS -->
+  {f'''<div class="section">
+    <div class="section-title">Business Segments</div>
+    <table>
+      <tr><th>Segment</th><th>Revenue</th><th>Growth</th><th>Margin</th><th>Comment</th></tr>
+      {segment_rows}
+    </table>
+  </div>''' if segment_rows else ''}
+
+  <!-- MANAGEMENT -->
+  <div class="section break">
+    <div class="section-title">Management Commentary — Tone: {val(mgmt.get('overall_tone'))}</div>
+    <div class="two-col">
+      <div>
+        <strong style="font-size:12px">Key Points</strong>
+        <ul style="margin-top:8px;font-size:12px">{mgmt_points}</ul>
+      </div>
+      <div>
+        <strong style="font-size:12px">Concerns Raised</strong>
+        <ul style="margin-top:8px;font-size:12px">{concerns}</ul>
+        <div style="margin-top:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:10px;font-size:11px">
+          <strong>Outlook:</strong> {val(mgmt.get('outlook_statement'))}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HIGHLIGHTS + RISKS + WATCH -->
+  <div class="section">
+    <div class="two-col">
+      <div>
+        <div class="section-title">Key Highlights</div>
+        <ul style="font-size:12px">{bullet_list(r.get('highlights', []))}</ul>
+      </div>
+      <div>
+        <div class="section-title">Key Risks</div>
+        <ul style="font-size:12px;color:#dc2626">{bullet_list(r.get('risks', []))}</ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">What to Watch Next</div>
+    <ul style="font-size:12px">{bullet_list(r.get('what_to_watch', []))}</ul>
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <span>FinSight AI — Automated Financial Analysis</span>
+    <span>For informational purposes only. Not financial advice.</span>
+    <span>{datetime.utcnow().strftime('%d %b %Y')}</span>
+  </div>
+
+</div>
+</body>
+</html>"""
