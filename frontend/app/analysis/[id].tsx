@@ -120,19 +120,32 @@ export default function AnalysisScreen() {
     const company = (analysis.result.company_name || 'FinSight').replace(/[^a-z0-9]/gi, '_');
     const filename = `${company}_Analysis`;
 
-    if (Platform.OS === 'web') {
-      const pdfUrl = `${BACKEND}/api/analyses/${id}/export-pdf`;
-      const response = await fetch(pdfUrl);
-      if (!response.ok) throw new Error('PDF generation failed');
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${filename}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+   if (Platform.OS === 'web') {
+  const html = pdfHTML(analysis.result, dark);
+  
+  const response = await fetch('https://api.html2pdf.app/v1/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      html: html,
+      apiKey: 'pdliSG0Ajq3ghYvV3adX4OSZNtRLL8IMo0gK52WPIfY3lDwQoFwGfWaHfxWsjUcQ',
+      zoom: 1,
+      landscape: false,
+    })
+  });
+
+  if (!response.ok) throw new Error('PDF generation failed');
+  
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${filename}.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
     } else {
       const html = pdfHTML(analysis.result, dark);
       const { printToFileAsync } = await import('expo-print');
