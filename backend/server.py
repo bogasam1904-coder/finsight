@@ -1047,10 +1047,33 @@ def _render_pdf(html: str) -> bytes:
     from bs4 import BeautifulSoup
     import re
 
-    # Parse key data from HTML
     soup = BeautifulSoup(html, 'html.parser')
     text_content = soup.get_text(separator='\n', strip=True)
     lines = [l.strip() for l in text_content.splitlines() if l.strip()]
+
+    # Clean special characters that latin-1 can't handle
+    def clean(text: str) -> str:
+        return (text
+            .replace('\u2014', '-')   # em dash
+            .replace('\u2013', '-')   # en dash
+            .replace('\u2018', "'")   # left quote
+            .replace('\u2019', "'")   # right quote
+            .replace('\u201c', '"')   # left double quote
+            .replace('\u201d', '"')   # right double quote
+            .replace('\u2022', '-')   # bullet
+            .replace('\u25b2', '^')   # up arrow
+            .replace('\u25bc', 'v')   # down arrow
+            .replace('\u2265', '>=')  # greater equal
+            .replace('\u2264', '<=')  # less equal
+            .encode('latin-1', errors='replace').decode('latin-1')
+        )
+
+    section_keywords = [
+        'Executive Summary', 'Investor Verdict', 'Score Breakdown',
+        'Key Financial Metrics', 'Profitability', 'Growth',
+        'Liquidity', 'Debt', 'Management Commentary',
+        'Segments', 'Key Strengths', 'Key Risks', 'What to Watch'
+    ]
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -1066,18 +1089,10 @@ def _render_pdf(html: str) -> bytes:
     pdf.cell(0, 8, f'Generated {datetime.utcnow().strftime("%d %b %Y %H:%M UTC")}', ln=True, align='C')
     pdf.ln(6)
 
-    section_keywords = [
-        'Executive Summary', 'Investor Verdict', 'Score Breakdown',
-        'Key Financial Metrics', 'Profitability', 'Growth',
-        'Liquidity', 'Debt', 'Management Commentary',
-        'Segments', 'Key Strengths', 'Key Risks', 'What to Watch'
-    ]
-
     for line in lines:
         if not line:
             continue
-
-        # Section headers
+        line = clean(line)
         is_header = any(kw.lower() in line.lower() for kw in section_keywords)
 
         if is_header and len(line) < 60:
@@ -1087,18 +1102,15 @@ def _render_pdf(html: str) -> bytes:
             pdf.set_fill_color(239, 246, 255)
             pdf.cell(0, 9, line[:80], ln=True, fill=True)
             pdf.ln(2)
-
-        elif any(line.startswith(p) for p in ['·', '•', '-', '*']):
+        elif any(line.startswith(p) for p in ['*', '-', '.']):
             pdf.set_font('Helvetica', '', 10)
             pdf.set_text_color(55, 65, 81)
             pdf.cell(6, 7, '-', ln=False)
             pdf.multi_cell(0, 7, line[1:].strip()[:200])
-
-        elif re.match(r'^\d+/\d+', line):  # score like 22/30
+        elif re.match(r'^\d+/\d+', line):
             pdf.set_font('Helvetica', 'B', 10)
             pdf.set_text_color(37, 99, 235)
             pdf.cell(0, 7, line[:100], ln=True)
-
         else:
             pdf.set_font('Helvetica', '', 10)
             pdf.set_text_color(31, 41, 55)
