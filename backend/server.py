@@ -1225,11 +1225,11 @@ def _build_report_html(r: dict) -> str:
   <div class="two-col section">
     <div>
       <div class="section-title">Profitability</div>
-      <div class="summary-box" style="font-size:12px">{val(r.get('profitability', {{}}).get('analysis'))}</div>
+      <div class="summary-box" style="font-size:12px">{val((r.get('profitability') or {}).get('analysis'))}</div>
     </div>
     <div>
       <div class="section-title">Growth</div>
-      <div class="summary-box" style="font-size:12px">{val(r.get('growth', {{}}).get('analysis'))}</div>
+      <div class="summary-box" style="font-size:12px">{val((r.get('growth') or {}).get('analysis'))}</div>
     </div>
   </div>
 
@@ -1237,11 +1237,11 @@ def _build_report_html(r: dict) -> str:
   <div class="two-col section">
     <div>
       <div class="section-title">Liquidity</div>
-      <div class="summary-box" style="font-size:12px">{val(r.get('liquidity', {{}}).get('analysis'))}</div>
+      <div class="summary-box" style="font-size:12px">{val((r.get('liquidity') or {}).get('analysis'))}</div>
     </div>
     <div>
       <div class="section-title">Debt & Leverage</div>
-      <div class="summary-box" style="font-size:12px">{val(r.get('debt', {{}}).get('analysis'))}</div>
+      <div class="summary-box" style="font-size:12px">{val((r.get('debt') or {}).get('analysis'))}</div>
     </div>
   </div>
 
