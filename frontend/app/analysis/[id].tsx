@@ -113,7 +113,7 @@ export default function AnalysisScreen() {
     }
   };
 
-  const handleDownloadPDF = async () => {
+ const handleDownloadPDF = async () => {
     if (!analysis?.result) return;
     setDownloading(true);
     try {
@@ -122,17 +122,46 @@ export default function AnalysisScreen() {
       const html = generatePDFHTML(analysis.result, dark);
 
       if (Platform.OS === 'web') {
-        // ── Use html2pdf.app API for instant real PDF download ──
         const response = await fetch('https://api.html2pdf.app/v1/generate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            html: html,
+            html,
             apiKey: 'pdliSG0Ajq3ghYvV3adX4OSZNtRLL8IMo0gK52WPIfY3lDwQoFwGfWaHfxWsjUcQ',
             zoom: 1,
             landscape: false,
           }),
         });
+        if (!response.ok) throw new Error('PDF generation failed');
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${filename}.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      } else {
+        const [PrintModule, SharingModule] = await Promise.all([
+          import('expo-print'),
+          import('expo-sharing'),
+        ]);
+        const { uri } = await PrintModule.printToFileAsync({ html, base64: false });
+        if (await SharingModule.isAvailableAsync()) {
+          await SharingModule.shareAsync(uri, {
+            mimeType: 'application/pdf',
+            dialogTitle: `Save ${filename}.pdf`,
+            UTI: 'com.adobe.pdf',
+          });
+        }
+      }
+    } catch (e: any) {
+      Alert.alert('Download Failed', e.message || 'Could not generate PDF.');
+    } finally {
+      setDownloading(false);
+    }
+  };
 
         if (!response.ok) throw new Error('PDF generation failed');
 
