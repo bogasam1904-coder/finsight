@@ -21,10 +21,10 @@ export default function HomeTab() {
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
-    Animated.timing(fadeAnim, { toValue: 1, duration: 700, useNativeDriver: true }).start();
+    Animated.timing(fadeAnim, { toValue: 1, duration: 700, useNativeDriver: false }).start();
     const loop = Animated.loop(Animated.sequence([
-      Animated.timing(pulseAnim, { toValue: 1.018, duration: 2800, useNativeDriver: true }),
-      Animated.timing(pulseAnim, { toValue: 1, duration: 2800, useNativeDriver: true }),
+      Animated.timing(pulseAnim, { toValue: 1.018, duration: 2800, useNativeDriver: false }),
+      Animated.timing(pulseAnim, { toValue: 1, duration: 2800, useNativeDriver: false }),
     ]));
     loop.start();
     return () => loop.stop();

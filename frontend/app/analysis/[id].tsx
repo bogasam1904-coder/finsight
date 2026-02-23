@@ -101,7 +101,7 @@ export default function AnalysisScreen() {
         if (res2.ok) {
           const data2 = await res2.json();
           setAnalysis(data2);
-          Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: true }).start();
+          Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: false }).start();
         } else {
           setAnalysis(null);
         }
@@ -114,43 +114,44 @@ export default function AnalysisScreen() {
   };
 
   const handleDownloadPDF = async () => {
-    if (!analysis?.result) return;
-    setDownloading(true);
-    try {
-      const html = pdfHTML(analysis.result, dark);
-      const company = (analysis.result.company_name || 'FinSight').replace(/[^a-z0-9]/gi, '_');
-      const filename = `${company}_Analysis`;
+  if (!analysis?.result) return;
+  setDownloading(true);
+  try {
+    const company = (analysis.result.company_name || 'FinSight').replace(/[^a-z0-9]/gi, '_');
+    const filename = `${company}_Analysis`;
 
-      if (Platform.OS === 'web') {
-        const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${filename}.html`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        Alert.alert('Downloaded!',
-          `"${filename}.html" saved.\n\nTo get PDF: Open the file in browser → Press Ctrl+P (Cmd+P) → "Save as PDF"`);
-      } else {
-        const { printToFileAsync } = await import('expo-print');
-        const { shareAsync, isAvailableAsync } = await import('expo-sharing');
-        const { uri } = await printToFileAsync({ html, base64: false });
-        if (await isAvailableAsync()) {
-          await shareAsync(uri, {
-            mimeType: 'application/pdf',
-            dialogTitle: `Save ${filename}.pdf`,
-            UTI: 'com.adobe.pdf',
-          });
-        }
+    if (Platform.OS === 'web') {
+      const pdfUrl = `${BACKEND}/api/analyses/${id}/export-pdf`;
+      const response = await fetch(pdfUrl);
+      if (!response.ok) throw new Error('PDF generation failed');
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${filename}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } else {
+      const html = pdfHTML(analysis.result, dark);
+      const { printToFileAsync } = await import('expo-print');
+      const { shareAsync, isAvailableAsync } = await import('expo-sharing');
+      const { uri } = await printToFileAsync({ html, base64: false });
+      if (await isAvailableAsync()) {
+        await shareAsync(uri, {
+          mimeType: 'application/pdf',
+          dialogTitle: `Save ${filename}.pdf`,
+          UTI: 'com.adobe.pdf',
+        });
       }
-    } catch (e) {
-      Alert.alert('Error', 'Could not generate PDF. Please try again.');
-    } finally {
-      setDownloading(false);
     }
-  };
+  } catch (e) {
+    Alert.alert('Error', 'Could not generate PDF. Please try again.');
+  } finally {
+    setDownloading(false);
+  }
+};
 
   const shareUrl = `https://finsight-vert.vercel.app/share/${id}`;
 
