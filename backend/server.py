@@ -343,7 +343,7 @@ DOCUMENT:
 def _sync_gemini(text: str) -> dict:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash-exp", generation_config={"temperature":0.1,"max_output_tokens":4096})
+    model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature":0.1,"max_output_tokens":4096})
     resp = model.generate_content(build_prompt(text))
     raw = resp.text.strip().replace("```json","").replace("```","").strip()
     s,e = raw.find('{'), raw.rfind('}')+1

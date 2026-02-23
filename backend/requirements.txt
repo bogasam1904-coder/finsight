@@ -6,7 +6,7 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.2.0
 python-multipart==0.0.9
-google-generativeai==0.7.2
+google-generativeai==0.8.6
 pypdf==4.3.1
 pydantic[email]==2.8.2
 groq==1.0.0
