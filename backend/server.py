@@ -1043,11 +1043,82 @@ async def export_pdf(analysis_id: str):
 
 
 def _render_pdf(html: str) -> bytes:
-    import io
-    from xhtml2pdf import pisa
-    buffer = io.BytesIO()
-    pisa.CreatePDF(html, dest=buffer)
-    return buffer.getvalue()
+    from fpdf import FPDF
+    from bs4 import BeautifulSoup
+    import re
+
+    # Parse key data from HTML
+    soup = BeautifulSoup(html, 'html.parser')
+    text_content = soup.get_text(separator='\n', strip=True)
+    lines = [l.strip() for l in text_content.splitlines() if l.strip()]
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_margins(15, 15, 15)
+
+    # Title
+    pdf.set_font('Helvetica', 'B', 20)
+    pdf.set_text_color(30, 58, 138)
+    pdf.cell(0, 12, 'FinSight Financial Analysis', ln=True, align='C')
+    pdf.set_font('Helvetica', '', 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 8, f'Generated {datetime.utcnow().strftime("%d %b %Y %H:%M UTC")}', ln=True, align='C')
+    pdf.ln(6)
+
+    section_keywords = [
+        'Executive Summary', 'Investor Verdict', 'Score Breakdown',
+        'Key Financial Metrics', 'Profitability', 'Growth',
+        'Liquidity', 'Debt', 'Management Commentary',
+        'Segments', 'Key Strengths', 'Key Risks', 'What to Watch'
+    ]
+
+    for line in lines:
+        if not line:
+            continue
+
+        # Section headers
+        is_header = any(kw.lower() in line.lower() for kw in section_keywords)
+
+        if is_header and len(line) < 60:
+            pdf.ln(4)
+            pdf.set_font('Helvetica', 'B', 13)
+            pdf.set_text_color(30, 58, 138)
+            pdf.set_fill_color(239, 246, 255)
+            pdf.cell(0, 9, line[:80], ln=True, fill=True)
+            pdf.ln(2)
+
+        elif any(line.startswith(p) for p in ['·', '•', '-', '*']):
+            pdf.set_font('Helvetica', '', 10)
+            pdf.set_text_color(55, 65, 81)
+            pdf.cell(6, 7, '-', ln=False)
+            pdf.multi_cell(0, 7, line[1:].strip()[:200])
+
+        elif re.match(r'^\d+/\d+', line):  # score like 22/30
+            pdf.set_font('Helvetica', 'B', 10)
+            pdf.set_text_color(37, 99, 235)
+            pdf.cell(0, 7, line[:100], ln=True)
+
+        else:
+            pdf.set_font('Helvetica', '', 10)
+            pdf.set_text_color(31, 41, 55)
+            try:
+                pdf.multi_cell(0, 6, line[:300])
+            except Exception:
+                pass
+
+    # Footer
+    pdf.ln(10)
+    pdf.set_font('Helvetica', 'I', 9)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(0, 8, 'FinSight AI - For informational purposes only. Not financial advice.', ln=True, align='C')
+
+    return bytes(pdf.output())
+```
+
+**Step 3 — Add `beautifulsoup4` to requirements.txt:**
+```
+beautifulsoup4==4.12.3
 
 
 def _build_report_html(r: dict) -> str:
