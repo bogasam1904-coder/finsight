@@ -1114,12 +1114,6 @@ def _render_pdf(html: str) -> bytes:
     pdf.cell(0, 8, 'FinSight AI - For informational purposes only. Not financial advice.', ln=True, align='C')
 
     return bytes(pdf.output())
-```
-
-**Step 3 — Add `beautifulsoup4` to requirements.txt:**
-```
-beautifulsoup4==4.12.3
-
 
 def _build_report_html(r: dict) -> str:
     def val(v):
