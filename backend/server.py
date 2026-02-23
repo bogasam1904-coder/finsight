@@ -1043,8 +1043,11 @@ async def export_pdf(analysis_id: str):
 
 
 def _render_pdf(html: str) -> bytes:
-    from weasyprint import HTML
-    return HTML(string=html).write_pdf()
+    import io
+    from xhtml2pdf import pisa
+    buffer = io.BytesIO()
+    pisa.CreatePDF(html, dest=buffer)
+    return buffer.getvalue()
 
 
 def _build_report_html(r: dict) -> str:
