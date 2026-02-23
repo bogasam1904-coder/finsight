@@ -18,7 +18,6 @@ const LIGHT = {
 };
 
 function pdfHTML(r: any, dark: boolean): string {
-  const t = dark ? DARK : LIGHT;
   const sc = r.health_score >= 80 ? '#22c55e' : r.health_score >= 60 ? '#f59e0b' : '#ef4444';
   const metricRows = (r.key_metrics || []).filter((m: any) => m.current && m.current !== 'N/A')
     .map((m: any) => `<tr>
@@ -87,21 +86,18 @@ export default function AnalysisScreen() {
       const token = await AsyncStorage.getItem('token');
       const headers: Record<string, string> = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
-
-      // First try private endpoint (with token), fallback to public endpoint
       const res = await fetch(`${BACKEND}/api/analyses/${id}`, { headers });
       if (!res.ok) throw new Error(`${res.status}`);
       const data = await res.json();
       setAnalysis(data);
       Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: true }).start();
-    } catch (e) {
-      // Try public endpoint as fallback
+    } catch {
       try {
         const res2 = await fetch(`${BACKEND}/api/public/analyses/${id}`);
         if (res2.ok) {
           const data2 = await res2.json();
           setAnalysis(data2);
-          Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: false }).start();
+          Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: true }).start();
         } else {
           setAnalysis(null);
         }
@@ -113,13 +109,13 @@ export default function AnalysisScreen() {
     }
   };
 
- const handleDownloadPDF = async () => {
+  const handleDownloadPDF = async () => {
     if (!analysis?.result) return;
     setDownloading(true);
     try {
       const company = (analysis.result.company_name || 'FinSight').replace(/[^a-z0-9]/gi, '_');
       const filename = `${company}_Analysis`;
-      const html = generatePDFHTML(analysis.result, dark);
+      const html = pdfHTML(analysis.result, dark);
 
       if (Platform.OS === 'web') {
         const response = await fetch('https://api.html2pdf.app/v1/generate', {
@@ -162,72 +158,6 @@ export default function AnalysisScreen() {
       setDownloading(false);
     }
   };
-
-        if (!response.ok) throw new Error('PDF generation failed');
-
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${filename}.pdf`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      } else {
-        // ── Mobile: use expo-print + expo-sharing ──
-        const [PrintModule, SharingModule] = await Promise.all([
-          import('expo-print'),
-          import('expo-sharing'),
-        ]);
-        const { uri } = await PrintModule.printToFileAsync({ html, base64: false });
-        if (await SharingModule.isAvailableAsync()) {
-          await SharingModule.shareAsync(uri, {
-            mimeType: 'application/pdf',
-            dialogTitle: `Save ${filename}.pdf`,
-            UTI: 'com.adobe.pdf',
-          });
-        }
-      }
-    } catch (e: any) {
-      Alert.alert('Download Failed', e.message || 'Could not generate PDF. Please try again.');
-    } finally {
-      setDownloading(false);
-    }
-  };
-
-
-  if (!response.ok) throw new Error('PDF generation failed');
-  
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${filename}.pdf`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-    } else {
-      const html = pdfHTML(analysis.result, dark);
-      const { printToFileAsync } = await import('expo-print');
-      const { shareAsync, isAvailableAsync } = await import('expo-sharing');
-      const { uri } = await printToFileAsync({ html, base64: false });
-      if (await isAvailableAsync()) {
-        await shareAsync(uri, {
-          mimeType: 'application/pdf',
-          dialogTitle: `Save ${filename}.pdf`,
-          UTI: 'com.adobe.pdf',
-        });
-      }
-    }
-  } catch (e) {
-    Alert.alert('Error', 'Could not generate PDF. Please try again.');
-  } finally {
-    setDownloading(false);
-  }
-};
 
   const shareUrl = `https://finsight-vert.vercel.app/share/${id}`;
 
@@ -378,7 +308,7 @@ export default function AnalysisScreen() {
             <Text style={{ fontSize: 13, color: t.textSub }}>{r.statement_type} · {r.period} · {r.currency}</Text>
           </View>
 
-          {/* Score */}
+          {/* Score card */}
           <View style={[gs.scoreCard, { backgroundColor: t.card, borderColor: t.border }]}>
             <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 2, textTransform: 'uppercase', color: t.textSub, marginBottom: 10 }}>FINANCIAL HEALTH SCORE</Text>
             <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
@@ -463,9 +393,11 @@ export default function AnalysisScreen() {
                 <Stat label="D/E" val={r.debt.debt_to_equity} />
                 <Stat label="Interest Coverage" val={r.debt.interest_coverage} />
               </View>
-              {r.debt.debt_trend && <View style={{ backgroundColor: r.debt.debt_trend === 'Decreasing' ? '#22c55e15' : r.debt.debt_trend === 'Increasing' ? '#ef444415' : t.cardAlt, borderRadius: 10, padding: 10, alignSelf: 'flex-start' }}>
-                <Text style={{ color: r.debt.debt_trend === 'Decreasing' ? '#22c55e' : r.debt.debt_trend === 'Increasing' ? '#ef4444' : t.textSub, fontWeight: '700', fontSize: 13 }}>Trend: {r.debt.debt_trend}</Text>
-              </View>}
+              {r.debt.debt_trend && (
+                <View style={{ backgroundColor: r.debt.debt_trend === 'Decreasing' ? '#22c55e15' : r.debt.debt_trend === 'Increasing' ? '#ef444415' : t.cardAlt, borderRadius: 10, padding: 10, alignSelf: 'flex-start' }}>
+                  <Text style={{ color: r.debt.debt_trend === 'Decreasing' ? '#22c55e' : r.debt.debt_trend === 'Increasing' ? '#ef4444' : t.textSub, fontWeight: '700', fontSize: 13 }}>Trend: {r.debt.debt_trend}</Text>
+                </View>
+              )}
             </Card>
           )}
 
@@ -527,13 +459,16 @@ export default function AnalysisScreen() {
             <TouchableOpacity
               style={[gs.pdfBtn, { backgroundColor: t.accent, opacity: downloading ? 0.7 : 1 }]}
               onPress={handleDownloadPDF} disabled={downloading}>
-              {downloading ? <ActivityIndicator color="#fff" /> : <>
-                <Text style={{ fontSize: 22 }}>⬇️</Text>
-                <View>
-                  <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Download PDF Report</Text>
-                  <Text style={{ color: 'rgba(255,255,255,0.65)', fontSize: 11, marginTop: 2 }}>Saves in {dark ? 'dark' : 'light'} theme</Text>
-                </View>
-              </>}
+              {downloading
+                ? <ActivityIndicator color="#fff" />
+                : <>
+                    <Text style={{ fontSize: 22 }}>⬇️</Text>
+                    <View>
+                      <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Download PDF Report</Text>
+                      <Text style={{ color: 'rgba(255,255,255,0.65)', fontSize: 11, marginTop: 2 }}>Saves in {dark ? 'dark' : 'light'} theme</Text>
+                    </View>
+                  </>
+              }
             </TouchableOpacity>
 
             <View style={{ flexDirection: 'row', gap: 10, marginBottom: 12 }}>
