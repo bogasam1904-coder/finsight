@@ -385,24 +385,27 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
 
 
 # PDF EXTRACTION
-def extract_pdf_text(content: bytes) -> str:
+def extract_pdf_text(raw_bytes: bytes) -> str:
+    """
+    Entry point for PDF processing.
+    Validates the PDF, checks it's not scanned, then extracts only financial pages.
+    """
     try:
-        reader    = pypdf.PdfReader(io.BytesIO(content))
+        reader    = pypdf.PdfReader(io.BytesIO(raw_bytes))
         num_pages = len(reader.pages)
-        pages     = []
-        for i, page in enumerate(reader.pages):
-            t = page.extract_text() or ""
-            if t.strip(): pages.append(t)
-            if (i + 1) % 20 == 0:
-                logger.info(f"Extracting PDF: page {i+1}/{num_pages}")
-        text       = "\n\n".join(pages)
-        char_count = len(text.strip())
-        logger.info(f"PDF extraction: {char_count:,} chars from {num_pages} pages")
-        if char_count < 300:
+
+        # Quick scan to check if PDF has any selectable text
+        sample_text = ""
+        for page in reader.pages[:10]:
+            sample_text += page.extract_text() or ""
+        if len(sample_text.strip()) < 300:
             raise ValueError(
-                f"This PDF appears to be scanned/image-based — only {char_count} characters extracted "
-                f"from {num_pages} pages. Please download the digital/searchable version from BSE or NSE.")
-        return text
+                f"This PDF appears to be scanned/image-based — no selectable text found in first 10 pages. "
+                f"Please download the digital/searchable version from BSE or NSE.")
+
+        logger.info(f"PDF validated: {num_pages} pages, extracting financial sections...")
+        return extract_financial_snippet(raw_bytes)
+
     except ValueError: raise
     except Exception as e:
         logger.error(f"PDF read error: {e}")
@@ -451,75 +454,68 @@ def _repair_json(s: str) -> str:
 
 # AI PROMPT
 
-def extract_financial_snippet(text: str, max_chars: int = 18000) -> str:
+def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 35000) -> str:
     """
-    Anchor-based extraction: instead of scoring all lines, we hunt for
-    specific financial section headers and extract a window of text around each.
-    This reliably captures Balance Sheet, P&L, Cash Flow and Ratios even when
-    they appear deep in a 500k+ char annual report.
+    Page-score extraction: scores every page by how many financial keywords it contains.
+    Pages with score >= 3 are core financial statement pages (Balance Sheet, P&L, Cash Flow).
+    Always includes first 5 pages (Director Report / Financial Highlights).
+    Works for ANY company PDF — no hardcoded patterns.
     """
-    # Anchors: (keyword_to_search, chars_to_extract_after_it)
-    ANCHORS = [
-        # P&L summary — near start, always present
-        ("financial highlights",       3000),
-        ("profit and loss",            2500),
-        ("statement of profit",        2500),
-        # Balance Sheet — large pre-window since cash appears before Total Assets
-        ("total assets",               4500),
-        ("borrowings",                 2000),
-        # Cash Flow
-        ("cash flow from operating",   2500),
-        # Key Ratios
-        ("debt to equity ratio",       2000),
-        ("key financial ratios",       2000),
-        ("capital adequacy",           1000),
-        ("net advances",               1000),
-        ("management discussion",      2000),
-        ("earnings per share",          800),
+    reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+    total  = len(reader.pages)
+
+    KEYWORDS = [
+        "total assets", "profit and loss", "statement of profit",
+        "cash flow", "balance sheet", "total income", "borrowing",
+        "finance cost", "total equity", "earnings per share",
+        "debt to equity", "financial highlights", "key financial ratios",
+        "total revenue", "gross income", "net profit", "ebitda",
+        "total liabilities", "current assets", "current liabilities",
     ]
 
-    seen_positions = set()
-    sections = []
+    core_pages = set(range(min(5, total)))  # first 5 pages always included
+    for i, page in enumerate(reader.pages):
+        t = (page.extract_text() or "").lower()
+        score = sum(1 for kw in KEYWORDS if kw in t)
+        if score >= 3:
+            core_pages.add(i)
 
-    for keyword, window in ANCHORS:
-        # Search from beginning of text
-        search_start = 0
-        while True:
-            idx = text.lower().find(keyword.lower(), search_start)
-            if idx == -1: break
-            # Avoid extracting the same region twice (within 500 chars)
-            bucket = idx // 500
-            if bucket not in seen_positions:
-                seen_positions.add(bucket)
-                chunk = text[max(0, idx - 1000): idx + window].strip()  # 1000 pre-chars catches cash/assets listed before anchor
-                sections.append(f"\n=== {keyword.upper()} ===\n" + chunk)
-            # Only take first occurrence for most anchors
-            break
+    logger.info(f"PDF: {total} pages, {len(core_pages)} financial pages selected: {sorted(core_pages)}")
 
-    combined = "\n".join(sections)
+    result = ""
+    for i in sorted(core_pages):
+        pt = reader.pages[i].extract_text() or ""
+        if pt.strip():
+            result += f"\n--- PAGE {i+1} ---\n{pt}\n"
 
-    # Trim to max_chars, but always keep intro (first 1500 chars of doc)
-    intro = text[:1500]
-    full  = intro + "\n\n" + combined
-    return full[:max_chars]
+    logger.info(f"Extracted {len(result):,} chars from financial pages")
+    return result[:max_chars]
 
 
 def build_prompt(text: str) -> str:
-    snippet = extract_financial_snippet(text, max_chars=18000)
-    logger.info(f"Prompt snippet: {len(snippet)} chars (from {len(text)} total)")
+    # text here is already the financial-pages extract — pass it directly
+    snippet = text[:35000]
+    logger.info(f"Prompt snippet: {len(snippet)} chars")
 
     return f"""You are a Senior Equity Research Analyst, Credit Analyst, and Forensic Accounting Expert with 20+ years of experience.
 
 Analyze the provided financial document and return ONLY a single valid JSON object. No markdown, no code fences, no explanation text before or after.
 
 ABSOLUTE RULES:
-1. Use ONLY real numbers from the document. Do NOT invent or estimate anything.
-2. NEVER write placeholder text like "val", "X%", "Item 1", "Strength 1", "actual value", "actual %", or any template text.
-3. If data is genuinely absent, write "Not reported".
-4. All 7 score components must add up exactly to health_score.
-5. Write analysis in simple English for beginner investors — always explain WHY.
-6. Return complete valid JSON — close all brackets and braces.
-
+1. Use ONLY real numbers extracted from the document. Do NOT invent numbers.
+2. NEVER write "Not reported" if the data exists anywhere in the document — search carefully.
+3. COMPUTE every possible ratio from available data. Examples:
+   - Net Profit Margin = PAT / Total Income × 100
+   - EBITDA = PBT + Depreciation + Finance Costs (if not stated directly)
+   - EBITDA Margin = EBITDA / Total Income × 100
+   - Debt to Equity = Total Debt (Debt Securities + Borrowings) / Total Equity
+   - ROE = PAT / Total Equity × 100
+   - ROA = PAT / Total Assets × 100
+   - Interest Coverage = EBIT / Finance Costs
+   - Current Ratio = Current Assets / Current Liabilities (if available)
+4. For NBFCs and financial companies: Total Debt = Debt Securities + Borrowings (other than debt securities) + Subordinated Liabilities
+5. NEVER write placeholder text like "val", "X%", "actual value", "actual %", or template labels.
+6. Only write "Not reported" when the underlying raw numbers to compute a metric are completely absent — this should be RARE.
 {{
   "company_name": "Full legal name from document",
   "statement_type": "Annual Report / Q1 Results / Q2 Results / Q3 Results / Q4 Results / Half-Year Results / Balance Sheet",
@@ -654,6 +650,9 @@ ABSOLUTE RULES:
 
 IMPORTANT: Replace ALL template labels above (like "REAL value", "REAL %") with actual data from the document.
 Never output "REAL value", "REAL %", "val", "X%", or any placeholder. Write "Not reported" only if data is genuinely missing.
+
+PRE-COMPUTED RATIOS (already calculated from document — USE THESE VALUES directly):
+{pre_computed}
 
 FINANCIAL DOCUMENT:
 {snippet}"""
