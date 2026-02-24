@@ -972,7 +972,7 @@ async def generate_pdf(req: PDFRequest):
             async with httpx.AsyncClient(timeout=90) as c:
                 r = await c.post("https://api.html2pdf.app/v1/generate",
                     json={"html": html_content, "apiKey": HTML2PDF_KEY, "zoom": 1, "landscape": False,
-                          "marginTop": "10mm", "marginBottom": "10mm", "marginLeft": "10mm", "marginRight": "10mm"},
+                          "marginTop": 10, "marginBottom": 10, "marginLeft": 10, "marginRight": 10},
                     headers={"Content-Type": "application/json"})
             if r.status_code == 200:
                 logger.info(f"PDF generated on attempt {attempt} — {len(r.content):,} bytes")
