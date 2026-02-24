@@ -451,57 +451,63 @@ def _repair_json(s: str) -> str:
 
 # AI PROMPT
 
-def extract_financial_snippet(text: str, max_chars: int = 8000) -> str:
+def extract_financial_snippet(text: str, max_chars: int = 18000) -> str:
     """
-    Instead of blindly taking first N chars, intelligently extract the most
-    financially relevant sections from the document. This avoids sending the
-    entire 65k document and hitting token limits on free-tier AI models.
+    Anchor-based extraction: instead of scoring all lines, we hunt for
+    specific financial section headers and extract a window of text around each.
+    This reliably captures Balance Sheet, P&L, Cash Flow and Ratios even when
+    they appear deep in a 500k+ char annual report.
     """
-    lines = text.splitlines()
-    
-    # Keywords that signal financially important sections
-    financial_keywords = [
-        "revenue", "income", "profit", "loss", "ebitda", "pat", "eps",
-        "debt", "equity", "assets", "liabilities", "cash", "borrowing",
-        "turnover", "margin", "ratio", "dividend", "crore", "lakh", "million",
-        "quarter", "annual", "fy20", "fy21", "fy22", "fy23", "fy24", "fy25",
-        "balance sheet", "p&l", "statement", "financial result",
-        "total income", "total expense", "finance cost", "depreciation",
-        "current ratio", "net worth", "return on", "operating"
+    # Anchors: (keyword_to_search, chars_to_extract_after_it)
+    ANCHORS = [
+        # P&L summary — near start, always present
+        ("financial highlights",       3000),
+        ("profit and loss",            2500),
+        ("statement of profit",        2500),
+        # Balance Sheet — large pre-window since cash appears before Total Assets
+        ("total assets",               4500),
+        ("borrowings",                 2000),
+        # Cash Flow
+        ("cash flow from operating",   2500),
+        # Key Ratios
+        ("debt to equity ratio",       2000),
+        ("key financial ratios",       2000),
+        ("capital adequacy",           1000),
+        ("net advances",               1000),
+        ("management discussion",      2000),
+        ("earnings per share",          800),
     ]
-    
-    scored_lines = []
-    for i, line in enumerate(lines):
-        lower = line.lower().strip()
-        if not lower: continue
-        score = sum(1 for kw in financial_keywords if kw in lower)
-        # Boost lines with numbers (financial data)
-        import re
-        if re.search(r'\d{2,}', line): score += 2
-        # Boost lines that look like table rows
-        if line.count('|') >= 2 or line.count('	') >= 2: score += 1
-        scored_lines.append((score, i, line))
-    
-    # Always include first 1500 chars (company name, intro)
+
+    seen_positions = set()
+    sections = []
+
+    for keyword, window in ANCHORS:
+        # Search from beginning of text
+        search_start = 0
+        while True:
+            idx = text.lower().find(keyword.lower(), search_start)
+            if idx == -1: break
+            # Avoid extracting the same region twice (within 500 chars)
+            bucket = idx // 500
+            if bucket not in seen_positions:
+                seen_positions.add(bucket)
+                chunk = text[max(0, idx - 1000): idx + window].strip()  # 1000 pre-chars catches cash/assets listed before anchor
+                sections.append(f"\n=== {keyword.upper()} ===\n" + chunk)
+            # Only take first occurrence for most anchors
+            break
+
+    combined = "\n".join(sections)
+
+    # Trim to max_chars, but always keep intro (first 1500 chars of doc)
     intro = text[:1500]
-    
-    # Sort by score, pick top lines, then re-sort by original line number
-    top_lines = sorted(scored_lines, key=lambda x: -x[0])[:200]
-    top_lines = sorted(top_lines, key=lambda x: x[1])  # restore order
-    
-    financial_section = "\n".join(l for _, _, l in top_lines)
-    
-    # Combine: intro + financial section, trim to max_chars
-    combined = intro + "\n\n--- KEY FINANCIAL DATA ---\n\n" + financial_section
-    combined = combined[:max_chars]
-    
-    return combined
+    full  = intro + "\n\n" + combined
+    return full[:max_chars]
 
 
 def build_prompt(text: str) -> str:
-    # Extract only the financially relevant content — keeps under token limits
-    snippet = extract_financial_snippet(text, max_chars=8000)
+    snippet = extract_financial_snippet(text, max_chars=18000)
     logger.info(f"Prompt snippet: {len(snippet)} chars (from {len(text)} total)")
+
     return f"""You are a Senior Equity Research Analyst, Credit Analyst, and Forensic Accounting Expert with 20+ years of experience.
 
 Analyze the provided financial document and return ONLY a single valid JSON object. No markdown, no code fences, no explanation text before or after.
