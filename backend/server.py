@@ -651,8 +651,7 @@ ABSOLUTE RULES:
 IMPORTANT: Replace ALL template labels above (like "REAL value", "REAL %") with actual data from the document.
 Never output "REAL value", "REAL %", "val", "X%", or any placeholder. Write "Not reported" only if data is genuinely missing.
 
-PRE-COMPUTED RATIOS (already calculated from document — USE THESE VALUES directly):
-{pre_computed}
+COMPUTE ALL RATIOS from the numbers found in the document. Show your calculations in the reasoning.
 
 FINANCIAL DOCUMENT:
 {snippet}"""
