@@ -902,24 +902,6 @@ async def run_analysis(text: str) -> dict:
     # All providers failed
     error_summary = " | ".join(errors) if errors else "No API keys configured"
     raise Exception(f"All AI providers failed. {error_summary}")
-            logger.error(f"All Groq failed: {e}"); errors.append(f"Groq: {str(e)[:100]}")
-
-    try:
-        result = await loop.run_in_executor(executor, _sync_together, text)
-        logger.info("✓ Together AI succeeded"); return result
-    except Exception as e:
-        logger.warning(f"Together failed: {e}"); errors.append(f"Together: {str(e)[:100]}")
-
-    try:
-        result = await loop.run_in_executor(executor, _sync_openrouter, text)
-        logger.info("✓ OpenRouter succeeded"); return result
-    except Exception as e:
-        logger.warning(f"OpenRouter failed: {e}"); errors.append(f"OpenRouter: {str(e)[:100]}")
-
-    raise Exception("All AI providers failed. " + " | ".join(errors))
-
-
-# ROUTES
 @app.get("/api/health")
 async def health():
     company_count = await companies_col.count_documents({})
