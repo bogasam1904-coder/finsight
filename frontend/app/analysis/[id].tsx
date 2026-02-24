@@ -80,7 +80,8 @@ export default function AnalysisScreen() {
   const [dark, setDark] = useState(true);
   const [downloading, setDownloading] = useState(false);
   const [copied, setCopied] = useState(false);
-  // useNativeDriver:false on web to avoid the "native animated module missing" warning
+  
+  // FIX #2: useNativeDriver set to false for web compatibility
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const t = dark ? DARK : LIGHT;
 
@@ -116,6 +117,7 @@ export default function AnalysisScreen() {
     }
   };
 
+  // FIX #1: Enhanced PDF download with proper error handling and logging
   const handleDownloadPDF = async () => {
     if (!analysis?.result) return;
     setDownloading(true);
@@ -127,26 +129,46 @@ export default function AnalysisScreen() {
       if (Platform.OS === 'web') {
         // ── Call OUR backend proxy which calls html2pdf.app server-side ──
         // This avoids the 403 CORS error from calling html2pdf.app directly in browser
+        console.log('🔄 Calling backend PDF generation endpoint...');
         const response = await fetch(`${BACKEND}/api/generate-pdf`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'Accept': 'application/pdf'
+          },
           body: JSON.stringify({ html }),
         });
 
+        console.log('📄 PDF Response status:', response.status);
+
         if (!response.ok) {
           const err = await response.text().catch(() => '');
+          console.error('❌ PDF generation error:', err);
           throw new Error(`PDF generation failed (${response.status}): ${err.substring(0, 100)}`);
         }
 
         const blob = await response.blob();
+        console.log('✅ PDF blob size:', blob.size, 'bytes');
+        
+        // Verify it's actually a PDF
+        if (blob.size < 1000) {
+          throw new Error('PDF file seems too small, generation may have failed');
+        }
+        
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = `${filename}.pdf`;
         document.body.appendChild(a);
         a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        
+        // Clean up after a short delay
+        setTimeout(() => {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }, 100);
+        
+        console.log('✅ PDF download initiated');
       } else {
         // ── Mobile: expo-print + expo-sharing ──
         const [PrintModule, SharingModule] = await Promise.all([
@@ -163,13 +185,15 @@ export default function AnalysisScreen() {
         }
       }
     } catch (e: any) {
+      console.error('❌ PDF download error:', e);
       Alert.alert('Download Failed', e.message || 'Could not generate PDF. Please try again.');
     } finally {
       setDownloading(false);
     }
   };
 
-  const shareUrl = `https://finsight-vert.vercel.app/share/${id}`;
+  // FIX #3: Update share URL to use correct domain
+  const shareUrl = `${BACKEND.replace('loyal-integrity-production-2b54.up.railway.app', 'finsight-vert.vercel.app')}/share/${id}`;
 
   const handleCopyLink = async () => {
     if (Platform.OS === 'web' && navigator?.clipboard) {
