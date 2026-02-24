@@ -1,4 +1,4 @@
-import os, uuid, logging, json, io, asyncio, httpx
+import os, uuid, logging, json, io, asyncio, httpx, re
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, BackgroundTasks
@@ -22,7 +22,7 @@ GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 
 executor = ThreadPoolExecutor(max_workers=4)
-app = FastAPI(title="FinSight API v10")
+app = FastAPI(title="FinSight API v11")
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
 @app.middleware("http")
@@ -44,10 +44,11 @@ async def cors_middleware(request: Request, call_next):
     return response
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-client       = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
-db           = client.finsight
-users_col    = db.users
-analyses_col = db.analyses
+client        = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
+db            = client.finsight
+users_col     = db.users
+analyses_col  = db.analyses
+companies_col = db.companies   # ← dynamic company master (all NSE + BSE listings)
 
 # ── AUTH ──────────────────────────────────────────────────────────────────────
 pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -65,8 +66,8 @@ async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(securit
         payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         uid = payload.get("sub")
         if not uid: raise HTTPException(401, "Invalid token")
-    except JWTError as e:
-        raise HTTPException(401, f"Token expired or invalid — please sign in again")
+    except JWTError:
+        raise HTTPException(401, "Token expired or invalid — please sign in again")
     user = await users_col.find_one({"user_id": uid})
     if not user: raise HTTPException(401, "Account not found — please sign in again")
     return user
@@ -114,6 +115,249 @@ BSE_HEADERS = {
     "Origin": "https://www.bseindia.com",
 }
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DYNAMIC COMPANY MASTER  — fetches ALL listed companies from NSE + BSE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def sync_nse_companies() -> int:
+    """
+    NSE publishes a full equity list as a CSV:
+      https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv
+    Columns: SYMBOL, NAME OF COMPANY, SERIES, DATE OF LISTING,
+             PAID UP VALUE, MARKET LOT, ISIN NUMBER, FACE VALUE
+    ~2,200+ rows covering every NSE-listed equity.
+    """
+    url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+    count = 0
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+            await c.get("https://www.nseindia.com/", headers=NSE_HEADERS)
+            r = await c.get(url, headers=NSE_HEADERS)
+            r.raise_for_status()
+
+        lines = r.text.splitlines()
+        if len(lines) < 2:
+            logger.warning("NSE CSV returned too few lines")
+            return 0
+
+        header = [h.strip().upper() for h in lines[0].split(",")]
+        try:
+            sym_idx  = header.index("SYMBOL")
+            name_idx = header.index("NAME OF COMPANY")
+            isin_idx = header.index("ISIN NUMBER") if "ISIN NUMBER" in header else -1
+        except ValueError as e:
+            logger.error(f"NSE CSV header mismatch: {header} — {e}")
+            return 0
+
+        from pymongo import UpdateOne
+        ops = []
+        for line in lines[1:]:
+            parts = line.split(",")
+            if len(parts) <= max(sym_idx, name_idx):
+                continue
+            symbol = parts[sym_idx].strip().upper()
+            name   = parts[name_idx].strip().title()
+            isin   = parts[isin_idx].strip() if isin_idx != -1 and len(parts) > isin_idx else ""
+            if not symbol or not name:
+                continue
+            ops.append(UpdateOne(
+                {"symbol": symbol},
+                {"$set": {
+                    "symbol": symbol, "name": name, "isin": isin,
+                    "nse_listed": True, "active": True,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }},
+                upsert=True,
+            ))
+
+        for i in range(0, len(ops), 500):
+            await companies_col.bulk_write(ops[i:i+500])
+            count += len(ops[i:i+500])
+
+        logger.info(f"NSE sync complete: {count} records upserted")
+    except Exception as e:
+        logger.error(f"NSE company sync failed: {e}")
+    return count
+
+
+async def sync_bse_companies() -> int:
+    """
+    BSE provides a full scrip master via:
+      https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w?Group=&Scripcode=&industry=&segment=Equity&status=Active
+    Returns JSON list with BSE code, NSE symbol, company name, ISIN, industry, etc.
+    ~5,500+ active equities.
+    """
+    url = (
+        "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
+        "?Group=&Scripcode=&industry=&segment=Equity&status=Active"
+    )
+    count = 0
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+            r = await c.get(url, headers=BSE_HEADERS)
+            r.raise_for_status()
+            data = r.json()
+
+        items = data if isinstance(data, list) else data.get("Table", data.get("data", []))
+        logger.info(f"BSE returned {len(items)} scrips")
+
+        from pymongo import UpdateOne
+        ops = []
+        for item in items:
+            bse_code = str(
+                item.get("SCRIP_CD") or item.get("scripCode") or item.get("ScripCode") or ""
+            ).strip()
+            nse_sym = (
+                item.get("NSE_SYMBOL") or item.get("nseSymbol") or item.get("scrip_id") or ""
+            ).strip().upper()
+            name = (
+                item.get("LONG_NAME") or item.get("longName") or
+                item.get("scrip_name") or item.get("Issuer_Name") or ""
+            ).strip().title()
+            isin = (
+                item.get("ISIN_NO") or item.get("isinNumber") or item.get("ISIN") or ""
+            ).strip()
+            sector = (item.get("INDUSTRY") or item.get("industry") or "").strip().title()
+
+            if not bse_code or not name:
+                continue
+
+            if nse_sym:
+                ops.append(UpdateOne(
+                    {"symbol": nse_sym},
+                    {"$set": {
+                        "bse_code": bse_code, "isin": isin,
+                        "sector": sector, "bse_listed": True, "active": True,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }},
+                    upsert=False,
+                ))
+                ops.append(UpdateOne(
+                    {"symbol": nse_sym},
+                    {"$setOnInsert": {
+                        "symbol": nse_sym, "name": name, "bse_code": bse_code,
+                        "isin": isin, "sector": sector,
+                        "nse_listed": False, "bse_listed": True, "active": True,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }},
+                    upsert=True,
+                ))
+            else:
+                ops.append(UpdateOne(
+                    {"bse_code": bse_code},
+                    {"$set": {
+                        "symbol": f"BSE_{bse_code}", "name": name,
+                        "bse_code": bse_code, "isin": isin, "sector": sector,
+                        "nse_listed": False, "bse_listed": True, "active": True,
+                        "updated_at": datetime.utcnow().isoformat(),
+                    }},
+                    upsert=True,
+                ))
+            count += 1
+
+        for i in range(0, len(ops), 500):
+            await companies_col.bulk_write(ops[i:i+500])
+
+        logger.info(f"BSE sync complete: {count} records processed")
+    except Exception as e:
+        logger.error(f"BSE company sync failed: {e}")
+    return count
+
+
+async def ensure_indexes():
+    await companies_col.create_index("symbol")
+    await companies_col.create_index("bse_code")
+    await companies_col.create_index("isin")
+    await companies_col.create_index([("name", "text"), ("symbol", "text")])
+    await analyses_col.create_index("analysis_id")
+    await analyses_col.create_index("user_id")
+    await users_col.create_index("email", unique=True)
+    logger.info("MongoDB indexes ensured")
+
+
+async def initial_sync():
+    """Run on startup: sync if DB is empty or data is stale (>24h)."""
+    await ensure_indexes()
+    count = await companies_col.count_documents({})
+    if count == 0:
+        logger.info("Company master empty — running full NSE + BSE sync...")
+        n = await sync_nse_companies()
+        b = await sync_bse_companies()
+        logger.info(f"Initial sync done — NSE: {n}, BSE: {b}")
+    else:
+        latest = await companies_col.find_one({}, sort=[("updated_at", -1)])
+        if latest:
+            try:
+                updated = datetime.fromisoformat(latest["updated_at"])
+                age_hrs = (datetime.utcnow() - updated).total_seconds() / 3600
+            except Exception:
+                age_hrs = 999
+            if age_hrs > 24:
+                logger.info(f"Data is {age_hrs:.0f}h old — scheduling background refresh")
+                asyncio.create_task(sync_nse_companies())
+                asyncio.create_task(sync_bse_companies())
+            else:
+                logger.info(f"Company master: {count:,} records, last synced {age_hrs:.1f}h ago ✓")
+
+
+async def _daily_sync_loop():
+    """Background task: re-sync every 24 hours."""
+    while True:
+        await asyncio.sleep(86400)
+        logger.info("Daily scheduled company sync starting...")
+        await sync_nse_companies()
+        await sync_bse_companies()
+
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(initial_sync())
+    asyncio.create_task(_daily_sync_loop())
+
+
+# ── COMPANY SEARCH (DB-backed, covers all NSE+BSE listings) ──────────────────
+async def search_companies(query: str, limit: int = 15) -> List[dict]:
+    """Multi-pass search: exact symbol → symbol prefix → name prefix → name contains."""
+    q_upper = query.strip().upper()
+    q_orig  = query.strip()
+    results: List[dict] = []
+    seen: set = set()
+
+    def _add(doc: dict, score: int):
+        doc.pop("_id", None)
+        key = doc.get("symbol") or doc.get("bse_code", "")
+        if key and key not in seen:
+            seen.add(key)
+            results.append({**doc, "_score": score})
+
+    # 1. Exact symbol
+    doc = await companies_col.find_one({"symbol": q_upper})
+    if doc: _add(doc, 100)
+
+    # 2. Symbol starts-with
+    async for doc in companies_col.find(
+        {"symbol": {"$regex": f"^{re.escape(q_upper)}", "$options": "i"}}, limit=10
+    ):
+        _add(doc, 80)
+
+    # 3. Name starts-with
+    async for doc in companies_col.find(
+        {"name": {"$regex": f"^{re.escape(q_orig)}", "$options": "i"}}, limit=10
+    ):
+        _add(doc, 60)
+
+    # 4. Name contains
+    if len(results) < limit:
+        async for doc in companies_col.find(
+            {"name": {"$regex": re.escape(q_orig), "$options": "i"}}, limit=limit
+        ):
+            _add(doc, 40)
+
+    results.sort(key=lambda x: -x.pop("_score", 0))
+    return results[:limit]
+
+
 # ── NSE FILING FETCHER ────────────────────────────────────────────────────────
 async def fetch_nse_filings(symbol: str) -> List[dict]:
     """
@@ -121,14 +365,14 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
     Returns list of filing dicts with title, date, pdf_url, type.
     """
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
             # First hit the main page to get NSE cookies (required)
-            await client.get("https://www.nseindia.com/", headers=NSE_HEADERS)
-            
+            await c.get("https://www.nseindia.com/", headers=NSE_HEADERS)
+
             # Now fetch the actual announcements
             url = f"https://www.nseindia.com/api/annual-reports?symbol={symbol}&issuer={symbol}&type=annual-report"
-            r = await client.get(url, headers=NSE_HEADERS)
-            
+            r = await c.get(url, headers=NSE_HEADERS)
+
             if r.status_code == 200:
                 data = r.json()
                 filings = []
@@ -147,10 +391,10 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
                     })
                 if filings:
                     return filings[:10]
-            
+
             # Fallback: try announcements endpoint
             url2 = f"https://www.nseindia.com/api/corporates-announcements?index=equities&symbol={symbol}&category=annual-report"
-            r2 = await client.get(url2, headers=NSE_HEADERS)
+            r2 = await c.get(url2, headers=NSE_HEADERS)
             if r2.status_code == 200:
                 data2 = r2.json()
                 filings = []
@@ -175,68 +419,83 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
         logger.warning(f"NSE fetch error for {symbol}: {e}")
     return []
 
-async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
-    """Fetch annual reports and quarterly results from BSE."""
+
+async def verify_pdf_url(c: httpx.AsyncClient, url: str) -> bool:
+    """HEAD-check a PDF URL; fall back to GET with Range header."""
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            # BSE announcements API
-            from datetime import date
-            to_date = date.today().strftime("%Y%m%d")
-            from_date = (date.today() - timedelta(days=1460)).strftime("%Y%m%d")  # 4 years
-            
-            url = (
+        r = await c.head(url, headers=BSE_HEADERS, timeout=8)
+        if r.status_code == 405:
+            r = await c.get(url, headers={**BSE_HEADERS, "Range": "bytes=0-10"}, timeout=8)
+        return r.status_code in (200, 206)
+    except Exception:
+        return False
+
+
+async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
+    """Fetch annual reports and quarterly results from BSE, verifying each PDF URL."""
+    if not bse_code:
+        return []
+    try:
+        from datetime import date as _date
+        to_dt   = _date.today().strftime("%Y%m%d")
+        from_dt = (_date.today() - timedelta(days=1460)).strftime("%Y%m%d")
+
+        def _bse_url(cat: str) -> str:
+            return (
                 f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-                f"?pageno=1&strCat=Result&strPrevDate={from_date}&strScrip={bse_code}"
-                f"&strSearch=P&strToDate={to_date}&strType=C"
+                f"?pageno=1&strCat={cat}&strPrevDate={from_dt}&strScrip={bse_code}"
+                f"&strSearch=P&strToDate={to_dt}&strType=C"
             )
-            r = await client.get(url, headers=BSE_HEADERS)
-            
-            filings = []
-            if r.status_code == 200:
-                data = r.json()
-                items = data.get("Table", [])
-                for item in items[:15]:
-                    pdf_name = item.get("ATTACHMENTNAME", "")
-                    if not pdf_name: continue
-                    pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_name}"
+
+        def _pdf_urls(pdf_name: str) -> List[str]:
+            return [
+                f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_name}",
+                f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{pdf_name}",
+            ]
+
+        filings: List[dict] = []
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
+            await c.get("https://www.bseindia.com/", headers=BSE_HEADERS)
+
+            for cat, max_items in [("Result", 15), ("Annual+Report", 5)]:
+                r = await c.get(_bse_url(cat), headers=BSE_HEADERS)
+                if r.status_code != 200:
+                    continue
+
+                for item in (r.json().get("Table", []))[:max_items]:
+                    pdf_name = item.get("ATTACHMENTNAME", "").strip()
+                    if not pdf_name:
+                        continue
+
                     title = item.get("SUBJECT", item.get("CATEGORYNAME", "Financial Results"))
+
+                    # Try AttachLive first, then AttachHis
+                    working_url = None
+                    for candidate in _pdf_urls(pdf_name):
+                        if await verify_pdf_url(c, candidate):
+                            working_url = candidate
+                            break
+
+                    if not working_url:
+                        logger.warning(f"BSE PDF not found for {pdf_name} — skipping")
+                        continue
+
                     filings.append({
                         "title": title,
                         "date": item.get("NEWS_DT", ""),
-                        "pdf_url": pdf_url,
-                        "type": _classify_filing(title),
+                        "pdf_url": working_url,
+                        "type": "Annual Report" if cat == "Annual+Report" else _classify_filing(title),
                         "source": "BSE",
                         "symbol": symbol,
                         "bse_code": bse_code,
                     })
-            
-            # Also fetch annual reports
-            url2 = (
-                f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-                f"?pageno=1&strCat=Annual+Report&strPrevDate={from_date}&strScrip={bse_code}"
-                f"&strSearch=P&strToDate={to_date}&strType=C"
-            )
-            r2 = await client.get(url2, headers=BSE_HEADERS)
-            if r2.status_code == 200:
-                data2 = r2.json()
-                for item in (data2.get("Table", []))[:5]:
-                    pdf_name = item.get("ATTACHMENTNAME", "")
-                    if not pdf_name: continue
-                    pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_name}"
-                    filings.append({
-                        "title": item.get("SUBJECT", "Annual Report"),
-                        "date": item.get("NEWS_DT", ""),
-                        "pdf_url": pdf_url,
-                        "type": "Annual Report",
-                        "source": "BSE",
-                        "symbol": symbol,
-                        "bse_code": bse_code,
-                    })
-            
-            return filings[:12]
+
+        logger.info(f"BSE: found {len(filings)} valid filings for {bse_code}")
+        return filings[:12]
     except Exception as e:
         logger.warning(f"BSE fetch error for {bse_code}: {e}")
     return []
+
 
 def _classify_filing(title: str) -> str:
     t = title.lower()
@@ -249,6 +508,7 @@ def _classify_filing(title: str) -> str:
     if "result" in t or "financial" in t: return "Financial Results"
     return "Filing"
 
+
 # ── PDF EXTRACTION ────────────────────────────────────────────────────────────
 def extract_pdf_text(content: bytes) -> str:
     try:
@@ -260,6 +520,7 @@ def extract_pdf_text(content: bytes) -> str:
     except Exception as e:
         logger.error(f"PDF extraction: {e}")
         return ""
+
 
 # ── AI PROMPT ─────────────────────────────────────────────────────────────────
 def build_prompt(text: str) -> str:
@@ -339,6 +600,7 @@ RULES: Use EXACT numbers from document. Score components must sum to health_scor
 DOCUMENT:
 {text[:14000]}"""
 
+
 # ── AI RUNNERS ─────────────────────────────────────────────────────────────────
 def _sync_gemini(text: str) -> dict:
     import google.generativeai as genai
@@ -376,130 +638,38 @@ async def run_analysis(text: str) -> dict:
             logger.error(f"Groq failed: {e}"); errors.append(f"Groq: {str(e)[:80]}")
     raise Exception("AI analysis failed. " + (" | ".join(errors) if errors else "No API keys configured."))
 
-# ── NSE COMPANY DATABASE ──────────────────────────────────────────────────────
-# BSE codes mapped to NSE symbols for BSE API calls
-BSE_CODES = {
-    "RELIANCE":"500325","TCS":"532540","HDFCBANK":"500180","INFY":"500209","ICICIBANK":"532174",
-    "HINDUNILVR":"500696","ITC":"500875","SBIN":"500112","BHARTIARTL":"532454","KOTAKBANK":"500247",
-    "WIPRO":"507685","AXISBANK":"532215","LT":"500510","ASIANPAINT":"500820","HCLTECH":"532281",
-    "MARUTI":"532500","SUNPHARMA":"524715","TITAN":"500114","BAJFINANCE":"500034","NESTLEIND":"500790",
-    "TECHM":"532755","ULTRACEMCO":"532538","POWERGRID":"532898","NTPC":"532555","ONGC":"500312",
-    "COALINDIA":"533278","ADANIENT":"512599","ADANIPORTS":"532921","BAJAJFINSV":"532978","INDUSINDBK":"532187",
-    "TATASTEEL":"500470","HINDALCO":"500440","JSWSTEEL":"500228","TATAMOTORS":"500570","HEROMOTOCO":"500182",
-    "BAJAJ-AUTO":"532977","M&M":"500520","EICHERMOT":"505200","DRREDDY":"500124","CIPLA":"500087",
-    "DIVISLAB":"532488","APOLLOHOSP":"508869","GRASIM":"500300","BRITANNIA":"500825","DABUR":"500096",
-    "MARICO":"531642","GODREJCP":"532424","PIDILITIND":"500331","HAVELLS":"517354","ZOMATO":"543320",
-    "IRCTC":"542830","DMART":"540376","LICI":"543526","PAYTM":"543396","NYKAA":"543384",
-    "SBILIFE":"540719","HDFCLIFE":"540777","BANKBARODA":"532134","PNB":"532461","YESBANK":"532648",
-    "IDFCFIRSTB":"539437","FEDERALBNK":"500469","CANBK":"532483","UNIONBANK":"532477",
-    "RECLTD":"532955","PFC":"532810","GAIL":"532155","IOC":"530965","BPCL":"500547",
-    "VEDL":"500295","SAIL":"500113","NMDC":"526371","TATACHEM":"500770","LUPIN":"500257",
-    "AUROPHARMA":"524804","BIOCON":"532523","TORNTPHARM":"500420",
-}
-
-NSE_COMPANIES = [
-    {"symbol":"RELIANCE","name":"Reliance Industries Ltd","sector":"Energy"},
-    {"symbol":"TCS","name":"Tata Consultancy Services Ltd","sector":"IT"},
-    {"symbol":"HDFCBANK","name":"HDFC Bank Ltd","sector":"Banking"},
-    {"symbol":"INFY","name":"Infosys Ltd","sector":"IT"},
-    {"symbol":"ICICIBANK","name":"ICICI Bank Ltd","sector":"Banking"},
-    {"symbol":"HINDUNILVR","name":"Hindustan Unilever Ltd","sector":"FMCG"},
-    {"symbol":"ITC","name":"ITC Ltd","sector":"FMCG"},
-    {"symbol":"SBIN","name":"State Bank of India","sector":"Banking"},
-    {"symbol":"BHARTIARTL","name":"Bharti Airtel Ltd","sector":"Telecom"},
-    {"symbol":"KOTAKBANK","name":"Kotak Mahindra Bank Ltd","sector":"Banking"},
-    {"symbol":"WIPRO","name":"Wipro Ltd","sector":"IT"},
-    {"symbol":"AXISBANK","name":"Axis Bank Ltd","sector":"Banking"},
-    {"symbol":"LT","name":"Larsen & Toubro Ltd","sector":"Infrastructure"},
-    {"symbol":"ASIANPAINT","name":"Asian Paints Ltd","sector":"Consumer"},
-    {"symbol":"HCLTECH","name":"HCL Technologies Ltd","sector":"IT"},
-    {"symbol":"MARUTI","name":"Maruti Suzuki India Ltd","sector":"Auto"},
-    {"symbol":"SUNPHARMA","name":"Sun Pharmaceutical Industries Ltd","sector":"Pharma"},
-    {"symbol":"TITAN","name":"Titan Company Ltd","sector":"Consumer"},
-    {"symbol":"BAJFINANCE","name":"Bajaj Finance Ltd","sector":"Finance"},
-    {"symbol":"NESTLEIND","name":"Nestle India Ltd","sector":"FMCG"},
-    {"symbol":"TECHM","name":"Tech Mahindra Ltd","sector":"IT"},
-    {"symbol":"ULTRACEMCO","name":"UltraTech Cement Ltd","sector":"Cement"},
-    {"symbol":"POWERGRID","name":"Power Grid Corporation of India Ltd","sector":"Power"},
-    {"symbol":"NTPC","name":"NTPC Ltd","sector":"Power"},
-    {"symbol":"ONGC","name":"Oil and Natural Gas Corporation Ltd","sector":"Energy"},
-    {"symbol":"COALINDIA","name":"Coal India Ltd","sector":"Energy"},
-    {"symbol":"ADANIENT","name":"Adani Enterprises Ltd","sector":"Diversified"},
-    {"symbol":"ADANIPORTS","name":"Adani Ports & Special Economic Zone Ltd","sector":"Logistics"},
-    {"symbol":"BAJAJFINSV","name":"Bajaj Finserv Ltd","sector":"Finance"},
-    {"symbol":"INDUSINDBK","name":"IndusInd Bank Ltd","sector":"Banking"},
-    {"symbol":"TATASTEEL","name":"Tata Steel Ltd","sector":"Metals"},
-    {"symbol":"HINDALCO","name":"Hindalco Industries Ltd","sector":"Metals"},
-    {"symbol":"JSWSTEEL","name":"JSW Steel Ltd","sector":"Metals"},
-    {"symbol":"TATAMOTORS","name":"Tata Motors Ltd","sector":"Auto"},
-    {"symbol":"HEROMOTOCO","name":"Hero MotoCorp Ltd","sector":"Auto"},
-    {"symbol":"BAJAJ-AUTO","name":"Bajaj Auto Ltd","sector":"Auto"},
-    {"symbol":"M&M","name":"Mahindra & Mahindra Ltd","sector":"Auto"},
-    {"symbol":"EICHERMOT","name":"Eicher Motors Ltd","sector":"Auto"},
-    {"symbol":"DRREDDY","name":"Dr Reddy's Laboratories Ltd","sector":"Pharma"},
-    {"symbol":"CIPLA","name":"Cipla Ltd","sector":"Pharma"},
-    {"symbol":"DIVISLAB","name":"Divi's Laboratories Ltd","sector":"Pharma"},
-    {"symbol":"APOLLOHOSP","name":"Apollo Hospitals Enterprise Ltd","sector":"Healthcare"},
-    {"symbol":"GRASIM","name":"Grasim Industries Ltd","sector":"Diversified"},
-    {"symbol":"BRITANNIA","name":"Britannia Industries Ltd","sector":"FMCG"},
-    {"symbol":"DABUR","name":"Dabur India Ltd","sector":"FMCG"},
-    {"symbol":"MARICO","name":"Marico Ltd","sector":"FMCG"},
-    {"symbol":"GODREJCP","name":"Godrej Consumer Products Ltd","sector":"FMCG"},
-    {"symbol":"HAVELLS","name":"Havells India Ltd","sector":"Electricals"},
-    {"symbol":"ZOMATO","name":"Zomato Ltd","sector":"Fintech"},
-    {"symbol":"IRCTC","name":"Indian Railway Catering and Tourism Corp","sector":"Services"},
-    {"symbol":"DMART","name":"Avenue Supermarts Ltd (D-Mart)","sector":"Retail"},
-    {"symbol":"LICI","name":"Life Insurance Corporation of India","sector":"Insurance"},
-    {"symbol":"PAYTM","name":"One 97 Communications Ltd (Paytm)","sector":"Fintech"},
-    {"symbol":"NYKAA","name":"FSN E-Commerce Ventures Ltd (Nykaa)","sector":"E-Commerce"},
-    {"symbol":"SBILIFE","name":"SBI Life Insurance Company Ltd","sector":"Insurance"},
-    {"symbol":"HDFCLIFE","name":"HDFC Life Insurance Company Ltd","sector":"Insurance"},
-    {"symbol":"BANKBARODA","name":"Bank of Baroda","sector":"Banking"},
-    {"symbol":"PNB","name":"Punjab National Bank","sector":"Banking"},
-    {"symbol":"YESBANK","name":"Yes Bank Ltd","sector":"Banking"},
-    {"symbol":"IDFCFIRSTB","name":"IDFC First Bank Ltd","sector":"Banking"},
-    {"symbol":"FEDERALBNK","name":"The Federal Bank Ltd","sector":"Banking"},
-    {"symbol":"CANBK","name":"Canara Bank","sector":"Banking"},
-    {"symbol":"UNIONBANK","name":"Union Bank of India","sector":"Banking"},
-    {"symbol":"RECLTD","name":"REC Ltd","sector":"Finance"},
-    {"symbol":"PFC","name":"Power Finance Corporation Ltd","sector":"Finance"},
-    {"symbol":"GAIL","name":"GAIL (India) Ltd","sector":"Energy"},
-    {"symbol":"IOC","name":"Indian Oil Corporation Ltd","sector":"Energy"},
-    {"symbol":"BPCL","name":"Bharat Petroleum Corporation Ltd","sector":"Energy"},
-    {"symbol":"VEDL","name":"Vedanta Ltd","sector":"Metals"},
-    {"symbol":"SAIL","name":"Steel Authority of India Ltd","sector":"Metals"},
-    {"symbol":"NMDC","name":"NMDC Ltd","sector":"Metals"},
-    {"symbol":"LUPIN","name":"Lupin Ltd","sector":"Pharma"},
-    {"symbol":"AUROPHARMA","name":"Aurobindo Pharma Ltd","sector":"Pharma"},
-    {"symbol":"BIOCON","name":"Biocon Ltd","sector":"Pharma"},
-    {"symbol":"TORNTPHARM","name":"Torrent Pharmaceuticals Ltd","sector":"Pharma"},
-    {"symbol":"MUTHOOTFIN","name":"Muthoot Finance Ltd","sector":"Finance"},
-    {"symbol":"CHOLAFIN","name":"Cholamandalam Investment and Finance","sector":"Finance"},
-    {"symbol":"PIDILITIND","name":"Pidilite Industries Ltd","sector":"Chemicals"},
-    {"symbol":"BERGEPAINT","name":"Berger Paints India Ltd","sector":"Consumer"},
-    {"symbol":"VOLTAS","name":"Voltas Ltd","sector":"Electricals"},
-    {"symbol":"SIEMENS","name":"Siemens Ltd","sector":"Electricals"},
-    {"symbol":"BOSCHLTD","name":"Bosch Ltd","sector":"Auto"},
-    {"symbol":"JUBLFOOD","name":"Jubilant Foodworks Ltd","sector":"Retail"},
-    {"symbol":"TRENT","name":"Trent Ltd","sector":"Retail"},
-    {"symbol":"DELHIVERY","name":"Delhivery Ltd","sector":"Logistics"},
-    {"symbol":"POLICYBZR","name":"PB Fintech Ltd (PolicyBazaar)","sector":"Fintech"},
-    {"symbol":"ICICIGI","name":"ICICI Lombard General Insurance","sector":"Insurance"},
-    {"symbol":"HPCL","name":"Hindustan Petroleum Corporation Ltd","sector":"Energy"},
-    {"symbol":"NTPC","name":"NTPC Ltd","sector":"Power"},
-    {"symbol":"IRFC","name":"Indian Railway Finance Corporation Ltd","sector":"Finance"},
-    {"symbol":"NHPC","name":"NHPC Ltd","sector":"Power"},
-    {"symbol":"SJVN","name":"SJVN Ltd","sector":"Power"},
-    {"symbol":"TATACHEM","name":"Tata Chemicals Ltd","sector":"Chemicals"},
-    {"symbol":"ABB","name":"ABB India Ltd","sector":"Electricals"},
-]
 
 # ── ROUTES ─────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health():
-    return {"status":"ok","time":datetime.utcnow().isoformat(),"gemini":bool(GEMINI_API_KEY),"groq":bool(GROQ_API_KEY)}
+    company_count = await companies_col.count_documents({})
+    return {
+        "status": "ok",
+        "time": datetime.utcnow().isoformat(),
+        "gemini": bool(GEMINI_API_KEY),
+        "groq": bool(GROQ_API_KEY),
+        "companies_in_db": company_count,
+    }
 
+# ── ADMIN ROUTES ──────────────────────────────────────────────────────────────
+@app.post("/api/admin/sync-companies")
+async def trigger_sync():
+    """Manually trigger a full re-sync of the company master from NSE + BSE."""
+    asyncio.create_task(sync_nse_companies())
+    asyncio.create_task(sync_bse_companies())
+    return {"status": "sync started in background"}
+
+@app.get("/api/admin/sync-status")
+async def sync_status():
+    count  = await companies_col.count_documents({})
+    latest = await companies_col.find_one({}, sort=[("updated_at", -1)])
+    return {
+        "total_companies": count,
+        "last_updated": latest.get("updated_at") if latest else None,
+    }
+
+# ── AUTH ──────────────────────────────────────────────────────────────────────
 @app.post("/api/auth/register")
 async def register(req: RegisterRequest):
     if not req.name.strip() or not req.email.strip() or not req.password:
@@ -558,51 +728,51 @@ async def analyze_from_url(req: AnalyzeFromURLRequest, user=Depends(get_optional
     """
     analysis_id = str(uuid.uuid4())
     user_id = user["user_id"] if user else f"guest_{str(uuid.uuid4())[:8]}"
-    
+
     await analyses_col.insert_one({
         "analysis_id": analysis_id, "user_id": user_id,
         "is_guest": user is None, "filename": req.filename,
         "source": req.source, "pdf_url": req.pdf_url,
         "status": "processing", "created_at": datetime.utcnow().isoformat(), "result": None
     })
-    
+
     try:
         logger.info(f"Fetching PDF: {req.pdf_url}")
-        
+
         # Choose headers based on source
         headers = NSE_HEADERS if req.source == "nse" else BSE_HEADERS
-        
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
             # Hit homepage first to get session/cookies
             if req.source == "nse":
-                await client.get("https://www.nseindia.com/", headers=NSE_HEADERS)
+                await c.get("https://www.nseindia.com/", headers=NSE_HEADERS)
             elif req.source == "bse":
-                await client.get("https://www.bseindia.com/", headers=BSE_HEADERS)
-            
-            r = await client.get(req.pdf_url, headers=headers)
-            
+                await c.get("https://www.bseindia.com/", headers=BSE_HEADERS)
+
+            r = await c.get(req.pdf_url, headers=headers)
+
             if r.status_code != 200:
                 raise Exception(f"Could not fetch PDF (HTTP {r.status_code}). The file may have moved.")
-            
+
             content_type = r.headers.get("content-type", "")
             if "pdf" not in content_type.lower() and len(r.content) < 1000:
                 raise Exception("Response doesn't appear to be a valid PDF")
-            
+
             pdf_bytes = r.content
-        
+
         logger.info(f"Downloaded {len(pdf_bytes)} bytes from {req.source}")
-        
+
         loop = asyncio.get_event_loop()
         text = await loop.run_in_executor(executor, extract_pdf_text, pdf_bytes)
-        
+
         if not text or len(text.strip()) < 50:
             raise Exception("Could not extract readable text from this PDF. It may be scanned/image-based.")
-        
+
         result = await run_analysis(text)
         await analyses_col.update_one({"analysis_id":analysis_id},{"$set":{"status":"completed","result":result}})
         logger.info(f"✓ URL analysis done: {analysis_id}")
         return {"analysis_id":analysis_id,"status":"completed","result":result}
-        
+
     except Exception as e:
         msg = str(e)
         logger.error(f"✗ URL analysis failed {analysis_id}: {msg}")
@@ -615,26 +785,27 @@ async def get_filings(symbol: str):
     """
     Get list of real financial filings (PDFs) for a company from NSE and BSE.
     Returns filing list with pdf_url for one-tap analysis.
+    Now looks up company from the dynamic DB (all NSE+BSE listed companies).
     """
     symbol = symbol.upper().strip()
-    company = next((c for c in NSE_COMPANIES if c["symbol"] == symbol), None)
+    company = await companies_col.find_one({"symbol": symbol})
     if not company:
-        raise HTTPException(404, f"Company {symbol} not found")
-    
-    bse_code = BSE_CODES.get(symbol, "")
-    
+        raise HTTPException(404, f"Company '{symbol}' not found. Try searching: /api/nse/search?q={symbol}")
+
+    bse_code = company.get("bse_code", "")
+
     # Fetch from both NSE and BSE in parallel
     nse_task = fetch_nse_filings(symbol)
     bse_task = fetch_bse_filings(bse_code, symbol) if bse_code else asyncio.sleep(0)
-    
+
     results = await asyncio.gather(nse_task, bse_task, return_exceptions=True)
-    
+
     nse_filings = results[0] if isinstance(results[0], list) else []
     bse_filings = results[1] if isinstance(results[1], list) else []
-    
+
     # Merge and sort by date (newest first)
     all_filings = bse_filings + nse_filings  # BSE usually more reliable
-    
+
     # Deduplicate by similar title
     seen_titles = set()
     unique_filings = []
@@ -643,8 +814,7 @@ async def get_filings(symbol: str):
         if key not in seen_titles:
             seen_titles.add(key)
             unique_filings.append(f)
-    
-    # Sort by date descending
+
     def parse_date(d):
         try:
             for fmt in ["%d %b %Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%b %d, %Y"]:
@@ -652,41 +822,40 @@ async def get_filings(symbol: str):
                 except: pass
         except: pass
         return datetime.min
-    
+
     unique_filings.sort(key=lambda x: parse_date(x.get("date","") or ""), reverse=True)
-    
+
     return {
         "symbol": symbol,
-        "company": company["name"],
-        "sector": company["sector"],
+        "company": company.get("name", symbol),
+        "sector": company.get("sector", ""),
+        "isin": company.get("isin", ""),
         "filings": unique_filings[:15],
         "bse_code": bse_code,
         "total": len(unique_filings),
     }
 
-# ── NSE SEARCH ────────────────────────────────────────────────────────────────
+# ── NSE SEARCH (now DB-backed — covers all NSE + BSE listings) ───────────────
 @app.get("/api/nse/search")
 async def nse_search(q: str = ""):
     if not q.strip(): return {"results":[],"query":""}
-    q_lower = q.lower().strip()
-    scored = []
-    for c in NSE_COMPANIES:
-        s = 0
-        nl = c["name"].lower(); sl = c["symbol"].lower()
-        if sl == q_lower: s=100
-        elif nl == q_lower: s=90
-        elif sl.startswith(q_lower): s=80
-        elif q_lower in sl: s=70
-        elif nl.startswith(q_lower): s=60
-        elif q_lower in nl: s=50
-        if s>0: scored.append({**c,"_score":s})
-    scored.sort(key=lambda x:-x["_score"])
-    return {"results":[{k:v for k,v in c.items() if k!="_score"} for c in scored[:12]],"query":q}
+    results = await search_companies(q, limit=15)
+    return {"results": results, "query": q, "total": len(results)}
 
 @app.get("/api/nse/popular")
 async def nse_popular():
-    syms = ["RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","SBIN","BAJFINANCE","ZOMATO","LT","WIPRO","ADANIENT","TATAMOTORS"]
-    return {"results":[c for c in NSE_COMPANIES if c["symbol"] in syms][:12]}
+    popular = [
+        "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","SBIN",
+        "BAJFINANCE","ZOMATO","LT","WIPRO","ADANIENT","TATAMOTORS",
+        "HINDUNILVR","ITC","AXISBANK",
+    ]
+    results = []
+    for sym in popular:
+        doc = await companies_col.find_one({"symbol": sym})
+        if doc:
+            doc.pop("_id", None)
+            results.append(doc)
+    return {"results": results}
 
 # ── RETRIEVE ──────────────────────────────────────────────────────────────────
 @app.get("/api/public/analyses/{analysis_id}")
@@ -728,8 +897,8 @@ async def generate_pdf(req: PDFRequest):
     """
     HTML2PDF_KEY = os.getenv("HTML2PDF_KEY", "pdliSG0Ajq3ghYvV3adX4OSZNtRLL8IMo0gK52WPIfY3lDwQoFwGfWaHfxWsjUcQ")
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
                 "https://api.html2pdf.app/v1/generate",
                 json={"html": req.html, "apiKey": HTML2PDF_KEY, "zoom": 1, "landscape": False},
                 headers={"Content-Type": "application/json"},
