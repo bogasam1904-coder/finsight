@@ -524,88 +524,214 @@ def extract_pdf_text(content: bytes) -> str:
 
 # ── AI PROMPT ─────────────────────────────────────────────────────────────────
 def build_prompt(text: str) -> str:
-    return f"""You are a world-class senior financial analyst (CFA, 20+ years).
-Analyse this financial document and return ONLY valid JSON. No markdown, no code blocks, no explanation.
+    return f"""You are a Senior Equity Research Analyst, Credit Analyst, and Forensic Accounting Expert with 20+ years of experience.
 
-RULES: Use EXACT numbers from document. Score components must sum to health_score total. N/A only if genuinely missing.
+Analyze the provided financial document and return ONLY a single valid JSON object. No markdown, no code fences, no explanation text before or after the JSON.
+
+ABSOLUTE RULES:
+1. Use ONLY real numbers extracted from the document — do NOT invent or estimate.
+2. NEVER output placeholder text like "val", "X%", "Item 1", "Strength 1", "Risk 1", or any template text.
+3. If a specific metric is genuinely not present in the document, write "Not reported" for that field.
+4. All score components must sum exactly to health_score total.
+5. Write all analysis fields in simple English suitable for beginner investors.
+6. The JSON must be complete and valid — close all brackets and braces.
+
+Return this exact JSON structure with ALL fields populated with real data:
 
 {{
-  "company_name": "Full legal company name",
+  "company_name": "Full legal company name from document",
   "statement_type": "Annual Report / Q1 Results / Q2 Results / Q3 Results / Q4 Results / Half-Year Results / Balance Sheet",
-  "period": "e.g. Q3 FY2024 or FY2023-24",
+  "period": "Exact period e.g. FY2024-25 or Q3 FY2025",
   "currency": "INR Crores / USD Millions / etc",
-  "health_score": 75,
+
+  "health_score": 0,
   "health_label": "Excellent / Good / Fair / Poor / Critical",
+
   "health_score_breakdown": {{
-    "total": 75,
+    "total": 0,
     "components": [
-      {{"category": "Profitability", "weight": 30, "score": 22, "max": 30, "rating": "Strong/Moderate/Weak", "reasoning": "exact numbers here"}},
-      {{"category": "Revenue Growth", "weight": 25, "score": 18, "max": 25, "rating": "Strong/Moderate/Weak", "reasoning": "exact numbers here"}},
-      {{"category": "Debt & Leverage", "weight": 20, "score": 14, "max": 20, "rating": "Strong/Moderate/Weak", "reasoning": "exact numbers here"}},
-      {{"category": "Liquidity", "weight": 15, "score": 12, "max": 15, "rating": "Strong/Moderate/Weak", "reasoning": "exact numbers here"}},
-      {{"category": "Management & Outlook", "weight": 10, "score": 9, "max": 10, "rating": "Strong/Moderate/Weak", "reasoning": "tone and guidance quality"}}
+      {{"category": "Profitability",      "weight": 20, "score": 0, "max": 20, "rating": "Strong/Average/Weak", "reasoning": "Real numbers from document"}},
+      {{"category": "Growth",             "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "Real revenue and profit growth figures"}},
+      {{"category": "Balance Sheet",      "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "Real debt, equity figures"}},
+      {{"category": "Liquidity",          "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak", "reasoning": "Real current ratio and cash figures"}},
+      {{"category": "Cash Flow",          "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "Real OCF vs PAT comparison"}},
+      {{"category": "Governance & Risk",  "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "Fraud signals, related party, management quality"}},
+      {{"category": "Industry Position",  "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak", "reasoning": "Peer comparison at industry level"}}
     ]
   }},
-  "executive_summary": "5-6 comprehensive sentences",
-  "investor_verdict": "3-4 sentences plain English for non-finance reader",
+
+  "executive_summary": "5-6 lines in simple English: what the company does, whether business improved or deteriorated, financial condition strong/average/weak, one-line investment view. Use real numbers.",
+
+  "investor_verdict": "3-4 sentences in plain English for a beginner investor. Explain whether to be interested or cautious and why.",
+
+  "explain_like_15": "5 lines using a small shop analogy explaining whether this business is doing well or not. Make it fun and very simple.",
+
+  "investment_label": "Strong Buy / Buy / Hold / Risky / Avoid",
+
   "key_metrics": [
-    {{"label": "Revenue / Total Income", "current": "val", "previous": "val", "change": "+X% YoY", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Net Profit / PAT", "current": "val", "previous": "val", "change": "+X%", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "EBITDA", "current": "val", "previous": "val", "change": "+X%", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "EBITDA Margin", "current": "X%", "previous": "X%", "change": "+X bps", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Gross Margin", "current": "X%", "previous": "X%", "change": "val", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Net Profit Margin", "current": "X%", "previous": "X%", "change": "val", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "EPS (Basic)", "current": "val", "previous": "val", "change": "val", "trend": "up/down/neutral", "comment": "context"}},
-    {{"label": "Total Assets", "current": "val", "previous": "val", "change": "val", "trend": "neutral", "comment": "context"}},
-    {{"label": "Total Debt", "current": "val", "previous": "val", "change": "val", "trend": "down", "comment": "context"}},
-    {{"label": "Cash & Equivalents", "current": "val", "previous": "val", "change": "val", "trend": "up", "comment": "context"}},
-    {{"label": "ROE", "current": "X%", "previous": "X%", "change": "val", "trend": "up", "comment": "context"}},
-    {{"label": "ROCE", "current": "X%", "previous": "X%", "change": "val", "trend": "up", "comment": "context"}},
-    {{"label": "Debt to Equity", "current": "val", "previous": "val", "change": "val", "trend": "down", "comment": "context"}},
-    {{"label": "Interest Coverage", "current": "val", "previous": "val", "change": "val", "trend": "up", "comment": "context"}},
-    {{"label": "Operating Cash Flow", "current": "val", "previous": "val", "change": "val", "trend": "up", "comment": "context"}}
+    {{"label": "Revenue / Total Income",  "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Net Profit / PAT",        "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "EBITDA",                  "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "EBITDA Margin",           "current": "actual %",     "previous": "actual %",     "change": "actual bps",  "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Net Profit Margin",       "current": "actual %",     "previous": "actual %",     "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "EPS (Basic)",             "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Total Assets",            "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Total Debt",              "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Cash & Equivalents",      "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "ROE",                     "current": "actual %",     "previous": "actual %",     "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "ROCE",                    "current": "actual %",     "previous": "actual %",     "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Debt to Equity",          "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Interest Coverage",       "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Current Ratio",           "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}},
+    {{"label": "Operating Cash Flow",     "current": "actual value", "previous": "actual value", "change": "actual %",    "trend": "up/down/neutral", "comment": "simple explanation"}}
   ],
+
+  "financial_performance": {{
+    "revenue_analysis": "Explain revenue growth in simple English with exact numbers. Is growth strong or weak? Consistent or volatile? Why?",
+    "profitability_analysis": "Explain EBITDA trend, PAT trend, margin movement in simple English with real numbers. Why did margins change?",
+    "ratio_interpretation": [
+      {{"ratio": "EBITDA Margin",     "value": "actual %", "classification": "Strong/Average/Weak", "simple_explanation": "What this means in plain English"}},
+      {{"ratio": "Net Profit Margin", "value": "actual %", "classification": "Strong/Average/Weak", "simple_explanation": "What this means in plain English"}},
+      {{"ratio": "ROE",               "value": "actual %", "classification": "Strong/Average/Weak", "simple_explanation": "What this means in plain English"}},
+      {{"ratio": "ROCE",              "value": "actual %", "classification": "Strong/Average/Weak", "simple_explanation": "What this means in plain English"}}
+    ]
+  }},
+
   "profitability": {{
-    "analysis": "3-4 sentences with exact numbers",
-    "gross_margin_current": "X%", "gross_margin_previous": "X%",
-    "net_margin_current": "X%", "net_margin_previous": "X%",
-    "ebitda_margin_current": "X%", "ebitda_margin_previous": "X%",
-    "roe": "X%", "roa": "X%",
-    "key_cost_drivers": ["Item with number", "Item 2"]
+    "analysis": "3-4 sentences with real numbers in simple language",
+    "gross_margin_current": "actual % or Not reported",
+    "gross_margin_previous": "actual % or Not reported",
+    "net_margin_current": "actual %",
+    "net_margin_previous": "actual %",
+    "ebitda_margin_current": "actual %",
+    "ebitda_margin_previous": "actual %",
+    "roe": "actual % or Not reported",
+    "roa": "actual % or Not reported",
+    "key_cost_drivers": ["Real cost item 1 with number", "Real cost item 2 with number"]
   }},
+
   "growth": {{
-    "analysis": "3-4 sentences", "revenue_growth_yoy": "X%", "profit_growth_yoy": "X%",
-    "volume_growth": "X% or N/A", "guidance": "guidance text or N/A"
+    "analysis": "3-4 sentences in simple English about growth quality and consistency",
+    "revenue_growth_yoy": "actual %",
+    "profit_growth_yoy": "actual %",
+    "multi_year_trend": "Improving / Stable / Deteriorating",
+    "multi_year_explanation": "Explain 2-5 year trend in simple words based on available data",
+    "volume_growth": "actual % or Not reported",
+    "guidance": "What management said about future growth or Not reported"
   }},
+
+  "balance_sheet": {{
+    "analysis": "2-3 sentences: is company overleveraged? Can it comfortably repay debt? Simple English.",
+    "total_debt": "actual value",
+    "net_worth": "actual value",
+    "debt_to_equity": "actual value",
+    "interest_coverage": "actual value or Not reported",
+    "is_overleveraged": true,
+    "debt_comfort_level": "Comfortable / Moderate / Stressed"
+  }},
+
   "liquidity": {{
-    "analysis": "2-3 sentences", "current_ratio": "val", "quick_ratio": "val",
-    "cash_position": "val", "operating_cash_flow": "val", "free_cash_flow": "val"
+    "analysis": "2-3 sentences in simple English: can company run day-to-day operations smoothly?",
+    "current_ratio": "actual value",
+    "quick_ratio": "actual value or Not reported",
+    "cash_position": "actual value",
+    "operating_cash_flow": "actual value or Not reported",
+    "free_cash_flow": "actual value or Not reported",
+    "day_to_day_assessment": "Smooth / Adequate / Tight"
   }},
+
   "debt": {{
-    "analysis": "2-3 sentences", "total_debt": "val", "debt_to_equity": "val",
-    "interest_coverage": "val", "net_debt": "val", "debt_trend": "Decreasing/Increasing/Stable"
+    "analysis": "2-3 sentences with real numbers",
+    "total_debt": "actual value",
+    "debt_to_equity": "actual value",
+    "interest_coverage": "actual value or Not reported",
+    "net_debt": "actual value or Not reported",
+    "debt_trend": "Decreasing / Increasing / Stable"
   }},
+
+  "cash_flow_quality": {{
+    "analysis": "Are profits real or just accounting profits? Is company generating cash or burning cash? Use real numbers.",
+    "pat": "actual value",
+    "operating_cash_flow": "actual value or Not reported",
+    "cash_vs_profit_assessment": "Real Cash Profits / Accounting Profits / Cash Burn",
+    "quality_rating": "High / Medium / Low"
+  }},
+
+  "peer_comparison": {{
+    "industry": "Industry name",
+    "classification": "Better than peers / At par / Worse than peers",
+    "margin_comparison": "How company margins compare to typical industry levels",
+    "roe_comparison": "How ROE compares to industry norms",
+    "debt_comparison": "How debt levels compare to industry norms",
+    "summary": "2-3 sentences in simple English"
+  }},
+
+  "fraud_risk": {{
+    "overall_risk": "Low / Moderate / High",
+    "signals_checked": [
+      {{"signal": "Profit rising but cash flow not rising", "found": true, "detail": "explanation with numbers"}},
+      {{"signal": "Rising receivables / working capital stress", "found": false, "detail": "explanation"}},
+      {{"signal": "High other income contribution", "found": false, "detail": "explanation"}},
+      {{"signal": "Frequent exceptional items", "found": false, "detail": "explanation"}},
+      {{"signal": "Sudden margin spikes without explanation", "found": false, "detail": "explanation"}},
+      {{"signal": "Debt rising but profits not rising", "found": false, "detail": "explanation"}}
+    ],
+    "reasoning": "Overall fraud risk reasoning in simple English"
+  }},
+
   "management_commentary": {{
-    "overall_tone": "Positive/Cautious/Neutral/Concerned",
-    "key_points": ["Point 1","Point 2","Point 3","Point 4","Point 5"],
-    "outlook_statement": "what management said",
-    "concerns_raised": ["Concern 1","Concern 2"]
+    "overall_tone": "Positive / Cautious / Neutral / Concerned",
+    "key_points": ["Real point 1 from document", "Real point 2", "Real point 3", "Real point 4", "Real point 5"],
+    "outlook_statement": "Exact or paraphrased management outlook",
+    "concerns_raised": ["Real concern 1", "Real concern 2"],
+    "management_interpretation": "In simple words, what do management decisions mean for investors? Cover expansion, monetization, restructuring etc."
   }},
-  "segments": [{{"name":"Segment","revenue":"val","growth":"X%","margin":"X%","comment":"observation"}}],
-  "highlights": ["Strength 1 with numbers","Strength 2","Strength 3","Strength 4"],
-  "risks": ["Risk 1 with context","Risk 2","Risk 3"],
-  "what_to_watch": ["Item 1","Item 2","Item 3"]
+
+  "segments": [
+    {{"name": "Actual segment name", "revenue": "actual value", "growth": "actual %", "margin": "actual % or Not reported", "comment": "observation"}}
+  ],
+
+  "highlights": [
+    "Real strength 1 backed by actual numbers from document",
+    "Real strength 2 backed by actual numbers",
+    "Real strength 3 backed by actual numbers",
+    "Real strength 4 backed by actual numbers",
+    "Real strength 5 backed by actual numbers"
+  ],
+
+  "risks": [
+    "Real risk 1 with reasoning and numbers",
+    "Real risk 2 with reasoning",
+    "Real risk 3 with reasoning",
+    "Real risk 4 with reasoning",
+    "Real risk 5 with reasoning"
+  ],
+
+  "future_outlook": {{
+    "growth_potential": "What growth potential exists based on numbers and management commentary",
+    "key_triggers": ["Real trigger 1", "Real trigger 2", "Real trigger 3"],
+    "key_risks": ["Real risk 1", "Real risk 2", "Real risk 3"],
+    "summary": "2-3 sentences on future direction in simple English"
+  }},
+
+  "what_to_watch": [
+    "Real item to watch 1 with context",
+    "Real item to watch 2 with context",
+    "Real item to watch 3 with context"
+  ]
 }}
 
-DOCUMENT:
-{text[:14000]}"""
+CRITICAL: Every single field must contain REAL data extracted from the document below. NEVER write "val", "X%", "Item 1", "Strength 1", "Real point 1", or any other placeholder text in your final output. If data is not available, write "Not reported".
+
+FINANCIAL DOCUMENT:
+{{text[:30000]}}"""
 
 
 # ── AI RUNNERS ─────────────────────────────────────────────────────────────────
 def _sync_gemini(text: str) -> dict:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature":0.1,"max_output_tokens":4096})
+    model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature":0.1,"max_output_tokens":8192})
     resp = model.generate_content(build_prompt(text))
     raw = resp.text.strip().replace("```json","").replace("```","").strip()
     s,e = raw.find('{'), raw.rfind('}')+1
