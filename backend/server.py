@@ -605,38 +605,135 @@ DOCUMENT:
 def _sync_gemini(text: str) -> dict:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash-exp", generation_config={"temperature":0.1,"max_output_tokens":4096})
+    model = genai.GenerativeModel("gemini-2.0-flash", generation_config={"temperature":0.1,"max_output_tokens":4096})
     resp = model.generate_content(build_prompt(text))
     raw = resp.text.strip().replace("```json","").replace("```","").strip()
     s,e = raw.find('{'), raw.rfind('}')+1
     return json.loads(raw[s:e] if s!=-1 else raw)
 
+# All Groq models tried in order (if one hits rate limit, next is used)
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+
 def _sync_groq(text: str) -> dict:
     from groq import Groq
     gc = Groq(api_key=GROQ_API_KEY)
-    resp = gc.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role":"user","content":build_prompt(text)}], temperature=0.1, max_tokens=4096)
-    raw = resp.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
-    s,e = raw.find('{'), raw.rfind('}')+1
-    return json.loads(raw[s:e] if s!=-1 else raw)
+    last_error = None
+    for model in GROQ_MODELS:
+        try:
+            resp = gc.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": build_prompt(text)}],
+                temperature=0.1,
+                max_tokens=4096,
+            )
+            raw = resp.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
+            s, e = raw.find('{'), raw.rfind('}') + 1
+            result = json.loads(raw[s:e] if s != -1 else raw)
+            logger.info(f"✓ Groq succeeded with model: {model}")
+            return result
+        except Exception as ex:
+            logger.warning(f"Groq model {model} failed: {str(ex)[:100]}")
+            last_error = ex
+            continue
+    raise Exception(f"All Groq models failed. Last: {last_error}")
+
+def _sync_together(text: str) -> dict:
+    """Together AI — free tier, generous limits. Set TOGETHER_API_KEY env var."""
+    together_key = os.getenv("TOGETHER_API_KEY", "")
+    if not together_key:
+        raise Exception("No TOGETHER_API_KEY configured")
+    import httpx as _httpx
+    resp = _httpx.post(
+        "https://api.together.xyz/v1/chat/completions",
+        headers={"Authorization": f"Bearer {together_key}", "Content-Type": "application/json"},
+        json={
+            "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+            "messages": [{"role": "user", "content": build_prompt(text)}],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    raw = raw.replace("```json","").replace("```","").strip()
+    s, e = raw.find('{'), raw.rfind('}') + 1
+    return json.loads(raw[s:e] if s != -1 else raw)
+
+def _sync_openrouter(text: str) -> dict:
+    """OpenRouter — has free models. Set OPENROUTER_API_KEY env var."""
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not openrouter_key:
+        raise Exception("No OPENROUTER_API_KEY configured")
+    import httpx as _httpx
+    resp = _httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {openrouter_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://finsight.app",
+        },
+        json={
+            "model": "meta-llama/llama-3.3-70b-instruct:free",
+            "messages": [{"role": "user", "content": build_prompt(text)}],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    raw = resp.json()["choices"][0]["message"]["content"].strip()
+    raw = raw.replace("```json","").replace("```","").strip()
+    s, e = raw.find('{'), raw.rfind('}') + 1
+    return json.loads(raw[s:e] if s != -1 else raw)
 
 async def run_analysis(text: str) -> dict:
     loop = asyncio.get_event_loop()
     errors = []
+
+    # 1. Gemini (best quality)
     if GEMINI_API_KEY:
         try:
             result = await loop.run_in_executor(executor, _sync_gemini, text)
             logger.info("✓ Gemini succeeded")
             return result
         except Exception as e:
-            logger.warning(f"Gemini failed: {e}"); errors.append(f"Gemini: {str(e)[:80]}")
+            logger.warning(f"Gemini failed: {e}")
+            errors.append(f"Gemini: {str(e)[:80]}")
+
+    # 2. Groq — tries llama-3.3-70b → llama-3.1-8b → mixtral → gemma2
     if GROQ_API_KEY:
         try:
             result = await loop.run_in_executor(executor, _sync_groq, text)
-            logger.info("✓ Groq succeeded")
             return result
         except Exception as e:
-            logger.error(f"Groq failed: {e}"); errors.append(f"Groq: {str(e)[:80]}")
-    raise Exception("AI analysis failed. " + (" | ".join(errors) if errors else "No API keys configured."))
+            logger.error(f"All Groq models failed: {e}")
+            errors.append(f"Groq: {str(e)[:80]}")
+
+    # 3. Together AI (free tier — sign up at api.together.xyz, add TOGETHER_API_KEY)
+    try:
+        result = await loop.run_in_executor(executor, _sync_together, text)
+        logger.info("✓ Together AI succeeded")
+        return result
+    except Exception as e:
+        logger.warning(f"Together AI failed: {e}")
+        errors.append(f"Together: {str(e)[:80]}")
+
+    # 4. OpenRouter (free models — sign up at openrouter.ai, add OPENROUTER_API_KEY)
+    try:
+        result = await loop.run_in_executor(executor, _sync_openrouter, text)
+        logger.info("✓ OpenRouter succeeded")
+        return result
+    except Exception as e:
+        logger.warning(f"OpenRouter failed: {e}")
+        errors.append(f"OpenRouter: {str(e)[:80]}")
+
+    raise Exception("All AI providers failed. " + " | ".join(errors))
 
 
 # ── ROUTES ─────────────────────────────────────────────────────────────────────
