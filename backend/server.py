@@ -277,7 +277,11 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
                 f"https://www.nseindia.com/api/annual-reports?symbol={symbol}&issuer={symbol}&type=annual-report",
                 headers=NSE_HEADERS)
             if r.status_code == 200:
-                data  = r.json()
+                try:
+                    data = r.json()
+                except Exception:
+                    logger.warning(f"NSE annual-reports JSON decode failed for {symbol}")
+                    data = {}
                 items = data.get("data") or (data if isinstance(data, list) else [])
                 for item in items[:10]:
                     pdf = (item.get("fileName") or item.get("pdfName") or item.get("attachment") or "").strip()
@@ -446,8 +450,58 @@ def _repair_json(s: str) -> str:
 
 
 # AI PROMPT
+
+def extract_financial_snippet(text: str, max_chars: int = 8000) -> str:
+    """
+    Instead of blindly taking first N chars, intelligently extract the most
+    financially relevant sections from the document. This avoids sending the
+    entire 65k document and hitting token limits on free-tier AI models.
+    """
+    lines = text.splitlines()
+    
+    # Keywords that signal financially important sections
+    financial_keywords = [
+        "revenue", "income", "profit", "loss", "ebitda", "pat", "eps",
+        "debt", "equity", "assets", "liabilities", "cash", "borrowing",
+        "turnover", "margin", "ratio", "dividend", "crore", "lakh", "million",
+        "quarter", "annual", "fy20", "fy21", "fy22", "fy23", "fy24", "fy25",
+        "balance sheet", "p&l", "statement", "financial result",
+        "total income", "total expense", "finance cost", "depreciation",
+        "current ratio", "net worth", "return on", "operating"
+    ]
+    
+    scored_lines = []
+    for i, line in enumerate(lines):
+        lower = line.lower().strip()
+        if not lower: continue
+        score = sum(1 for kw in financial_keywords if kw in lower)
+        # Boost lines with numbers (financial data)
+        import re
+        if re.search(r'\d{2,}', line): score += 2
+        # Boost lines that look like table rows
+        if line.count('|') >= 2 or line.count('	') >= 2: score += 1
+        scored_lines.append((score, i, line))
+    
+    # Always include first 1500 chars (company name, intro)
+    intro = text[:1500]
+    
+    # Sort by score, pick top lines, then re-sort by original line number
+    top_lines = sorted(scored_lines, key=lambda x: -x[0])[:200]
+    top_lines = sorted(top_lines, key=lambda x: x[1])  # restore order
+    
+    financial_section = "\n".join(l for _, _, l in top_lines)
+    
+    # Combine: intro + financial section, trim to max_chars
+    combined = intro + "\n\n--- KEY FINANCIAL DATA ---\n\n" + financial_section
+    combined = combined[:max_chars]
+    
+    return combined
+
+
 def build_prompt(text: str) -> str:
-    snippet = text[:30000]
+    # Extract only the financially relevant content — keeps under token limits
+    snippet = extract_financial_snippet(text, max_chars=8000)
+    logger.info(f"Prompt snippet: {len(snippet)} chars (from {len(text)} total)")
     return f"""You are a Senior Equity Research Analyst, Credit Analyst, and Forensic Accounting Expert with 20+ years of experience.
 
 Analyze the provided financial document and return ONLY a single valid JSON object. No markdown, no code fences, no explanation text before or after.
@@ -602,14 +656,40 @@ FINANCIAL DOCUMENT:
 # AI RUNNERS
 def _sync_gemini(text: str) -> dict:
     import google.generativeai as genai
+    import time
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash",
-        generation_config={"temperature": 0.1, "max_output_tokens": 8192})
-    resp = model.generate_content(build_prompt(text))
-    logger.info(f"Gemini response: {len(resp.text)} chars")
-    return safe_parse_json(resp.text)
+    # Try gemini-2.0-flash first, fall back to gemini-1.5-flash if quota exceeded
+    gemini_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+    last_err = None
+    for model_name in gemini_models:
+        for attempt in range(2):  # 2 attempts per model (handles transient 429)
+            try:
+                model = genai.GenerativeModel(model_name,
+                    generation_config={"temperature": 0.1, "max_output_tokens": 8192})
+                resp = model.generate_content(build_prompt(text))
+                logger.info(f"Gemini {model_name} response: {len(resp.text)} chars")
+                return safe_parse_json(resp.text)
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str and attempt == 0:
+                    wait = 10
+                    logger.warning(f"Gemini {model_name} 429 — retrying in {wait}s")
+                    time.sleep(wait)
+                    continue
+                last_err = e
+                logger.warning(f"Gemini {model_name} failed: {err_str[:100]}")
+                break  # try next model
+    raise Exception(f"All Gemini models failed. Last: {last_err}")
 
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]
+# Active Groq models as of Feb 2026 (mixtral/gemma2 decommissioned)
+# With 8k snippet, even small models can handle the payload
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",   # 128k ctx, best quality
+    "llama-3.1-70b-versatile",   # 128k ctx, fallback
+    "llama3-70b-8192",           # 8k ctx, stable
+    "llama3-8b-8192",            # 8k ctx, fastest - works fine with 8k snippet
+    "llama-3.1-8b-instant",      # instant tier, very fast
+]
 
 def _sync_groq(text: str) -> dict:
     from groq import Groq
@@ -645,16 +725,38 @@ def _sync_together(text: str) -> dict:
 def _sync_openrouter(text: str) -> dict:
     key = os.getenv("OPENROUTER_API_KEY", "")
     if not key: raise Exception("No OPENROUTER_API_KEY")
-    import httpx as _h
-    resp = _h.post("https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "HTTP-Referer": "https://finsight.app"},
-        json={"model": "meta-llama/llama-3.3-70b-instruct:free",
-              "messages": [{"role": "user", "content": build_prompt(text)}],
-              "temperature": 0.1, "max_tokens": 8192}, timeout=90)
-    resp.raise_for_status()
-    raw = resp.json()["choices"][0]["message"]["content"]
-    logger.info(f"OpenRouter: {len(raw)} chars")
-    return safe_parse_json(raw)
+    import httpx as _h, time
+    # Multiple free models on OpenRouter as fallbacks
+    or_models = [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "meta-llama/llama-3.1-70b-instruct:free",
+        "google/gemma-3-27b-it:free",
+        "mistralai/mistral-7b-instruct:free",
+    ]
+    last_err = None
+    for model_name in or_models:
+        for attempt in range(2):
+            try:
+                resp = _h.post("https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                             "HTTP-Referer": "https://finsight.app"},
+                    json={"model": model_name,
+                          "messages": [{"role": "user", "content": build_prompt(text)}],
+                          "temperature": 0.1, "max_tokens": 8192}, timeout=90)
+                if resp.status_code == 429:
+                    if attempt == 0:
+                        logger.warning(f"OpenRouter {model_name} 429 — retrying in 10s")
+                        time.sleep(10); continue
+                    raise Exception(f"OpenRouter 429 on {model_name}")
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"]
+                logger.info(f"OpenRouter {model_name}: {len(raw)} chars")
+                return safe_parse_json(raw)
+            except Exception as e:
+                last_err = e
+                logger.warning(f"OpenRouter {model_name} failed: {str(e)[:100]}")
+                break
+    raise Exception(f"All OpenRouter models failed. Last: {last_err}")
 
 async def run_analysis(text: str) -> dict:
     loop   = asyncio.get_event_loop()
