@@ -29,37 +29,42 @@ function pdfHTML(r: any, dark: boolean): string {
 
   const scoreRows = (r.health_score_breakdown?.components || []).map((c: any) => {
     const col = c.rating === 'Strong' ? '#22c55e' : c.rating === 'Moderate' ? '#f59e0b' : '#ef4444';
-    const pct = c.max > 0 ? Math.round((c.score/c.max)*100) : 0;
+    const pct = c.max > 0 ? Math.round((c.score / c.max) * 100) : 0;
     return `<div style="background:${dark?'#111B35':'#f8faff'};border-radius:10px;padding:14px;margin-bottom:10px;border:1px solid ${dark?'#1E2D4A':'#e5e7eb'}">
       <div style="display:flex;justify-content:space-between;margin-bottom:8px">
         <span style="font-weight:700;font-size:14px;color:${dark?'#F0F4FF':'#0A0E1A'}">${c.category}</span>
         <span style="font-weight:700;color:${col}">${c.score}/${c.max} — ${c.rating}</span>
       </div>
-      <div style="background:${dark?'#1E2D4A':'#e5e7eb'};border-radius:4px;height:6px;margin-bottom:8px"><div style="background:${col};height:6px;border-radius:4px;width:${pct}%"></div></div>
+      <div style="background:${dark?'#1E2D4A':'#e5e7eb'};border-radius:4px;height:6px;margin-bottom:8px">
+        <div style="background:${col};height:6px;border-radius:4px;width:${pct}%"></div>
+      </div>
       <p style="margin:0;font-size:12px;color:${dark?'#6B82A8':'#555'};line-height:1.6">${c.reasoning}</p>
     </div>`;
   }).join('');
 
-  const li = (arr: string[]) => (arr||[]).map(x => `<li style="margin-bottom:6px;font-size:13px;color:${dark?'#b0c0e0':'#333'};line-height:1.6">${x}</li>`).join('');
+  const li = (arr: string[]) =>
+    (arr || []).map(x => `<li style="margin-bottom:6px;font-size:13px;color:${dark?'#b0c0e0':'#333'};line-height:1.6">${x}</li>`).join('');
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:${dark?'#060B18':'#fff'};color:${dark?'#F0F4FF':'#0A0E1A'};-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:820px;margin:0 auto;padding:40px}.hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:32px;padding-bottom:24px;border-bottom:2px solid ${dark?'#4F8AFF':'#0052FF'}}.logo{font-size:20px;font-weight:900;color:${dark?'#4F8AFF':'#0052FF'}}.sec{margin-bottom:28px;page-break-inside:avoid}.sec-title{font-size:14px;font-weight:700;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid ${dark?'#1E2D4A':'#f0f0f0'}}table{width:100%;border-collapse:collapse}th{background:${dark?'#111B35':'#f8faff'};padding:8px 12px;font-size:11px;color:${dark?'#6B82A8':'#888'};text-align:left;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid ${dark?'#1E2D4A':'#eee'}}.foot{text-align:center;color:${dark?'#3A5080':'#999'};font-size:11px;margin-top:40px;padding-top:20px;border-top:1px solid ${dark?'#1E2D4A':'#eee'}}ul{padding-left:20px;margin:8px 0}@page{margin:0.5in}</style></head>
 <body><div class="page">
-  <div class="hdr"><div><div class="logo">📊 FinSight</div><div style="font-size:12px;color:${dark?'#6B82A8':'#888'};margin-top:4px">AI Financial Analysis Report</div></div>
-  <div style="text-align:right"><div style="font-size:20px;font-weight:800">${r.company_name||'Analysis'}</div>
-  <div style="font-size:13px;color:${dark?'#6B82A8':'#666'};margin-top:4px">${r.statement_type||''} · ${r.period||''} · ${r.currency||''}</div>
-  <div style="font-size:11px;color:${dark?'#3A5080':'#999'};margin-top:4px">Generated ${new Date().toLocaleDateString('en-IN',{day:'numeric',month:'long',year:'numeric'})}</div></div></div>
-
+  <div class="hdr">
+    <div><div class="logo">📊 FinSight</div><div style="font-size:12px;color:${dark?'#6B82A8':'#888'};margin-top:4px">AI Financial Analysis Report</div></div>
+    <div style="text-align:right">
+      <div style="font-size:20px;font-weight:800">${r.company_name||'Analysis'}</div>
+      <div style="font-size:13px;color:${dark?'#6B82A8':'#666'};margin-top:4px">${r.statement_type||''} · ${r.period||''} · ${r.currency||''}</div>
+      <div style="font-size:11px;color:${dark?'#3A5080':'#999'};margin-top:4px">Generated ${new Date().toLocaleDateString('en-IN',{day:'numeric',month:'long',year:'numeric'})}</div>
+    </div>
+  </div>
   <div style="text-align:center;background:${dark?'#0D1426':'#f4f7ff'};border-radius:20px;padding:32px;margin-bottom:28px;border:1px solid ${dark?'#1E2D4A':'#e5e7eb'}">
     <div style="font-size:12px;color:${dark?'#6B82A8':'#888'};text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Financial Health Score</div>
     <div style="font-size:80px;font-weight:900;color:${sc};line-height:1;letter-spacing:-3px">${r.health_score}<span style="font-size:30px;color:${dark?'#3A5080':'#ccc'}">/100</span></div>
     <div style="display:inline-block;background:${sc}25;color:${sc};font-weight:700;font-size:17px;padding:6px 20px;border-radius:30px;margin-top:12px">${r.health_label}</div>
   </div>
-
   ${scoreRows ? `<div class="sec"><div class="sec-title">📐 Score Breakdown</div>${scoreRows}</div>` : ''}
   <div class="sec"><div class="sec-title">📋 Executive Summary</div><p style="font-size:14px;line-height:1.9;color:${dark?'#b0c0e0':'#333'}">${r.executive_summary||''}</p></div>
-  ${r.investor_verdict ? `<div class="sec"><div class="sec-title">💡 Plain English Verdict</div><div style="background:${dark?'#0D1D3A':'#eef4ff'};border-left:3px solid ${dark?'#4F8AFF':'#0052FF'};padding:14px 18px;border-radius:0 10px 10px 0;font-size:13px;line-height:1.8;color:${dark?'#b0c0e0':'#333'}">${r.investor_verdict}</div></div>` : ''}
-  ${metricRows ? `<div class="sec"><div class="sec-title">📊 Key Financial Metrics</div><table><tr><th>Metric</th><th style="text-align:right">Current</th><th style="text-align:right">Previous</th><th style="text-align:right">Change</th></tr>${metricRows}</table></div>` : ''}
+  ${r.investor_verdict ? `<div class="sec"><div class="sec-title">💡 Verdict</div><div style="background:${dark?'#0D1D3A':'#eef4ff'};border-left:3px solid ${dark?'#4F8AFF':'#0052FF'};padding:14px 18px;border-radius:0 10px 10px 0;font-size:13px;line-height:1.8;color:${dark?'#b0c0e0':'#333'}">${r.investor_verdict}</div></div>` : ''}
+  ${metricRows ? `<div class="sec"><div class="sec-title">📊 Key Metrics</div><table><tr><th>Metric</th><th style="text-align:right">Current</th><th style="text-align:right">Previous</th><th style="text-align:right">Change</th></tr>${metricRows}</table></div>` : ''}
   ${r.highlights?.length ? `<div class="sec"><div class="sec-title">✅ Strengths</div><ul>${li(r.highlights)}</ul></div>` : ''}
   ${r.risks?.length ? `<div class="sec"><div class="sec-title">⚠️ Risks</div><ul>${li(r.risks)}</ul></div>` : ''}
   ${r.what_to_watch?.length ? `<div class="sec"><div class="sec-title">🔭 Watch</div><ul>${li(r.what_to_watch)}</ul></div>` : ''}
@@ -75,6 +80,7 @@ export default function AnalysisScreen() {
   const [dark, setDark] = useState(true);
   const [downloading, setDownloading] = useState(false);
   const [copied, setCopied] = useState(false);
+  // useNativeDriver:false on web to avoid the "native animated module missing" warning
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const t = dark ? DARK : LIGHT;
 
@@ -90,14 +96,15 @@ export default function AnalysisScreen() {
       if (!res.ok) throw new Error(`${res.status}`);
       const data = await res.json();
       setAnalysis(data);
-      Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: true }).start();
+      // useNativeDriver false for web compatibility
+      Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: false }).start();
     } catch {
       try {
         const res2 = await fetch(`${BACKEND}/api/public/analyses/${id}`);
         if (res2.ok) {
           const data2 = await res2.json();
           setAnalysis(data2);
-          Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: true }).start();
+          Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: false }).start();
         } else {
           setAnalysis(null);
         }
@@ -118,17 +125,19 @@ export default function AnalysisScreen() {
       const html = pdfHTML(analysis.result, dark);
 
       if (Platform.OS === 'web') {
-        const response = await fetch('https://api.html2pdf.app/v1/generate', {
+        // ── Call OUR backend proxy which calls html2pdf.app server-side ──
+        // This avoids the 403 CORS error from calling html2pdf.app directly in browser
+        const response = await fetch(`${BACKEND}/api/generate-pdf`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            html,
-            apiKey: 'pdliSG0Ajq3ghYvV3adX4OSZNtRLL8IMo0gK52WPIfY3lDwQoFwGfWaHfxWsjUcQ',
-            zoom: 1,
-            landscape: false,
-          }),
+          body: JSON.stringify({ html }),
         });
-        if (!response.ok) throw new Error('PDF generation failed');
+
+        if (!response.ok) {
+          const err = await response.text().catch(() => '');
+          throw new Error(`PDF generation failed (${response.status}): ${err.substring(0, 100)}`);
+        }
+
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -139,6 +148,7 @@ export default function AnalysisScreen() {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
       } else {
+        // ── Mobile: expo-print + expo-sharing ──
         const [PrintModule, SharingModule] = await Promise.all([
           import('expo-print'),
           import('expo-sharing'),
@@ -153,7 +163,7 @@ export default function AnalysisScreen() {
         }
       }
     } catch (e: any) {
-      Alert.alert('Download Failed', e.message || 'Could not generate PDF.');
+      Alert.alert('Download Failed', e.message || 'Could not generate PDF. Please try again.');
     } finally {
       setDownloading(false);
     }
@@ -179,7 +189,7 @@ export default function AnalysisScreen() {
   const shareMsg = () => {
     const r = analysis?.result;
     if (!r) return '';
-    return `📊 ${r.company_name} — Health Score: ${r.health_score}/100 (${r.health_label})\n\n${(r.investor_verdict||'').substring(0,180)}...\n\nFull analysis: ${shareUrl}`;
+    return `📊 ${r.company_name} — Health Score: ${r.health_score}/100 (${r.health_label})\n\n${(r.investor_verdict || '').substring(0, 180)}...\n\nFull analysis: ${shareUrl}`;
   };
 
   const handleBack = () => {
@@ -213,7 +223,12 @@ export default function AnalysisScreen() {
   const sc = r.health_score >= 80 ? '#22c55e' : r.health_score >= 60 ? '#f59e0b' : r.health_score >= 40 ? '#ef4444' : '#dc2626';
 
   const Card = ({ title, leftBorder, children }: any) => (
-    <View style={[gs.card, { backgroundColor: t.card, borderColor: leftBorder ? 'transparent' : t.border, borderLeftColor: leftBorder || t.border, borderLeftWidth: leftBorder ? 3 : 1 }]}>
+    <View style={[gs.card, {
+      backgroundColor: t.card,
+      borderColor: leftBorder ? 'transparent' : t.border,
+      borderLeftColor: leftBorder || t.border,
+      borderLeftWidth: leftBorder ? 3 : 1,
+    }]}>
       {title ? <Text style={[gs.cardTitle, { color: t.text }]}>{title}</Text> : null}
       {children}
     </View>
@@ -326,9 +341,19 @@ export default function AnalysisScreen() {
             )}
           </View>
 
-          {r.executive_summary && <Card title="📋 Executive Summary"><Text style={{ fontSize: 14, lineHeight: 23, color: t.text }}>{r.executive_summary}</Text></Card>}
+          {r.executive_summary && (
+            <Card title="📋 Executive Summary">
+              <Text style={{ fontSize: 14, lineHeight: 23, color: t.text }}>{r.executive_summary}</Text>
+            </Card>
+          )}
 
-          {r.investor_verdict && <Card title="💡 Plain English Verdict" leftBorder={t.accent}><View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 16 }}><Text style={{ fontSize: 14, lineHeight: 23, color: t.text }}>{r.investor_verdict}</Text></View></Card>}
+          {r.investor_verdict && (
+            <Card title="💡 Plain English Verdict" leftBorder={t.accent}>
+              <View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 16 }}>
+                <Text style={{ fontSize: 14, lineHeight: 23, color: t.text }}>{r.investor_verdict}</Text>
+              </View>
+            </Card>
+          )}
 
           {r.key_metrics?.filter((m: any) => m.current && m.current !== 'N/A').length > 0 && (
             <Card title="📊 Key Metrics">
@@ -350,10 +375,14 @@ export default function AnalysisScreen() {
                 <Stat label="ROE" val={r.profitability.roe} color="#22c55e" />
                 <Stat label="ROA" val={r.profitability.roa} color="#22c55e" />
               </View>
-              {r.profitability.key_cost_drivers?.length > 0 && <>
-                <Text style={{ fontSize: 12, fontWeight: '700', color: t.text, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Cost Drivers</Text>
-                {r.profitability.key_cost_drivers.map((d: string, i: number) => <Text key={i} style={{ fontSize: 13, lineHeight: 22, color: t.textSub, marginBottom: 4 }}>· {d}</Text>)}
-              </>}
+              {r.profitability.key_cost_drivers?.length > 0 && (
+                <>
+                  <Text style={{ fontSize: 12, fontWeight: '700', color: t.text, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Cost Drivers</Text>
+                  {r.profitability.key_cost_drivers.map((d: string, i: number) => (
+                    <Text key={i} style={{ fontSize: 13, lineHeight: 22, color: t.textSub, marginBottom: 4 }}>· {d}</Text>
+                  ))}
+                </>
+              )}
             </Card>
           )}
 
@@ -408,7 +437,9 @@ export default function AnalysisScreen() {
                   <Text style={{ color: r.management_commentary.overall_tone === 'Positive' ? '#22c55e' : r.management_commentary.overall_tone === 'Concerned' ? '#ef4444' : '#f59e0b', fontWeight: '700', fontSize: 13 }}>Tone: {r.management_commentary.overall_tone}</Text>
                 </View>
               )}
-              {r.management_commentary.key_points?.map((p: string, i: number) => <Text key={i} style={{ fontSize: 13, lineHeight: 22, color: t.text, marginBottom: 6 }}>· {p}</Text>)}
+              {r.management_commentary.key_points?.map((p: string, i: number) => (
+                <Text key={i} style={{ fontSize: 13, lineHeight: 22, color: t.text, marginBottom: 6 }}>· {p}</Text>
+              ))}
               {r.management_commentary.outlook_statement && r.management_commentary.outlook_statement !== 'N/A' && (
                 <View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 14, marginTop: 12 }}>
                   <Text style={{ fontSize: 12, fontWeight: '700', color: t.accent, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>Outlook</Text>
@@ -452,13 +483,15 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* Share & Download Panel */}
+          {/* Save & Share Panel */}
           <View style={[gs.sharePanel, { backgroundColor: t.card, borderColor: t.border }]}>
             <Text style={{ fontSize: 10, fontWeight: '800', letterSpacing: 2, textTransform: 'uppercase', color: t.textSub, textAlign: 'center', marginBottom: 18 }}>SAVE & SHARE</Text>
 
             <TouchableOpacity
               style={[gs.pdfBtn, { backgroundColor: t.accent, opacity: downloading ? 0.7 : 1 }]}
-              onPress={handleDownloadPDF} disabled={downloading}>
+              onPress={handleDownloadPDF}
+              disabled={downloading}
+            >
               {downloading
                 ? <ActivityIndicator color="#fff" />
                 : <>
@@ -491,7 +524,8 @@ export default function AnalysisScreen() {
 
             <TouchableOpacity
               style={[gs.copyBtn, { borderColor: copied ? '#22c55e' : t.accent, backgroundColor: copied ? '#22c55e15' : t.accentBg }]}
-              onPress={handleCopyLink}>
+              onPress={handleCopyLink}
+            >
               <Text style={{ color: copied ? '#22c55e' : t.accent, fontSize: 15, fontWeight: '700' }}>
                 {copied ? '✅ Link Copied!' : '🔗 Copy Shareable Link'}
               </Text>
@@ -510,26 +544,26 @@ export default function AnalysisScreen() {
 }
 
 const gs = StyleSheet.create({
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
-  btn: { borderRadius: 14, padding: 16, paddingHorizontal: 32 },
-  btnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  topBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 56, paddingBottom: 16, borderBottomWidth: 1 },
-  backText: { fontSize: 15, fontWeight: '600' },
-  card: { borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 10, elevation: 3 },
-  cardTitle: { fontSize: 15, fontWeight: '800', marginBottom: 14, letterSpacing: -0.3 },
-  scoreCard: { borderRadius: 22, padding: 24, alignItems: 'center', marginBottom: 14, borderWidth: 1 },
-  scoreBar: { borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1 },
-  row: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 11, borderBottomWidth: 1 },
-  rowLabel: { fontSize: 13, fontWeight: '600' },
-  stat: { borderRadius: 14, padding: 14, minWidth: '30%', flex: 1, alignItems: 'center', borderWidth: 1 },
-  statVal: { fontSize: 16, fontWeight: '800', letterSpacing: -0.5 },
-  statLabel: { fontSize: 10, marginTop: 5, textAlign: 'center', fontWeight: '600' },
-  dotRow: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 12 },
-  dot: { width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center', marginRight: 12, marginTop: 1, flexShrink: 0 },
-  segCard: { borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1 },
+  center:     { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
+  btn:        { borderRadius: 14, padding: 16, paddingHorizontal: 32 },
+  btnText:    { color: '#fff', fontSize: 15, fontWeight: '700' },
+  topBar:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 16, paddingTop: 56, paddingBottom: 16, borderBottomWidth: 1 },
+  backText:   { fontSize: 15, fontWeight: '600' },
+  card:       { borderRadius: 20, padding: 18, marginBottom: 14, borderWidth: 1, shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 10, elevation: 3 },
+  cardTitle:  { fontSize: 15, fontWeight: '800', marginBottom: 14, letterSpacing: -0.3 },
+  scoreCard:  { borderRadius: 22, padding: 24, alignItems: 'center', marginBottom: 14, borderWidth: 1 },
+  scoreBar:   { borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1 },
+  row:        { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 11, borderBottomWidth: 1 },
+  rowLabel:   { fontSize: 13, fontWeight: '600' },
+  stat:       { borderRadius: 14, padding: 14, minWidth: '30%', flex: 1, alignItems: 'center', borderWidth: 1 },
+  statVal:    { fontSize: 16, fontWeight: '800', letterSpacing: -0.5 },
+  statLabel:  { fontSize: 10, marginTop: 5, textAlign: 'center', fontWeight: '600' },
+  dotRow:     { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 12 },
+  dot:        { width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center', marginRight: 12, marginTop: 1, flexShrink: 0 },
+  segCard:    { borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1 },
   sharePanel: { borderRadius: 22, padding: 20, marginBottom: 14, borderWidth: 1 },
-  pdfBtn: { borderRadius: 16, padding: 16, flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 14 },
-  shareBtn: { flex: 1, borderRadius: 14, paddingVertical: 14, alignItems: 'center' },
-  copyBtn: { borderRadius: 14, padding: 14, alignItems: 'center', borderWidth: 1.5 },
-  backBtn: { borderRadius: 14, padding: 14, alignItems: 'center', borderWidth: 1, marginBottom: 4 },
+  pdfBtn:     { borderRadius: 16, padding: 16, flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 14 },
+  shareBtn:   { flex: 1, borderRadius: 14, paddingVertical: 14, alignItems: 'center' },
+  copyBtn:    { borderRadius: 14, padding: 14, alignItems: 'center', borderWidth: 1.5 },
+  backBtn:    { borderRadius: 14, padding: 14, alignItems: 'center', borderWidth: 1, marginBottom: 4 },
 });
