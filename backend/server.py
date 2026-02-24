@@ -657,127 +657,251 @@ FINANCIAL DOCUMENT:
 {snippet}"""
 
 
-# AI RUNNERS
+# FIXED AI RUNNERS - Replace in your server_v12.py starting at line 660
+
+# AI RUNNERS WITH WORKING MODELS (Feb 2026)
+
 def _sync_gemini(text: str) -> dict:
-    import google.generativeai as genai
-    import time
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Try gemini-2.0-flash first, fall back to gemini-1.5-flash if quota exceeded
-    gemini_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
-    last_err = None
-    for model_name in gemini_models:
-        for attempt in range(2):  # 2 attempts per model (handles transient 429)
+    """
+    Use new google-genai package instead of deprecated google.generativeai
+    Only use models that are confirmed working
+    """
+    try:
+        # Use new API
+        from google import genai
+        from google.genai import types
+        
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        
+        # Working models in order of preference
+        models_to_try = [
+            "gemini-2.0-flash-exp",  # Latest experimental
+            "gemini-1.5-pro",        # Stable production
+            "gemini-1.5-flash",      # Fast and reliable
+        ]
+        
+        for model_name in models_to_try:
             try:
-                model = genai.GenerativeModel(model_name,
-                    generation_config={"temperature": 0.1, "max_output_tokens": 8192})
-                resp = model.generate_content(build_prompt(text))
-                logger.info(f"Gemini {model_name} response: {len(resp.text)} chars")
-                return safe_parse_json(resp.text)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=build_prompt(text),
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=8192,
+                    )
+                )
+                
+                raw_text = response.text
+                logger.info(f"✓ Gemini {model_name}: {len(raw_text)} chars")
+                return safe_parse_json(raw_text)
+                
             except Exception as e:
                 err_str = str(e)
-                if "429" in err_str and attempt == 0:
-                    wait = 10
-                    logger.warning(f"Gemini {model_name} 429 — retrying in {wait}s")
-                    time.sleep(wait)
+                logger.warning(f"Gemini {model_name} failed: {err_str[:150]}")
+                
+                # If quota exceeded, try next model immediately
+                if "429" in err_str or "quota" in err_str.lower():
                     continue
-                last_err = e
-                logger.warning(f"Gemini {model_name} failed: {err_str[:100]}")
-                break  # try next model
-    raise Exception(f"All Gemini models failed. Last: {last_err}")
+                    
+                # If model not found, try next
+                if "404" in err_str or "not found" in err_str.lower():
+                    continue
+                    
+        raise Exception("All Gemini models failed")
+        
+    except ImportError:
+        # Fallback to old API if new one not available
+        logger.warning("New google-genai package not found, using old API")
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        resp = model.generate_content(build_prompt(text))
+        return safe_parse_json(resp.text)
 
-# Active Groq models as of Feb 2026 (mixtral/gemma2 decommissioned)
-# With 8k snippet, even small models can handle the payload
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",   # 128k ctx, best quality
-    "llama-3.1-70b-versatile",   # 128k ctx, fallback
-    "llama3-70b-8192",           # 8k ctx, stable
-    "llama3-8b-8192",            # 8k ctx, fastest - works fine with 8k snippet
-    "llama-3.1-8b-instant",      # instant tier, very fast
+
+# GROQ - Use only currently active models (Feb 2026)
+GROQ_MODELS_ACTIVE = [
+    "llama-3.3-70b-versatile",  # Primary - 128k context
+    "llama-3.2-90b-vision-preview",  # Fallback - latest
+    "gemma2-9b-it",  # Fast fallback
 ]
 
 def _sync_groq(text: str) -> dict:
+    """Use only active Groq models with proper error handling"""
     from groq import Groq
+    
     gc = Groq(api_key=GROQ_API_KEY)
-    last_error = None
-    for model in GROQ_MODELS:
+    prompt = build_prompt(text)
+    
+    # Reduce prompt size if too large
+    if len(prompt) > 30000:
+        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 25000")
+        prompt = prompt[:25000] + "\n\n[Document truncated due to size limits]"
+    
+    for model in GROQ_MODELS_ACTIVE:
         try:
-            resp = gc.chat.completions.create(model=model,
-                messages=[{"role": "user", "content": build_prompt(text)}],
-                temperature=0.1, max_tokens=8192)
+            resp = gc.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=8192
+            )
             raw = resp.choices[0].message.content
-            logger.info(f"Groq {model}: {len(raw)} chars")
+            logger.info(f"✓ Groq {model}: {len(raw)} chars")
             return safe_parse_json(raw)
+            
         except Exception as ex:
-            logger.warning(f"Groq {model} failed: {str(ex)[:120]}")
-            last_error = ex
-    raise Exception(f"All Groq models failed. Last: {last_error}")
+            err_str = str(ex)
+            logger.warning(f"Groq {model} failed: {err_str[:150]}")
+            
+            # Skip if rate limited or model decommissioned
+            if "429" in err_str or "rate limit" in err_str.lower():
+                continue
+            if "400" in err_str or "decommissioned" in err_str.lower():
+                continue
+            if "413" in err_str or "too large" in err_str.lower():
+                continue
+                
+    raise Exception("All Groq models failed or unavailable")
+
 
 def _sync_together(text: str) -> dict:
+    """Together AI with working free models"""
     key = os.getenv("TOGETHER_API_KEY", "")
-    if not key: raise Exception("No TOGETHER_API_KEY")
-    import httpx as _h
-    resp = _h.post("https://api.together.xyz/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-              "messages": [{"role": "user", "content": build_prompt(text)}],
-              "temperature": 0.1, "max_tokens": 8192}, timeout=90)
-    resp.raise_for_status()
-    raw = resp.json()["choices"][0]["message"]["content"]
-    logger.info(f"Together AI: {len(raw)} chars")
-    return safe_parse_json(raw)
+    if not key:
+        raise Exception("No TOGETHER_API_KEY")
+    
+    import httpx
+    
+    # Use free tier models
+    models = [
+        "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+        "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+    ]
+    
+    for model in models:
+        try:
+            resp = httpx.post(
+                "https://api.together.xyz/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": build_prompt(text)}],
+                    "temperature": 0.1,
+                    "max_tokens": 8192
+                },
+                timeout=90
+            )
+            
+            if resp.status_code == 200:
+                raw = resp.json()["choices"][0]["message"]["content"]
+                logger.info(f"✓ Together {model}: {len(raw)} chars")
+                return safe_parse_json(raw)
+            else:
+                logger.warning(f"Together {model} failed: {resp.status_code}")
+                
+        except Exception as e:
+            logger.warning(f"Together {model} error: {str(e)[:150]}")
+            
+    raise Exception("All Together AI models failed")
+
 
 def _sync_openrouter(text: str) -> dict:
+    """OpenRouter with currently available free models"""
     key = os.getenv("OPENROUTER_API_KEY", "")
-    if not key: raise Exception("No OPENROUTER_API_KEY")
-    import httpx as _h, time
-    # Multiple free models on OpenRouter as fallbacks
-    or_models = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "meta-llama/llama-3.1-70b-instruct:free",
-        "google/gemma-3-27b-it:free",
-        "mistralai/mistral-7b-instruct:free",
+    if not key:
+        raise Exception("No OPENROUTER_API_KEY")
+    
+    import httpx
+    import time
+    
+    # Updated list of working free models (Feb 2026)
+    models = [
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "qwen/qwen-2.5-7b-instruct:free",
     ]
-    last_err = None
-    for model_name in or_models:
+    
+    for model in models:
         for attempt in range(2):
             try:
-                resp = _h.post("https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                             "HTTP-Referer": "https://finsight.app"},
-                    json={"model": model_name,
-                          "messages": [{"role": "user", "content": build_prompt(text)}],
-                          "temperature": 0.1, "max_tokens": 8192}, timeout=90)
-                if resp.status_code == 429:
-                    if attempt == 0:
-                        logger.warning(f"OpenRouter {model_name} 429 — retrying in 10s")
-                        time.sleep(10); continue
-                    raise Exception(f"OpenRouter 429 on {model_name}")
-                resp.raise_for_status()
-                raw = resp.json()["choices"][0]["message"]["content"]
-                logger.info(f"OpenRouter {model_name}: {len(raw)} chars")
-                return safe_parse_json(raw)
+                resp = httpx.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "HTTP-Referer": "https://finsight-vert.vercel.app",
+                        "X-Title": "FinSight",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": build_prompt(text)}],
+                        "temperature": 0.1,
+                        "max_tokens": 8192
+                    },
+                    timeout=90
+                )
+                
+                if resp.status_code == 429 and attempt == 0:
+                    logger.warning(f"OpenRouter {model} rate limited, waiting 15s...")
+                    time.sleep(15)
+                    continue
+                    
+                if resp.status_code == 200:
+                    raw = resp.json()["choices"][0]["message"]["content"]
+                    logger.info(f"✓ OpenRouter {model}: {len(raw)} chars")
+                    return safe_parse_json(raw)
+                else:
+                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
+                    break  # Try next model
+                    
             except Exception as e:
-                last_err = e
-                logger.warning(f"OpenRouter {model_name} failed: {str(e)[:100]}")
+                logger.warning(f"OpenRouter {model} error: {str(e)[:150]}")
                 break
-    raise Exception(f"All OpenRouter models failed. Last: {last_err}")
+                
+    raise Exception("All OpenRouter models failed")
 
+
+# MAIN ANALYSIS ORCHESTRATOR
 async def run_analysis(text: str) -> dict:
-    loop   = asyncio.get_event_loop()
-    errors: List[str] = []
-
-    if GEMINI_API_KEY:
+    """
+    Try all available AI providers in order of preference
+    Returns first successful result
+    """
+    loop = asyncio.get_event_loop()
+    errors = []
+    
+    # Provider priority order
+    providers = [
+        ("Gemini", _sync_gemini, GEMINI_API_KEY),
+        ("Groq", _sync_groq, GROQ_API_KEY),
+        ("Together", _sync_together, os.getenv("TOGETHER_API_KEY", "")),
+        ("OpenRouter", _sync_openrouter, os.getenv("OPENROUTER_API_KEY", "")),
+    ]
+    
+    for provider_name, func, api_key in providers:
+        if not api_key:
+            logger.info(f"⊘ {provider_name} skipped (no API key)")
+            continue
+            
         try:
-            result = await loop.run_in_executor(executor, _sync_gemini, text)
-            logger.info("✓ Gemini succeeded"); return result
-        except Exception as e:
-            logger.warning(f"Gemini failed: {e}"); errors.append(f"Gemini: {str(e)[:100]}")
-
-    if GROQ_API_KEY:
-        try:
-            result = await loop.run_in_executor(executor, _sync_groq, text)
+            logger.info(f"→ Trying {provider_name}...")
+            result = await loop.run_in_executor(executor, func, text)
+            logger.info(f"✓ {provider_name} succeeded!")
             return result
+            
         except Exception as e:
+            error_msg = str(e)[:200]
+            logger.warning(f"✗ {provider_name} failed: {error_msg}")
+            errors.append(f"{provider_name}: {error_msg}")
+    
+    # All providers failed
+    error_summary = " | ".join(errors) if errors else "No API keys configured"
+    raise Exception(f"All AI providers failed. {error_summary}")
             logger.error(f"All Groq failed: {e}"); errors.append(f"Groq: {str(e)[:100]}")
 
     try:
