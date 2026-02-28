@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Analytics } from "@vercel/analytics/react";
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
@@ -55,6 +56,7 @@ export default function App() {
       <div style={{ marginTop: 30, whiteSpace: "pre-wrap" }}>
         {result}
       </div>
+      <Analytics />
     </div>
   );
 }
