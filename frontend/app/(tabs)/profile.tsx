@@ -22,18 +22,25 @@ export default function ProfileTab() {
   };
 
   const handleSignOut = () => {
-    Alert.alert('Sign Out', 'Are you sure?', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Sign Out', style: 'destructive',
-        onPress: async () => {
-          await AsyncStorage.multiRemove(['token', 'user']);
-          // Replace ensures back button won't bring user back
-          router.replace('/');
+  Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
+    { text: 'Cancel', style: 'cancel' },
+    {
+      text: 'Sign Out',
+      style: 'destructive',
+      onPress: async () => {
+        try {
+          // Clear ALL stored data
+          await AsyncStorage.clear();
+          // Navigate to login (not just '/')
+          router.replace('/login');
+        } catch (error) {
+          console.error('Sign out error:', error);
+          Alert.alert('Error', 'Failed to sign out. Please try again.');
         }
       }
-    ]);
-  };
+    }
+  ]);
+};
 
   return (
     <View style={ps.root}>

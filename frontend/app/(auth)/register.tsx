@@ -1,9 +1,10 @@
-﻿import { useState } from "react";
+import { useState } from "react";
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView, Alert } from "react-native";
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Feather } from "@expo/vector-icons";
 import { useAuth } from "../../src/context/AuthContext";
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export default function RegisterScreen() {
   const router = useRouter();
@@ -30,21 +31,36 @@ export default function RegisterScreen() {
 
   const handleRegister = async () => {
     if (!validate()) return;
+    
     setLoading(true);
-    try { await register(name.trim(), email.trim().toLowerCase(), password); }
-    catch (e: any) { Alert.alert("Registration Failed", e.message || "Please try again"); }
-    finally { setLoading(false); }
+    
+    // ✅ FIX #2: Clear old session data BEFORE creating new account
+    await AsyncStorage.clear();
+    
+    try { 
+      await register(name.trim(), email.trim().toLowerCase(), password); 
+    }
+    catch (e: any) { 
+      Alert.alert("Registration Failed", e.message || "Please try again"); 
+    }
+    finally { 
+      setLoading(false); 
+    }
   };
 
   return (
     <SafeAreaView style={styles.container}>
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === "ios" ? "padding" : "height"}>
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-          <TouchableOpacity style={styles.back} onPress={() => router.back()}><Feather name="arrow-left" size={22} color="#111111" /></TouchableOpacity>
+          <TouchableOpacity style={styles.back} onPress={() => router.back()}>
+            <Feather name="arrow-left" size={22} color="#111111" />
+          </TouchableOpacity>
+          
           <View style={styles.headerText}>
             <Text style={styles.title}>Create account</Text>
             <Text style={styles.subtitle}>Start analyzing financial statements for free</Text>
           </View>
+          
           <View style={styles.card}>
             {[
               { label: "Full name", value: name, onChange: setName, placeholder: "Jane Smith", icon: "user", key: "name", secure: false },
@@ -56,17 +72,48 @@ export default function RegisterScreen() {
                 <Text style={styles.label}>{f.label}</Text>
                 <View style={[styles.inputWrap, errors[f.key] && styles.inputError]}>
                   <Feather name={f.icon as any} size={18} color="#888" style={styles.inputIcon} />
-                  <TextInput style={styles.input} placeholder={f.placeholder} placeholderTextColor="#BBBBBB" secureTextEntry={f.secure && !showPw} autoCapitalize="none" value={f.value} onChangeText={t => { f.onChange(t); setErrors(p => ({ ...p, [f.key]: "" })); }} />
-                  {f.secure && <TouchableOpacity onPress={() => setShowPw(v => !v)} style={styles.eyeBtn}><Feather name={showPw ? "eye-off" : "eye"} size={18} color="#888" /></TouchableOpacity>}
+                  <TextInput 
+                    style={styles.input} 
+                    placeholder={f.placeholder} 
+                    placeholderTextColor="#BBBBBB" 
+                    secureTextEntry={f.secure && !showPw} 
+                    autoCapitalize="none" 
+                    value={f.value} 
+                    onChangeText={t => { 
+                      f.onChange(t); 
+                      setErrors(p => ({ ...p, [f.key]: "" })); 
+                    }} 
+                  />
+                  {f.secure && (
+                    <TouchableOpacity onPress={() => setShowPw(v => !v)} style={styles.eyeBtn}>
+                      <Feather name={showPw ? "eye-off" : "eye"} size={18} color="#888" />
+                    </TouchableOpacity>
+                  )}
                 </View>
                 {errors[f.key] ? <Text style={styles.errorText}>{errors[f.key]}</Text> : null}
               </View>
             ))}
-            <TouchableOpacity style={[styles.btn, loading && styles.btnDisabled]} onPress={handleRegister} disabled={loading} activeOpacity={0.85}>
-              {loading ? <ActivityIndicator color="#FFF" /> : <Text style={styles.btnText}>Create Account</Text>}
+            
+            <TouchableOpacity 
+              style={[styles.btn, loading && styles.btnDisabled]} 
+              onPress={handleRegister} 
+              disabled={loading} 
+              activeOpacity={0.85}
+            >
+              {loading ? (
+                <ActivityIndicator color="#FFF" />
+              ) : (
+                <Text style={styles.btnText}>Create Account</Text>
+              )}
             </TouchableOpacity>
-            <TouchableOpacity style={styles.loginLink} onPress={() => router.push("/(auth)/login")}>
-              <Text style={styles.loginLinkText}>Already have an account? <Text style={{ color: "#0052FF", fontWeight: "700" }}>Sign in</Text></Text>
+            
+            <TouchableOpacity 
+              style={styles.loginLink} 
+              onPress={() => router.push("/(auth)/login")}
+            >
+              <Text style={styles.loginLinkText}>
+                Already have an account? <Text style={{ color: "#0052FF", fontWeight: "700" }}>Sign in</Text>
+              </Text>
             </TouchableOpacity>
           </View>
         </ScrollView>

@@ -87,9 +87,12 @@ export default function Login() {
     }
   };
 
-  const continueAsGuest = () => {
-    router.replace('/(tabs)');
-  };
+  const continueAsGuest = async () => {
+  // Clear any old data
+  await AsyncStorage.multiRemove(['token', 'user']);
+  // Navigate to main app
+  router.replace('/(tabs)');
+};
 
   return (
     <KeyboardAvoidingView style={s.root} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
