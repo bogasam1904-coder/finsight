@@ -193,7 +193,7 @@ export default function AnalysisScreen() {
   };
 
   // FIX #3: Update share URL to use correct domain
-  const shareUrl = `${BACKEND.replace('loyal-integrity-production-2b54.up.railway.app', 'finsight-vert.vercel.app')}/analysis/${id}`;
+  const shareUrl = `https://finsight-vert.vercel.app/share/${id}`;
 
   const handleCopyLink = async () => {
     if (Platform.OS === 'web' && navigator?.clipboard) {
@@ -215,6 +215,70 @@ export default function AnalysisScreen() {
     if (!r) return '';
     return `📊 ${r.company_name} — Health Score: ${r.health_score}/100 (${r.health_label})\n\n${(r.investor_verdict || '').substring(0, 180)}...\n\nFull analysis: ${shareUrl}`;
   };
+
+  // ✅ WhatsApp Share
+const handleWhatsAppShare = () => {
+  const r = analysis?.result;
+  if (!r) return;
+  
+  const message = `📊 *${r.company_name}* Financial Analysis
+
+💯 Health Score: *${r.health_score}/100* (${r.health_label})
+
+${r.investor_verdict || r.executive_summary || ''}
+
+📱 View full analysis:
+${shareUrl}
+
+_Powered by FinSight_`;
+
+  const url = `https://wa.me/?text=${encodeURIComponent(message)}`;
+  
+  if (Platform.OS === 'web') {
+    window.open(url, '_blank');
+  } else {
+    Linking.openURL(url).catch(() => Alert.alert('Error', 'Could not open WhatsApp'));
+  }
+};
+
+// ✅ Twitter Share
+const handleTwitterShare = () => {
+  const r = analysis?.result;
+  if (!r) return;
+  
+  const tweet = `📊 ${r.company_name} - Financial Health: ${r.health_score}/100 (${r.health_label})
+
+${r.investor_verdict ? r.investor_verdict.substring(0, 100) + '...' : ''}
+
+Full analysis:`;
+
+  const url = `https://twitter.com/intent/tweet?text=${encodeURIComponent(tweet)}&url=${encodeURIComponent(shareUrl)}`;
+  
+  if (Platform.OS === 'web') {
+    window.open(url, '_blank');
+  } else {
+    Linking.openURL(url).catch(() => Alert.alert('Error', 'Could not open Twitter'));
+  }
+};
+
+// ✅ Generic Share
+const handleGenericShare = async () => {
+  const r = analysis?.result;
+  if (!r) return;
+  
+  try {
+    await Share.share({
+      message: `📊 ${r.company_name} - Health Score: ${r.health_score}/100
+
+${r.investor_verdict || ''}
+
+View analysis: ${shareUrl}`,
+      title: `${r.company_name} - Financial Analysis`,
+    });
+  } catch (error) {
+    console.error('Share error:', error);
+  }
+};
 
   const handleBack = () => {
     if (router.canGoBack()) router.back();
@@ -529,18 +593,15 @@ export default function AnalysisScreen() {
             </TouchableOpacity>
 
             <View style={{ flexDirection: 'row', gap: 10, marginBottom: 12 }}>
-              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#25D366' }]} onPress={() => openURL(`https://wa.me/?text=${encodeURIComponent(shareMsg())}`)}>
+              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#25D366' }]} onPress={handleWhatsAppShare}>
                 <Text style={{ fontSize: 18, marginBottom: 3 }}>💬</Text>
                 <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>WhatsApp</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#000' }]} onPress={() => {
-                const txt = `📊 ${r.company_name} — ${r.health_score}/100 (${r.health_label}) via FinSight`;
-                openURL(`https://twitter.com/intent/tweet?text=${encodeURIComponent(txt)}&url=${encodeURIComponent(shareUrl)}`);
-              }}>
+              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#000' }]} onPress={handleTwitterShare}>
                 <Text style={{ fontSize: 18, marginBottom: 3 }}>𝕏</Text>
                 <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Twitter</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#0052FF' }]} onPress={() => Share.share({ message: shareMsg(), title: r.company_name }).catch(() => {})}>
+              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#0052FF' }]} onPress={handleGenericShare}>
                 <Text style={{ fontSize: 18, marginBottom: 3 }}>📤</Text>
                 <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Share</Text>
               </TouchableOpacity>

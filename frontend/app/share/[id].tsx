@@ -1,43 +1,35 @@
-// app/share/[id].tsx
-// This file should be placed in your app directory structure
-// It handles the public share URLs like: https://yourapp.com/share/analysis-id-123
-
-import React, { useEffect, useState } from 'react';
-import { View, Text, ActivityIndicator, StyleSheet } from 'react-native';
+import { useEffect } from 'react';
+import { View, ActivityIndicator, Text, StyleSheet } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 
 const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://loyal-integrity-production-2b54.up.railway.app';
 
-export default function ShareRoute() {
+export default function ShareRedirect() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
-  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Verify the analysis exists, then redirect to the main analysis view
-    const checkAndRedirect = async () => {
-      if (!id) {
-        router.replace('/(tabs)');
-        return;
-      }
+    if (!id) {
+      router.replace('/(tabs)');
+      return;
+    }
 
+    // Verify analysis exists, then redirect to main analysis view
+    const checkAnalysis = async () => {
       try {
-        // Check if analysis exists via public endpoint
         const res = await fetch(`${BACKEND}/api/public/analyses/${id}`);
         if (res.ok) {
-          // Analysis exists, redirect to the analysis view
           router.replace(`/analysis/${id}`);
         } else {
-          // Analysis not found
           router.replace('/(tabs)');
         }
       } catch (error) {
-        console.error('Error checking analysis:', error);
+        console.error('Share route error:', error);
         router.replace('/(tabs)');
       }
     };
 
-    checkAndRedirect();
+    checkAnalysis();
   }, [id]);
 
   return (
