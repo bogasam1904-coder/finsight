@@ -1,3 +1,6 @@
+// COMPLETE FILE - app/(auth)/login.tsx
+// FIXES: Issue #1 (Guest mode)
+
 import React, { useState, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
@@ -18,15 +21,15 @@ export default function Login() {
   const fadeAnim = useRef(new Animated.Value(0)).current;
 
   React.useEffect(() => {
-    Animated.timing(fadeAnim, { toValue: 1, duration: 600, useNativeDriver: true }).start();
+    Animated.timing(fadeAnim, { toValue: 1, duration: 600, useNativeDriver: false }).start();
   }, []);
 
   const shake = () => Animated.sequence([
-    Animated.timing(shakeAnim, { toValue: 14, duration: 55, useNativeDriver: true }),
-    Animated.timing(shakeAnim, { toValue: -14, duration: 55, useNativeDriver: true }),
-    Animated.timing(shakeAnim, { toValue: 10, duration: 55, useNativeDriver: true }),
-    Animated.timing(shakeAnim, { toValue: -10, duration: 55, useNativeDriver: true }),
-    Animated.timing(shakeAnim, { toValue: 0, duration: 55, useNativeDriver: true }),
+    Animated.timing(shakeAnim, { toValue: 14, duration: 55, useNativeDriver: false }),
+    Animated.timing(shakeAnim, { toValue: -14, duration: 55, useNativeDriver: false }),
+    Animated.timing(shakeAnim, { toValue: 10, duration: 55, useNativeDriver: false }),
+    Animated.timing(shakeAnim, { toValue: -10, duration: 55, useNativeDriver: false }),
+    Animated.timing(shakeAnim, { toValue: 0, duration: 55, useNativeDriver: false }),
   ]).start();
 
   const handleLogin = async () => {
@@ -50,7 +53,6 @@ export default function Login() {
         body: JSON.stringify({ email: trimEmail, password }),
       });
       
-      // Parse response
       let data: any;
       const text = await res.text();
       try {
@@ -67,7 +69,6 @@ export default function Login() {
         throw new Error('No token received from server');
       }
       
-      // Save to storage
       await AsyncStorage.setItem('token', data.token);
       await AsyncStorage.setItem('user', JSON.stringify({
         name: data.name,
@@ -75,7 +76,6 @@ export default function Login() {
         user_id: data.user_id
       }));
       
-      // Navigate to tabs
       router.replace('/(tabs)');
       
     } catch (e: any) {
@@ -87,12 +87,15 @@ export default function Login() {
     }
   };
 
+  // ✅ FIX #1: Guest mode - clear old data and navigate
   const continueAsGuest = async () => {
-  // Clear any old data
-  await AsyncStorage.multiRemove(['token', 'user']);
-  // Navigate to main app
-  router.replace('/(tabs)');
-};
+    try {
+      await AsyncStorage.multiRemove(['token', 'user']);
+      router.replace('/(tabs)');
+    } catch (error) {
+      router.replace('/(tabs)');
+    }
+  };
 
   return (
     <KeyboardAvoidingView style={s.root} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>

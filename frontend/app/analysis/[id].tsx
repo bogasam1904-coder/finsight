@@ -195,24 +195,6 @@ export default function AnalysisScreen() {
   // FIX #3: Update share URL to use correct domain
   const shareUrl = `${BACKEND.replace('loyal-integrity-production-2b54.up.railway.app', 'finsight-vert.vercel.app')}/share/${id}`;
 
-  const handleWhatsAppShare = () => {
-  const r = analysis?.result;
-  if (!r) return;
-  const msg = `📊 ${r.company_name}\n💯 ${r.health_score}/100\n\n${shareUrl}`;
-  const url = `https://wa.me/?text=${encodeURIComponent(msg)}`;
-  if (Platform.OS === 'web') window.open(url, '_blank');
-  else Linking.openURL(url);
-};
-
-const handleTwitterShare = () => {
-  const r = analysis?.result;
-  if (!r) return;
-  const tweet = `📊 ${r.company_name} - ${r.health_score}/100`;
-  const url = `https://twitter.com/intent/tweet?text=${encodeURIComponent(tweet)}&url=${encodeURIComponent(shareUrl)}`;
-  if (Platform.OS === 'web') window.open(url, '_blank');
-  else Linking.openURL(url);
-};
-
   const handleCopyLink = async () => {
     if (Platform.OS === 'web' && navigator?.clipboard) {
       await navigator.clipboard.writeText(shareUrl).catch(() => {});
@@ -547,7 +529,7 @@ const handleTwitterShare = () => {
             </TouchableOpacity>
 
             <View style={{ flexDirection: 'row', gap: 10, marginBottom: 12 }}>
-              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#25D366' }]} onPress={handleWhatsAppShare}
+              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#25D366' }]} onPress={() => openURL(`https://wa.me/?text=${encodeURIComponent(shareMsg())}`)}>
                 <Text style={{ fontSize: 18, marginBottom: 3 }}>💬</Text>
                 <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>WhatsApp</Text>
               </TouchableOpacity>

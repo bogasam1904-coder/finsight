@@ -1,4 +1,7 @@
-﻿import { Tabs } from "expo-router";
+// COMPLETE FILE - app/(tabs)/_layout.tsx
+// FIXES: Issue #4 (duplicate search), Issue #5 (bottom nav)
+
+import { Tabs } from "expo-router";
 import { Feather } from "@expo/vector-icons";
 import { Platform } from "react-native";
 
@@ -52,13 +55,6 @@ export default function TabLayout() {
           tabBarIcon: ({ color, size }) => (
             <Feather name="user" size={size} color={color} />
           )
-        }} 
-      />
-      {/* Hide search tab - functionality integrated in main screen */}
-      <Tabs.Screen 
-        name="search" 
-        options={{ 
-          href: null, // This hides it from tab bar
         }} 
       />
     </Tabs>

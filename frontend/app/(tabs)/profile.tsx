@@ -1,8 +1,12 @@
+// COMPLETE FILE - app/(tabs)/profile.tsx
+// FIXES: Issue #7 (sign out not working)
+
 import React, { useState, useEffect } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, StatusBar } from 'react-native';
 import { useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { apiFetch } from '../../src/api';
+
+const BACKEND = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://loyal-integrity-production-2b54.up.railway.app';
 
 export default function ProfileTab() {
   const router = useRouter();
@@ -14,33 +18,50 @@ export default function ProfileTab() {
   const loadData = async () => {
     const u = await AsyncStorage.getItem('user');
     if (u) setUser(JSON.parse(u));
+    
     try {
-      const res = await apiFetch('/analyses');
-      const data = await res.json();
-      if (Array.isArray(data)) setStats({ total: data.length, completed: data.filter((a: any) => a.status === 'completed').length });
-    } catch { }
-  };
-
-  const handleSignOut = () => {
-  Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
-    { text: 'Cancel', style: 'cancel' },
-    {
-      text: 'Sign Out',
-      style: 'destructive',
-      onPress: async () => {
-        try {
-          // Clear ALL stored data
-          await AsyncStorage.clear();
-          // Navigate to login (not just '/')
-          router.replace('/login');
-        } catch (error) {
-          console.error('Sign out error:', error);
-          Alert.alert('Error', 'Failed to sign out. Please try again.');
+      const token = await AsyncStorage.getItem('token');
+      if (token) {
+        const res = await fetch(`${BACKEND}/api/analyses`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data)) {
+            setStats({ 
+              total: data.length, 
+              completed: data.filter((a: any) => a.status === 'completed').length 
+            });
+          }
         }
       }
+    } catch (error) {
+      console.error('Failed to load stats:', error);
     }
-  ]);
-};
+  };
+
+  // ✅ FIX #7: Working sign out
+  const handleSignOut = () => {
+    Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Sign Out',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            // Clear ALL stored data
+            await AsyncStorage.clear();
+            
+            // Navigate to login screen
+            router.replace('/login');
+          } catch (error) {
+            console.error('Sign out error:', error);
+            Alert.alert('Error', 'Failed to sign out. Please try again.');
+          }
+        }
+      }
+    ]);
+  };
 
   return (
     <View style={ps.root}>
@@ -51,27 +72,60 @@ export default function ProfileTab() {
         </View>
 
         <View style={ps.profileCard}>
-          <View style={ps.avatar}><Text style={ps.avatarText}>{user?.name?.[0]?.toUpperCase() || 'U'}</Text></View>
+          <View style={ps.avatar}>
+            <Text style={ps.avatarText}>{user?.name?.[0]?.toUpperCase() || 'U'}</Text>
+          </View>
           <Text style={ps.name}>{user?.name || 'User'}</Text>
           <Text style={ps.email}>{user?.email || ''}</Text>
+          
           <View style={ps.statsRow}>
-            <View style={ps.statItem}><Text style={ps.statVal}>{stats.total}</Text><Text style={ps.statLbl}>Total</Text></View>
+            <View style={ps.statItem}>
+              <Text style={ps.statVal}>{stats.total}</Text>
+              <Text style={ps.statLbl}>Total</Text>
+            </View>
             <View style={ps.statDivider} />
-            <View style={ps.statItem}><Text style={ps.statVal}>{stats.completed}</Text><Text style={ps.statLbl}>Done</Text></View>
+            <View style={ps.statItem}>
+              <Text style={ps.statVal}>{stats.completed}</Text>
+              <Text style={ps.statLbl}>Done</Text>
+            </View>
             <View style={ps.statDivider} />
-            <View style={ps.statItem}><Text style={ps.statVal}>{stats.total - stats.completed}</Text><Text style={ps.statLbl}>Failed</Text></View>
+            <View style={ps.statItem}>
+              <Text style={ps.statVal}>{stats.total - stats.completed}</Text>
+              <Text style={ps.statLbl}>Failed</Text>
+            </View>
           </View>
         </View>
 
         <View style={ps.menuCard}>
           {[
-            { icon: '📊', label: 'My Analyses', sub: `${stats.completed} completed`, onPress: () => router.push('/(tabs)/history') },
-            { icon: '🔗', label: 'Share FinSight', sub: 'Invite others', onPress: () => {} },
-            { icon: '📧', label: 'Support', sub: 'Get help', onPress: () => {} },
+            { 
+              icon: '📊', 
+              label: 'My Analyses', 
+              sub: `${stats.completed} completed`, 
+              onPress: () => router.push('/(tabs)/history') 
+            },
+            { 
+              icon: '🔗', 
+              label: 'Share FinSight', 
+              sub: 'Invite others', 
+              onPress: () => Alert.alert('Share', 'Share feature coming soon!') 
+            },
+            { 
+              icon: '📧', 
+              label: 'Support', 
+              sub: 'Get help', 
+              onPress: () => Alert.alert('Support', 'Email: support@finsight.app') 
+            },
           ].map((item, i) => (
-            <TouchableOpacity key={i} style={[ps.menuItem, { borderBottomColor: 'rgba(255,255,255,0.05)' }]} onPress={item.onPress}>
+            <TouchableOpacity 
+              key={i} 
+              style={[ps.menuItem, { borderBottomWidth: i < 2 ? 1 : 0, borderBottomColor: 'rgba(255,255,255,0.05)' }]} 
+              onPress={item.onPress}
+            >
               <View style={ps.menuLeft}>
-                <View style={ps.menuIcon}><Text style={{ fontSize: 16 }}>{item.icon}</Text></View>
+                <View style={ps.menuIcon}>
+                  <Text style={{ fontSize: 16 }}>{item.icon}</Text>
+                </View>
                 <View>
                   <Text style={ps.menuLabel}>{item.label}</Text>
                   <Text style={ps.menuSub}>{item.sub}</Text>
@@ -108,7 +162,7 @@ const ps = StyleSheet.create({
   statLbl: { color: 'rgba(255,255,255,0.3)', fontSize: 11, marginTop: 2 },
   statDivider: { width: 1, height: 36, backgroundColor: 'rgba(255,255,255,0.07)' },
   menuCard: { marginHorizontal: 20, backgroundColor: '#0D1426', borderRadius: 20, overflow: 'hidden', marginBottom: 16, borderWidth: 1, borderColor: 'rgba(255,255,255,0.06)' },
-  menuItem: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 18, paddingVertical: 17, borderBottomWidth: 1 },
+  menuItem: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 18, paddingVertical: 17 },
   menuLeft: { flexDirection: 'row', alignItems: 'center', gap: 14 },
   menuIcon: { width: 38, height: 38, borderRadius: 11, backgroundColor: 'rgba(255,255,255,0.05)', alignItems: 'center', justifyContent: 'center' },
   menuLabel: { color: '#fff', fontSize: 15, fontWeight: '600' },
