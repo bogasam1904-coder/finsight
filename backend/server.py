@@ -943,8 +943,8 @@ def _sync_groq(text: str) -> dict:
     
     # Reduce prompt size if too large
     if len(prompt) > 120000:  # Llama 3.3 supports 128k context
-    logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 100000")
-    prompt = prompt[:100000] + "\n\n[Document truncated due to size limits]"
+        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 100000")
+        prompt = prompt[:100000] + "\n\n[Document truncated due to size limits]"
     
     for model in GROQ_MODELS_ACTIVE:
         try:
