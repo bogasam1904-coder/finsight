@@ -193,7 +193,7 @@ export default function AnalysisScreen() {
   };
 
   // FIX #3: Update share URL to use correct domain
-  const shareUrl = `${BACKEND.replace('loyal-integrity-production-2b54.up.railway.app', 'finsight-vert.vercel.app')}/share/${id}`;
+  const shareUrl = `${BACKEND.replace('loyal-integrity-production-2b54.up.railway.app', 'finsight-vert.vercel.app')}/analysis/${id}`;
 
   const handleCopyLink = async () => {
     if (Platform.OS === 'web' && navigator?.clipboard) {

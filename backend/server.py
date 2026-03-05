@@ -493,165 +493,219 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 35000) -> str:
 
 
 def build_prompt(text: str) -> str:
-    # text here is already the financial-pages extract — pass it directly
-    snippet = text[:35000]
+    snippet = text[:50000]  # ✅ INCREASED from 35000 to 50000 for more data
     logger.info(f"Prompt snippet: {len(snippet)} chars")
 
-    return f"""You are a Senior Equity Research Analyst, Credit Analyst, and Forensic Accounting Expert with 20+ years of experience.
+    return f"""You are a Senior Equity Research Analyst with 25+ years of experience analyzing Indian companies. You have deep expertise in financial statement analysis, ratio interpretation, and company valuation.
 
-Analyze the provided financial document and return ONLY a single valid JSON object. No markdown, no code fences, no explanation text before or after.
+Analyze the provided financial document and return ONLY a single valid JSON object. No markdown, no code fences, no preamble.
 
-ABSOLUTE RULES:
-1. Use ONLY real numbers extracted from the document. Do NOT invent numbers.
-2. NEVER write "Not reported" if the data exists anywhere in the document — search carefully.
-3. COMPUTE every possible ratio from available data. Examples:
-   - Net Profit Margin = PAT / Total Income × 100
-   - EBITDA = PBT + Depreciation + Finance Costs (if not stated directly)
-   - EBITDA Margin = EBITDA / Total Income × 100
-   - Debt to Equity = Total Debt (Debt Securities + Borrowings) / Total Equity
-   - ROE = PAT / Total Equity × 100
-   - ROA = PAT / Total Assets × 100
+CRITICAL EXTRACTION RULES:
+1. SEARCH THE ENTIRE DOCUMENT for each metric before saying "Not reported"
+2. Look for alternate names:
+   - Total Assets = "Total Assets" OR "Assets" OR "Total" in Assets section
+   - Total Debt = "Total Borrowings" OR "Debt Securities" OR "Total Liabilities" OR "Borrowings"
+   - Operating Cash Flow = "Cash from Operating Activities" OR "Net Cash from Operations" OR "Operating Activities"
+   - Interest Coverage = calculate from "Finance Costs" and "EBIT" or "EBITDA"
+   - Debt to Equity = calculate from "Total Debt" / "Total Equity" OR "Net Worth"
+3. For NBFCs: Total Debt = Debt Securities + Borrowings + Subordinated Liabilities
+4. COMPUTE ratios even if not explicitly stated:
+   - ROE = (Net Profit / Total Equity) × 100
+   - ROA = (Net Profit / Total Assets) × 100  
+   - Debt to Equity = Total Debt / Total Equity
    - Interest Coverage = EBIT / Finance Costs
-   - Current Ratio = Current Assets / Current Liabilities (if available)
-4. For NBFCs and financial companies: Total Debt = Debt Securities + Borrowings (other than debt securities) + Subordinated Liabilities
-5. NEVER write placeholder text like "val", "X%", "actual value", "actual %", or template labels.
-6. Only write "Not reported" when the underlying raw numbers to compute a metric are completely absent — this should be RARE.
+   - Current Ratio = Current Assets / Current Liabilities
+   - Operating Cash Flow = Find in Cash Flow Statement
+5. Only say "Not reported" if the underlying numbers are COMPLETELY ABSENT after thorough search
+
+SCORING CALIBRATION (CRITICAL - DO NOT USE "WEAK" INCORRECTLY):
+For each category, use this EXACT scale:
+
+PROFITABILITY (0-20):
+- 18-20 = Strong (ROE >20%, Net Margin >15%, consistent profitability)
+- 12-17 = Average (ROE 12-20%, Net Margin 8-15%, stable profits)
+- 0-11 = Weak (ROE <12%, Net Margin <8%, declining profits)
+
+GROWTH (0-15):
+- 13-15 = Strong (Revenue growth >20% YoY, Profit growth >25%)
+- 9-12 = Average (Revenue growth 10-20%, Profit growth 10-25%)
+- 0-8 = Weak (Revenue growth <10%, Profit growth <10%)
+
+BALANCE SHEET (0-15):
+- 13-15 = Strong (D/E <0.5, Strong equity base, Low debt)
+- 9-12 = Average (D/E 0.5-1.5, Moderate leverage)
+- 0-8 = Weak (D/E >1.5, High debt burden)
+
+LIQUIDITY (0-10):
+- 9-10 = Strong (Current Ratio >1.5, Strong cash position)
+- 6-8 = Average (Current Ratio 1.0-1.5, Adequate cash)
+- 0-5 = Weak (Current Ratio <1.0, Cash concerns)
+
+CASH FLOW (0-15):
+- 13-15 = Strong (OCF > Net Profit, Consistent cash generation)
+- 9-12 = Average (OCF ≈ Net Profit, Stable cash flow)
+- 0-8 = Weak (OCF < Net Profit, Cash flow issues)
+
+GOVERNANCE & RISK (0-15):
+- 13-15 = Strong (No red flags, AAA rating, Good governance)
+- 9-12 = Average (Minor concerns, Good rating)
+- 0-8 = Weak (Red flags present, Governance issues)
+
+INDUSTRY POSITION (0-10):
+- 9-10 = Strong (Market leader, Better than peers)
+- 6-8 = Average (At par with peers)
+- 0-5 = Weak (Below peer average)
+
+RATING MUST MATCH SCORE:
+- If score is 12/15, rating MUST be "Average" (NOT "Weak")
+- If score is 16/20, rating MUST be "Average" (NOT "Weak")
+- Only use "Weak" if score is <60% of max (e.g., <9 out of 15)
+
+JSON OUTPUT:
 {{
   "company_name": "Full legal name from document",
-  "statement_type": "Annual Report / Q1 Results / Q2 Results / Q3 Results / Q4 Results / Half-Year Results / Balance Sheet",
-  "period": "e.g. FY2024-25 or Q3 FY2025",
-  "currency": "INR Crores / USD Millions / etc",
+  "statement_type": "Annual Report / Quarterly Results / Balance Sheet",
+  "period": "FY2024-25 or Q3 FY2025",
+  "currency": "INR Crores / INR Lakh / USD Millions",
   "health_score": 0,
-  "health_label": "Excellent / Good / Fair / Poor / Critical",
+  "health_label": "Excellent (80-100) / Good (60-79) / Fair (40-59) / Poor (20-39) / Critical (0-19)",
   "health_score_breakdown": {{
     "total": 0,
     "components": [
-      {{"category": "Profitability",     "weight": 20, "score": 0, "max": 20, "rating": "Strong/Average/Weak", "reasoning": "real numbers from doc"}},
-      {{"category": "Growth",            "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "real growth figures"}},
-      {{"category": "Balance Sheet",     "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "real debt/equity figures"}},
-      {{"category": "Liquidity",         "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak", "reasoning": "real current ratio/cash"}},
-      {{"category": "Cash Flow",         "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "real OCF vs PAT"}},
-      {{"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "fraud signals, mgmt quality"}},
-      {{"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak", "reasoning": "peer comparison"}}
+      {{
+        "category": "Profitability",
+        "weight": 20,
+        "score": 0,
+        "max": 20,
+        "rating": "Strong/Average/Weak (MUST match score using calibration above)",
+        "reasoning": "REAL numbers: ROE X%, Net Margin Y%, Trend. Therefore [rating] profitability."
+      }},
+      {{
+        "category": "Growth",
+        "weight": 15,
+        "score": 0,
+        "max": 15,
+        "rating": "Strong/Average/Weak (MUST match score)",
+        "reasoning": "Revenue grew X%, Profit grew Y%. Score Z/15 = [rating]."
+      }},
+      {{
+        "category": "Balance Sheet",
+        "weight": 15,
+        "score": 0,
+        "max": 15,
+        "rating": "Strong/Average/Weak (MUST match score)",
+        "reasoning": "D/E ratio X, Total Debt Y. Score Z/15 = [rating]."
+      }},
+      {{
+        "category": "Liquidity",
+        "weight": 10,
+        "score": 0,
+        "max": 10,
+        "rating": "Strong/Average/Weak (MUST match score)",
+        "reasoning": "Current Ratio X, Cash Y. Score Z/10 = [rating]."
+      }},
+      {{
+        "category": "Cash Flow",
+        "weight": 15,
+        "score": 0,
+        "max": 15,
+        "rating": "Strong/Average/Weak (MUST match score)",
+        "reasoning": "OCF X vs PAT Y. Score Z/15 = [rating]."
+      }},
+      {{
+        "category": "Governance & Risk",
+        "weight": 15,
+        "score": 0,
+        "max": 15,
+        "rating": "Strong/Average/Weak",
+        "reasoning": "Credit rating, governance quality, red flags found/not found."
+      }},
+      {{
+        "category": "Industry Position",
+        "weight": 10,
+        "score": 0,
+        "max": 10,
+        "rating": "Strong/Average/Weak",
+        "reasoning": "Market position vs peers, competitive advantages."
+      }}
     ]
   }},
-  "executive_summary": "5-6 sentences: what company does, improved or deteriorated, financial strength, one-line investment view. Use REAL numbers.",
-  "investor_verdict": "3-4 sentences for a beginner: interested or cautious and WHY. Real numbers only.",
-  "explain_like_15": "5 lines using a small shop analogy. Fun and very simple. Real situation from the data.",
+  "executive_summary": "5-6 sentences with REAL numbers from document",
+  "investor_verdict": "3-4 sentences: Buy/Hold/Avoid with specific reasons and numbers",
+  "explain_like_15": "5 lines using small shop analogy, simple language",
   "investment_label": "Strong Buy / Buy / Hold / Risky / Avoid",
   "key_metrics": [
-    {{"label": "Revenue / Total Income",  "current": "REAL value", "previous": "REAL value", "change": "REAL % YoY", "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Net Profit / PAT",        "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "EBITDA",                  "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "EBITDA Margin",           "current": "REAL %",     "previous": "REAL %",     "change": "REAL bps",   "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Net Profit Margin",       "current": "REAL %",     "previous": "REAL %",     "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "EPS (Basic)",             "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Total Assets",            "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Total Debt",              "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Cash & Equivalents",      "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "ROE",                     "current": "REAL %",     "previous": "REAL %",     "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "ROCE",                    "current": "REAL %",     "previous": "REAL %",     "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Debt to Equity",          "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Interest Coverage",       "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Current Ratio",           "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}},
-    {{"label": "Operating Cash Flow",     "current": "REAL value", "previous": "REAL value", "change": "REAL %",     "trend": "up/down/neutral", "comment": "simple explanation"}}
+    {{"label": "Revenue / Total Income", "current": "ACTUAL number from doc", "previous": "ACTUAL number", "change": "ACTUAL %", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Net Profit / PAT", "current": "ACTUAL number", "previous": "ACTUAL number", "change": "ACTUAL %", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "EBITDA", "current": "Calculate or extract", "previous": "ACTUAL", "change": "ACTUAL %", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "EBITDA Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "bps", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Net Profit Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "EPS (Basic)", "current": "ACTUAL", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Total Assets", "current": "SEARCH thoroughly - must find this", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Total Debt", "current": "SEARCH thoroughly - Borrowings + Debt Securities", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Cash & Equivalents", "current": "ACTUAL", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "ROE", "current": "Calculate from PAT/Equity", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "ROCE", "current": "Calculate if data available", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Debt to Equity", "current": "CALCULATE from Total Debt / Total Equity", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Interest Coverage", "current": "CALCULATE from EBIT / Finance Costs", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Current Ratio", "current": "Calculate Current Assets/Current Liabilities", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}},
+    {{"label": "Operating Cash Flow", "current": "SEARCH in Cash Flow Statement - Net Cash from Operating Activities", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "comment": "explanation"}}
   ],
-  "financial_performance": {{
-    "revenue_analysis": "Real revenue growth explanation with exact numbers. Strong or weak? Why?",
-    "profitability_analysis": "Real EBITDA/PAT/margin trend with exact numbers. Why did margins change?",
-    "ratio_interpretation": [
-      {{"ratio": "EBITDA Margin",     "value": "REAL %", "classification": "Strong/Average/Weak", "simple_explanation": "plain English"}},
-      {{"ratio": "Net Profit Margin", "value": "REAL %", "classification": "Strong/Average/Weak", "simple_explanation": "plain English"}},
-      {{"ratio": "ROE",               "value": "REAL %", "classification": "Strong/Average/Weak", "simple_explanation": "plain English"}},
-      {{"ratio": "ROCE",              "value": "REAL %", "classification": "Strong/Average/Weak", "simple_explanation": "plain English"}}
-    ]
-  }},
   "profitability": {{
-    "analysis": "3-4 sentences with real numbers, simple language",
-    "gross_margin_current": "REAL % or Not reported", "gross_margin_previous": "REAL % or Not reported",
-    "net_margin_current": "REAL %", "net_margin_previous": "REAL %",
-    "ebitda_margin_current": "REAL %", "ebitda_margin_previous": "REAL %",
-    "roe": "REAL % or Not reported", "roa": "REAL % or Not reported",
-    "key_cost_drivers": ["Real cost driver 1 with number", "Real cost driver 2 with number"]
-  }},
-  "growth": {{
-    "analysis": "3-4 sentences on growth quality and consistency, simple English",
-    "revenue_growth_yoy": "REAL %", "profit_growth_yoy": "REAL %",
-    "multi_year_trend": "Improving / Stable / Deteriorating",
-    "multi_year_explanation": "2-5 year trend in simple words from available data",
-    "volume_growth": "REAL % or Not reported",
-    "guidance": "What management said about future growth or Not reported"
+    "analysis": "Detailed analysis with actual numbers",
+    "gross_margin_current": "Calculate or extract %",
+    "gross_margin_previous": "ACTUAL %",
+    "net_margin_current": "MUST calculate from PAT/Revenue",
+    "net_margin_previous": "ACTUAL %",
+    "ebitda_margin_current": "MUST calculate",
+    "ebitda_margin_previous": "ACTUAL %",
+    "roe": "MUST calculate PAT/Equity × 100",
+    "roa": "MUST calculate PAT/Assets × 100",
+    "key_cost_drivers": ["Actual cost item 1 with numbers", "Actual cost item 2"]
   }},
   "balance_sheet": {{
-    "analysis": "2-3 sentences: overleveraged? comfortable repayment? Simple English.",
-    "total_debt": "REAL value", "net_worth": "REAL value", "debt_to_equity": "REAL value",
-    "interest_coverage": "REAL value or Not reported",
+    "analysis": "Analysis with real numbers",
+    "total_debt": "EXTRACT from Balance Sheet - Total Borrowings",
+    "net_worth": "EXTRACT Total Equity",
+    "debt_to_equity": "CALCULATE Total Debt / Total Equity",
+    "interest_coverage": "CALCULATE EBIT / Finance Costs",
     "is_overleveraged": false,
     "debt_comfort_level": "Comfortable / Moderate / Stressed"
   }},
   "liquidity": {{
-    "analysis": "2-3 sentences: can company run day-to-day operations smoothly?",
-    "current_ratio": "REAL value", "quick_ratio": "REAL value or Not reported",
-    "cash_position": "REAL value", "operating_cash_flow": "REAL value or Not reported",
-    "free_cash_flow": "REAL value or Not reported",
+    "analysis": "Analysis with real numbers",
+    "current_ratio": "CALCULATE Current Assets / Current Liabilities",
+    "quick_ratio": "Calculate if data available",
+    "cash_position": "EXTRACT Cash and Cash Equivalents",
+    "operating_cash_flow": "EXTRACT from Cash Flow Statement",
+    "free_cash_flow": "Calculate OCF - Capex if available",
     "day_to_day_assessment": "Smooth / Adequate / Tight"
   }},
   "debt": {{
-    "analysis": "2-3 sentences with real numbers",
-    "total_debt": "REAL value", "debt_to_equity": "REAL value",
-    "interest_coverage": "REAL value or Not reported",
-    "net_debt": "REAL value or Not reported",
+    "analysis": "Analysis with real numbers",
+    "total_debt": "EXTRACT Total Borrowings + Debt Securities",
+    "debt_to_equity": "CALCULATE",
+    "interest_coverage": "CALCULATE EBIT / Interest",
+    "net_debt": "Calculate Total Debt - Cash",
     "debt_trend": "Decreasing / Increasing / Stable"
   }},
   "cash_flow_quality": {{
-    "analysis": "Are profits real or accounting? Generating or burning cash? Real numbers.",
-    "pat": "REAL value", "operating_cash_flow": "REAL value or Not reported",
+    "analysis": "Real analysis comparing OCF to PAT",
+    "pat": "EXTRACT Net Profit",
+    "operating_cash_flow": "EXTRACT from Cash Flow Statement - Operating Activities section",
     "cash_vs_profit_assessment": "Real Cash Profits / Accounting Profits / Cash Burn",
     "quality_rating": "High / Medium / Low"
   }},
-  "peer_comparison": {{
-    "industry": "Industry name",
-    "classification": "Better than peers / At par / Worse than peers",
-    "margin_comparison": "How margins compare to industry",
-    "roe_comparison": "How ROE compares to industry norms",
-    "debt_comparison": "How debt compares to industry norms",
-    "summary": "2-3 sentences simple English"
-  }},
-  "fraud_risk": {{
-    "overall_risk": "Low / Moderate / High",
-    "signals_checked": [
-      {{"signal": "Profit rising but cash flow not rising",      "found": false, "detail": "numbers-based explanation"}},
-      {{"signal": "Rising receivables or working capital stress","found": false, "detail": "explanation"}},
-      {{"signal": "High other income contribution",             "found": false, "detail": "explanation"}},
-      {{"signal": "Frequent exceptional items",                 "found": false, "detail": "explanation"}},
-      {{"signal": "Sudden margin spikes without explanation",   "found": false, "detail": "explanation"}},
-      {{"signal": "Debt rising but profits not rising",         "found": false, "detail": "explanation"}}
-    ],
-    "reasoning": "Overall fraud risk explanation in simple English"
-  }},
-  "management_commentary": {{
-    "overall_tone": "Positive / Cautious / Neutral / Concerned",
-    "key_points": ["Real point 1 from doc", "Real point 2", "Real point 3", "Real point 4", "Real point 5"],
-    "outlook_statement": "Real management outlook",
-    "concerns_raised": ["Real concern 1", "Real concern 2"],
-    "management_interpretation": "Simple: what do management decisions mean for investors?"
-  }},
-  "segments": [{{"name": "Real segment name", "revenue": "REAL value", "growth": "REAL %", "margin": "REAL % or Not reported", "comment": "real observation"}}],
-  "highlights": ["Real strength 1 with numbers", "Real strength 2 with numbers", "Real strength 3 with numbers", "Real strength 4 with numbers", "Real strength 5 with numbers"],
-  "risks": ["Real risk 1 with reasoning/numbers", "Real risk 2", "Real risk 3", "Real risk 4", "Real risk 5"],
-  "future_outlook": {{
-    "growth_potential": "Real growth potential from numbers + management",
-    "key_triggers": ["Real trigger 1", "Real trigger 2", "Real trigger 3"],
-    "key_risks": ["Real risk 1", "Real risk 2", "Real risk 3"],
-    "summary": "2-3 sentences future direction, simple English"
-  }},
-  "what_to_watch": ["Real watch item 1 with context", "Real watch item 2", "Real watch item 3"]
+  "highlights": ["Actual strength 1 with numbers", "Actual strength 2", "Actual strength 3", "Actual strength 4", "Actual strength 5"],
+  "risks": ["Actual risk 1 with reasoning", "Actual risk 2", "Actual risk 3", "Actual risk 4", "Actual risk 5"],
+  "what_to_watch": ["Actual watch item 1", "Actual watch item 2", "Actual watch item 3"]
 }}
 
-IMPORTANT: Replace ALL template labels above (like "REAL value", "REAL %") with actual data from the document.
-Never output "REAL value", "REAL %", "val", "X%", or any placeholder. Write "Not reported" only if data is genuinely missing.
-
-COMPUTE ALL RATIOS from the numbers found in the document. Show your calculations in the reasoning.
+REMINDER:
+- NEVER say "Not reported" without THOROUGHLY searching the document
+- ALWAYS calculate ratios from available data
+- Match rating to score using calibration rules
+- Use REAL extracted numbers, not placeholders
 
 FINANCIAL DOCUMENT:
 {snippet}"""
