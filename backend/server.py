@@ -493,7 +493,7 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 100000) -> str:
 
 
 def build_prompt(text: str) -> str:
-    snippet = text[:50000]
+    snippet = text[:150000]
     logger.info(f"Prompt snippet: {len(snippet)} chars")
 
     return f"""You are FinSight, an elite AI financial analyst combining 25+ years of equity research experience with the rigor of a Goldman Sachs analyst and the clarity of a seasoned investor communicator. You specialize in Indian listed companies across all sectors.
