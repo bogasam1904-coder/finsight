@@ -454,7 +454,7 @@ def _repair_json(s: str) -> str:
 
 # AI PROMPT
 
-def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 35000) -> str:
+def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 100000) -> str:
     """
     Page-score extraction: scores every page by how many financial keywords it contains.
     Pages with score >= 3 are core financial statement pages (Balance Sheet, P&L, Cash Flow).
@@ -882,10 +882,10 @@ def _sync_gemini(text: str) -> dict:
         
         # Working models in order of preference
         models_to_try = [
-            "gemini-2.0-flash-exp",  # Latest experimental
-            "gemini-1.5-pro",        # Stable production
-            "gemini-1.5-flash",      # Fast and reliable
-        ]
+    "gemini-2.0-flash-thinking-exp-01-21",  # ✅ Latest (Jan 2025)
+    "gemini-2.0-flash-exp",                  # ✅ Experimental
+    "gemini-1.5-flash-latest",               # ✅ Stable fallback
+]
         
         for model_name in models_to_try:
             try:
@@ -922,7 +922,7 @@ def _sync_gemini(text: str) -> dict:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
         
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
         resp = model.generate_content(build_prompt(text))
         return safe_parse_json(resp.text)
 
@@ -942,9 +942,9 @@ def _sync_groq(text: str) -> dict:
     prompt = build_prompt(text)
     
     # Reduce prompt size if too large
-    if len(prompt) > 30000:
-        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 25000")
-        prompt = prompt[:25000] + "\n\n[Document truncated due to size limits]"
+    if len(prompt) > 120000:  # Llama 3.3 supports 128k context
+    logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 100000")
+    prompt = prompt[:100000] + "\n\n[Document truncated due to size limits]"
     
     for model in GROQ_MODELS_ACTIVE:
         try:
