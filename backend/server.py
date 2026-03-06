@@ -1,4 +1,5 @@
 import os, uuid, logging, json, io, asyncio, httpx, re
+from collections import defaultdict
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
@@ -383,6 +384,105 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
 
 # ─── PDF EXTRACTION (FIXED) ──────────────────────────────────────────────────
 
+# ─── ADVANCED TABLE + METRIC EXTRACTION ─────────────────────────────
+
+def extract_tables_from_pdf(raw_bytes: bytes):
+    """
+    Extract structured tables using pdfplumber.
+    Returns list of tables with rows preserved.
+    """
+    tables = []
+
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                extracted = page.extract_tables()
+
+                for table in extracted:
+                    clean_table = []
+
+                    for row in table:
+                        cleaned = [
+                            str(cell).strip() if cell else ""
+                            for cell in row
+                        ]
+
+                        if any(cleaned):
+                            clean_table.append(cleaned)
+
+                    if clean_table:
+                        tables.append({
+                            "page": page_num + 1,
+                            "rows": clean_table
+                        })
+
+        logger.info(f"Extracted {len(tables)} tables")
+
+    except Exception as e:
+        logger.warning(f"Table extraction failed: {e}")
+
+    return tables
+
+
+def parse_financial_metrics(tables):
+    """
+    Extract key financial metrics from tables.
+    """
+
+    metrics = defaultdict(str)
+
+    keywords = {
+        "revenue": [
+            "revenue",
+            "total income",
+            "income from operations"
+        ],
+        "net_profit": [
+            "net profit",
+            "profit after tax",
+            "pat"
+        ],
+        "ebitda": [
+            "ebitda"
+        ],
+        "eps": [
+            "earnings per share",
+            "eps"
+        ],
+        "total_assets": [
+            "total assets"
+        ],
+        "borrowings": [
+            "borrowings",
+            "total debt",
+            "loans"
+        ]
+    }
+
+    for table in tables:
+
+        for row in table["rows"]:
+
+            row_text = " ".join(row).lower()
+
+            for metric, keys in keywords.items():
+
+                if any(k in row_text for k in keys):
+
+                    numbers = re.findall(
+                        r'\d[\d,\.]*',
+                        row_text
+                    )
+
+                    if numbers:
+                        metrics[metric] = numbers[0]
+
+    logger.info(f"Extracted metrics: {dict(metrics)}")
+
+    return dict(metrics)
+
 def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
     """
     Use pdfplumber for superior table extraction — preserves column alignment
@@ -590,410 +690,170 @@ def _repair_json(s: str) -> str:
 
 
 # ─── AI PROMPT (UPGRADED) ────────────────────────────────────────────────────
+
+# ─── TEXT CHUNKING FOR LARGE FILINGS ───────────────────────────────
+
+def split_into_chunks(text, size=6000, overlap=600):
+
+    chunks = []
+    start = 0
+
+    while start < len(text):
+
+        chunk = text[start:start + size]
+
+        chunks.append(chunk)
+
+        start += size - overlap
+
+    logger.info(f"Split document into {len(chunks)} chunks")
+
+    return chunks
+
 def build_prompt(text: str) -> str:
+
     snippet = text[:35000]
+
     logger.info(f"Prompt snippet: {len(snippet)} chars")
 
-    # Sanity check — warn if snippet looks too short or lacks financial content
-    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh", "eps", "ebitda"]
-    found_kw = [kw for kw in financial_keywords if kw.lower() in snippet.lower()]
-    if len(found_kw) < 2:
-        logger.warning(f"Snippet may not contain financial data. Found keywords: {found_kw}. Preview: {snippet[:300]}")
-
-    return f"""You are FinSight, an elite AI financial analyst combining 25+ years of equity research experience with the rigor of a Goldman Sachs analyst and the clarity of a seasoned investor communicator. You specialize in Indian listed companies across all sectors.
-
-Analyze the provided financial document and return ONLY a single valid JSON object. No markdown, no code fences, no preamble, no trailing text.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CORE PHILOSOPHY — NON-NEGOTIABLE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. NEVER just describe numbers. Always EXPLAIN what they mean and WHY they matter to an investor.
-2. ALWAYS contextualize metrics against the company's specific business model and sector dynamics.
-3. Surface non-obvious risks and hidden signals that a casual reader would completely miss.
-4. Be direct and specific. Never use vague language like "may", "could potentially", or "might consider".
-5. Write as if a serious investor's capital depends on this analysis being accurate and insightful.
-6. Flag concerns EVEN when the overall picture is positive. Intellectual honesty builds trust.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CRITICAL DATA INTEGRITY RULES — READ FIRST
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-A. USE ONLY NUMBERS EXPLICITLY PRESENT IN THE DOCUMENT.
-   - Do NOT invent, estimate, or carry forward numbers not in the text.
-   - If the document is a newspaper extract or partial filing, it will contain a [SYSTEM NOTE] saying so.
-     In that case, mark any unavailable metric as "Not available in this filing extract".
-   - NEVER fabricate Balance Sheet items (Debt, Current Ratio, Cash, Working Capital) from a quarterly extract.
-
-B. NUMBER ACCURACY — CRITICAL:
-   - Read numbers exactly as they appear. Do NOT drop digits or shift decimal places.
-   - If you see "20,078.39" do NOT write "2,007.8" or "2007.8". Write "20,078.39".
-   - If you see "3,066.03" do NOT write "306.03". Write "3,066.03".
-   - Always check: does the number make sense vs other numbers in context?
-     (e.g. Net Profit cannot be larger than Revenue)
-   - Commas in Indian numbering: 1,00,000 = 100000 (one lakh), NOT 1000000.
-
-C. STANDALONE vs CONSOLIDATED:
-   - If both are present, use STANDALONE figures as primary (labelled clearly).
-   - If only consolidated is present, use those and label as "Consolidated".
-   - NEVER mix standalone and consolidated numbers in the same metric.
-
-D. CALCULATIONS — DO THE MATH CORRECTLY:
-   - Growth % = ((Current - Previous) / |Previous|) × 100
-   - Net Margin = (Net Profit / Revenue) × 100
-   - ROE = (Net Profit / Total Equity) × 100
-   - Debt/Equity = Total Debt / Total Equity
-   - Interest Coverage = EBIT / Finance Costs
-   - Current Ratio = Current Assets / Current Liabilities
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EXTRACTION RULES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. SEARCH THE ENTIRE DOCUMENT for each metric before saying "Not available"
-2. Alternate names to look for:
-   - Total Assets = "Total Assets" OR balance sheet total
-   - Total Debt = "Total Borrowings" OR "Debt Securities" OR "Borrowings" OR "Loans"
-   - Operating Cash Flow = "Cash from Operating Activities" OR "Net Cash from Operations"
-   - Interest Coverage = calculate from "Finance Costs" and "EBIT" or "EBITDA"
-3. For NBFCs: Total Debt = Debt Securities + Borrowings + Subordinated Liabilities
-4. For Defense/PSU: Order book, government advances, and contract pipeline are critical context
-5. Only write "Not available in this filing" if numbers are truly absent after thorough search
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SCORING CALIBRATION — STRICT ENFORCEMENT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PROFITABILITY (0-20):
-- 18-20 = Strong  (ROE >20%, Net Margin >15%, consistent profitability)
-- 12-17 = Average (ROE 12-20%, Net Margin 8-15%, stable profits)
-- 0-11  = Weak    (ROE <12%, Net Margin <8%, declining profits)
-
-GROWTH (0-15):
-- 13-15 = Strong  (Revenue growth >20% YoY AND Profit growth >25%)
-- 9-12  = Average (Revenue growth 10-20%, Profit growth 10-25%)
-- 0-8   = Weak    (Revenue growth <10% OR Profit growth <10%)
-
-BALANCE SHEET (0-15):
-- 13-15 = Strong  (D/E <0.5, strong equity base, low debt)
-- 9-12  = Average (D/E 0.5-1.5, moderate leverage)
-- 0-8   = Weak    (D/E >1.5, high debt burden)
-- If Balance Sheet data is unavailable: score based on what IS available; note limitation.
-
-LIQUIDITY (0-10):
-- 9-10 = Strong   (Current Ratio >1.5, strong cash position)
-- 6-8  = Average  (Current Ratio 1.0-1.5, adequate cash)
-- 0-5  = Weak     (Current Ratio <1.0, cash concerns)
-- If Liquidity data is unavailable: assign score of 5 and note "Insufficient data".
-
-CASH FLOW (0-15):
-- 13-15 = Strong  (OCF > Net Profit, consistent generation)
-- 9-12  = Average (OCF approximately equals Net Profit, stable)
-- 0-8   = Weak    (OCF < Net Profit or negative)
-- If Cash Flow data is unavailable: assign score of 7 and note "Not reported in extract".
-
-GOVERNANCE & RISK (0-15):
-- 13-15 = Strong  (No red flags, AAA/AA+ rating, clean audit, low promoter pledge)
-- 9-12  = Average (Minor concerns, good rating, no major flags)
-- 0-8   = Weak    (Auditor qualifications, governance issues, high pledging)
-
-INDUSTRY POSITION (0-10):
-- 9-10 = Strong   (Market leader, durable moat, pricing power)
-- 6-8  = Average  (At par with peers, no significant moat)
-- 0-5  = Weak     (Below peer average, losing market share)
-
-RATING MUST MATCH SCORE:
-- Score >= 80% of max = "Strong" | 60-79% = "Average" | <60% = "Weak"
-- Score 12/15 = "Average" (NOT "Weak"). Score 16/20 = "Strong" (NOT "Average").
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-JSON OUTPUT SCHEMA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{{
-  "company_name": "Full legal name exactly as it appears in the document",
-  "statement_type": "Annual Report / Half-Year Results / Quarterly Results / Newspaper Extract",
-  "period": "e.g. Q3 FY2025-26 (Quarter ended 31 December 2025)",
-  "currency": "INR Lakhs / INR Crores / USD Millions",
-  "data_source": "Standalone / Consolidated / Mixed (specify which metrics are which)",
-  "data_completeness": "Full Filing / Partial Extract / Newspaper Advertisement",
-  "health_score": 0,
-  "health_label": "Excellent (80-100) / Good (60-79) / Fair (40-59) / Poor (20-39) / Critical (0-19)",
-
-  "health_score_breakdown": {{
-    "total": 0,
-    "components": [
-      {{
-        "category": "Profitability",
-        "weight": 20,
-        "score": 0,
-        "max": 20,
-        "rating": "Strong / Average / Weak",
-        "reasoning": "State actual ROE %, Net Margin %, and trend. Explain WHY this score."
-      }},
-      {{
-        "category": "Growth",
-        "weight": 15,
-        "score": 0,
-        "max": 15,
-        "rating": "Strong / Average / Weak",
-        "reasoning": "Revenue grew X% (explain volume vs price), Profit grew Y%. Explain gap."
-      }},
-      {{
-        "category": "Balance Sheet",
-        "weight": 15,
-        "score": 0,
-        "max": 15,
-        "rating": "Strong / Average / Weak",
-        "reasoning": "D/E ratio X, Total Debt Y. If unavailable say so and explain scoring basis."
-      }},
-      {{
-        "category": "Liquidity",
-        "weight": 10,
-        "score": 0,
-        "max": 10,
-        "rating": "Strong / Average / Weak",
-        "reasoning": "Current Ratio X, Cash Y. If unavailable, state 'Insufficient data in filing'."
-      }},
-      {{
-        "category": "Cash Flow",
-        "weight": 15,
-        "score": 0,
-        "max": 15,
-        "rating": "Strong / Average / Weak",
-        "reasoning": "OCF X vs PAT Y. If unavailable in extract, state so explicitly."
-      }},
-      {{
-        "category": "Governance & Risk",
-        "weight": 15,
-        "score": 0,
-        "max": 15,
-        "rating": "Strong / Average / Weak",
-        "reasoning": "Credit rating, auditor stance, promoter pledge, any red flags found."
-      }},
-      {{
-        "category": "Industry Position",
-        "weight": 10,
-        "score": 0,
-        "max": 10,
-        "rating": "Strong / Average / Weak",
-        "reasoning": "Market rank vs named peers, moat source, competitive advantage."
-      }}
+    financial_keywords = [
+        "revenue",
+        "profit",
+        "income",
+        "assets",
+        "crore",
+        "lakh",
+        "eps",
+        "ebitda"
     ]
-  }},
 
-  "executive_summary": "5-6 sentences. Open with the company name and period. Use REAL numbers from the document. Explain what drove performance, key risk, and what investors must watch. Do NOT use placeholder language.",
+    found_kw = [
+        kw for kw in financial_keywords
+        if kw.lower() in snippet.lower()
+    ]
 
-  "headline": "One punchy, memorable sentence max 15 words capturing the essence of this result.",
+    if len(found_kw) < 2:
+        logger.warning(
+            f"Snippet may not contain financial data. "
+            f"Found keywords: {found_kw}. "
+            f"Preview: {snippet[:300]}"
+        )
 
-  "investment_label": "Strong Buy / Buy / Hold / Reduce / Avoid",
+    return f"""
+You are FinSight — an institutional-grade equity research analyst.
 
-  "investor_verdict": "3-4 sentences. Direct recommendation with specific reasoning using actual numbers. State what would change the view. Write as senior analyst to institutional client.",
+Your job is to analyze financial statements from Indian listed companies and produce an investor-grade report.
 
-  "for_long_term_investors": "2-3 sentences on compounding potential, moat durability, and risk of permanent capital loss.",
+━━━━━━━━━━━━━━━━━━
+CRITICAL RULES
+━━━━━━━━━━━━━━━━━━
 
-  "for_short_term_traders": "2-3 sentences on near-term catalysts and key triggers for next quarter.",
+1. Use ONLY numbers that appear in the document.
+2. NEVER fabricate data.
+3. If a metric does not exist in the document, write:
+   "Not available in this filing".
+4. Always scan the FULL document before deciding data is unavailable.
+5. Copy numbers EXACTLY as they appear.
 
-  "bottom_line": "One single memorable sentence — the most important thing any investor must know right now.",
+Example:
+If document shows:
+20,078.39
 
-  "explain_like_15": "5 lines using small shop analogy. No jargon. A 15-year-old must understand how the business is doing and why.",
+Do NOT write:
+2007.8
+20078
+20.07
 
-  "key_metrics": [
-    {{"label": "Revenue / Total Income", "current": "ACTUAL number from document", "previous": "ACTUAL number", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "What drove this? Volume or price?"}},
-    {{"label": "Net Profit / PAT", "current": "ACTUAL number", "previous": "ACTUAL number", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Growing faster or slower than revenue? Why?"}},
-    {{"label": "EBITDA", "current": "Calculate or extract", "previous": "ACTUAL", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Operating leverage story"}},
-    {{"label": "EBITDA Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "bps change", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Expanding or compressing? Key cost driver?"}},
-    {{"label": "Net Profit Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "bps change", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Divergence from EBITDA margin signals tax/interest dynamics"}},
-    {{"label": "EPS (Basic)", "current": "ACTUAL", "previous": "ACTUAL", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Per-share value creation"}},
-    {{"label": "Total Assets", "current": "Extract or Not available in this filing", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Asset growth vs revenue growth efficiency"}},
-    {{"label": "Total Debt", "current": "Extract Borrowings + Debt Securities or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Debt trajectory and purpose"}},
-    {{"label": "Cash & Equivalents", "current": "ACTUAL or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Cash burn or accumulation"}},
-    {{"label": "ROE", "current": "Calculate PAT/Equity or Not available", "previous": "ACTUAL or N/A", "change": "bps or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Equity deployment effectiveness"}},
-    {{"label": "ROCE", "current": "Calculate if possible or Not available", "previous": "ACTUAL or N/A", "change": "bps or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Capital allocation quality"}},
-    {{"label": "Debt to Equity", "current": "CALCULATE or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Leverage level"}},
-    {{"label": "Interest Coverage", "current": "CALCULATE EBIT/Finance Costs or Not available", "previous": "ACTUAL or N/A", "change": "x or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Debt servicing safety margin"}},
-    {{"label": "Current Ratio", "current": "Calculate CA/CL or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Short-term financial health"}},
-    {{"label": "Operating Cash Flow", "current": "EXTRACT from Cash Flow Statement or Not available in extract", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "OCF vs PAT — is profit real?"}},
-    {{"label": "Free Cash Flow", "current": "OCF minus Capex or Not available", "previous": "Calculate or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Cash after sustaining the business"}}
-  ],
+Write exactly:
+20,078.39
 
-  "segment_analysis": {{
-    "available": true,
-    "segments": [
-      {{
-        "name": "Segment name",
-        "revenue": "ACTUAL",
-        "revenue_share": "% of total",
-        "growth": "YoY %",
-        "margin": "If available or N/A",
-        "insight": "What is driving or dragging this segment?"
-      }}
-    ],
-    "key_takeaway": "Which segment is the real value driver? Which is the hidden risk?"
-  }},
+━━━━━━━━━━━━━━━━━━
+FINANCIAL EXTRACTION RULES
+━━━━━━━━━━━━━━━━━━
 
-  "cash_flow_deep_dive": {{
-    "operating_cf": "ACTUAL or Not available in this filing",
-    "investing_cf": "ACTUAL or Not available",
-    "financing_cf": "ACTUAL or Not available",
-    "free_cash_flow": "OCF - Capex or Not available",
-    "capex": "ACTUAL if available or Not available",
-    "cash_conversion_quality": "High / Medium / Low / Insufficient data",
-    "ocf_vs_pat_insight": "Is profit backed by real cash? Explain gap with specific reasons. If data absent say so.",
-    "red_flags": ["Specific FCF concern or N/A if data unavailable"]
-  }},
+Search the document carefully for the following sections:
 
-  "balance_sheet_deep_dive": {{
-    "asset_quality": "What are major assets? Productive? Any impairment risk? Or Not available.",
-    "debt_profile": "Maturity, cost, secured vs unsecured — or Not available in this filing.",
-    "working_capital_insight": "Receivables days, payable days — or Not available.",
-    "hidden_strengths": ["Non-obvious strength or N/A"],
-    "hidden_risks": ["Non-obvious risk or N/A"],
-    "total_debt": "EXTRACT or Not available",
-    "net_worth": "EXTRACT or Not available",
-    "debt_to_equity": "CALCULATE or Not available",
-    "interest_coverage": "CALCULATE or Not available",
-    "debt_comfort_level": "Comfortable / Moderate / Stressed / Insufficient data"
-  }},
+Income Statement keywords:
+- Revenue
+- Total Income
+- Income from Operations
+- Sales
 
-  "growth_quality": {{
-    "revenue_growth_context": "Organic or inorganic? Volume-led or price-led? Sustainable?",
-    "profit_growth_context": "Faster or slower than revenue? What explains the divergence?",
-    "margin_trend": "Expanding / Compressing / Stable — structural reason?",
-    "growth_outlook": "Accelerating / Stable / Decelerating / Uncertain",
-    "catalysts": ["Specific company-relevant catalyst 1", "Catalyst 2"],
-    "headwinds": ["Specific headwind 1 with reasoning", "Headwind 2"]
-  }},
+Profit keywords:
+- Net Profit
+- Profit After Tax
+- PAT
 
-  "industry_context": {{
-    "sector_tailwinds": ["Tailwind 1 relevant to this company", "Tailwind 2"],
-    "sector_headwinds": ["Headwind 1", "Headwind 2"],
-    "competitive_position": "Where does this company sit vs named peers?",
-    "peer_benchmarks": "Compare key margins vs named sector peers",
-    "regulatory_environment": "Policy or regulatory dependency that impacts outlook"
-  }},
+Operating metrics:
+- EBITDA
+- Operating Profit
+- Operating Margin
 
-  "red_flags": [
-    {{
-      "flag": "Specific non-generic flag title",
-      "severity": "High / Medium / Low",
-      "explanation": "What the concern is and why it matters",
-      "what_to_watch": "Specific metric or event that confirms or dismisses this risk"
-    }}
-  ],
+Balance sheet metrics:
+- Total Assets
+- Total Liabilities
+- Net Worth
+- Borrowings
+- Debt
 
-  "strengths_and_moats": [
-    {{
-      "strength": "Specific competitive strength",
-      "why_it_matters": "Why this is a durable moat — not just a positive data point",
-      "risk_to_moat": "What could erode this advantage?"
-    }}
-  ],
+Cash flow metrics:
+- Cash Flow from Operating Activities
+- Net Cash from Operations
 
-  "valuation_context": {{
-    "note": "Valuation data not provided in document. Assessment based on financials only.",
-    "book_value_per_share": "Calculate if share count available or Not available",
-    "pb_ratio": "If market price available or Not available",
-    "earnings_quality": "High / Medium / Low — and why",
-    "analyst_comment": "Premium or discount to peers likely? Why?"
-  }},
+EPS keywords:
+- Earnings Per Share
+- Basic EPS
+- Diluted EPS
 
-  "investor_faq": [
-    {{
-      "question": "Specific question a real investor would ask about THIS company",
-      "answer": "Direct expert answer using actual numbers. 2-4 sentences."
-    }},
-    {{
-      "question": "Second specific investor question",
-      "answer": "Direct expert answer"
-    }},
-    {{
-      "question": "Third specific investor question",
-      "answer": "Direct expert answer"
-    }},
-    {{
-      "question": "Fourth specific investor question",
-      "answer": "Direct expert answer"
-    }},
-    {{
-      "question": "Fifth question focused on the biggest risk",
-      "answer": "Direct expert answer"
-    }}
-  ],
+━━━━━━━━━━━━━━━━━━
+CALCULATIONS
+━━━━━━━━━━━━━━━━━━
 
-  "key_monitorables": [
-    {{
-      "metric": "Specific metric to track",
-      "why": "Why this is the most important forward indicator for this specific company",
-      "trigger": "Specific threshold or event that signals a turn"
-    }},
-    {{
-      "metric": "Second monitorable",
-      "why": "Company-specific reasoning",
-      "trigger": "Specific threshold"
-    }},
-    {{
-      "metric": "Third monitorable",
-      "why": "Specific reasoning",
-      "trigger": "Specific trigger"
-    }}
-  ],
+Calculate if possible:
 
-  "profitability": {{
-    "analysis": "Detailed analysis with actual numbers and business model context",
-    "gross_margin_current": "Calculate or extract % or N/A",
-    "gross_margin_previous": "ACTUAL % or N/A",
-    "net_margin_current": "CALCULATE PAT/Revenue — do not skip this",
-    "net_margin_previous": "ACTUAL %",
-    "ebitda_margin_current": "CALCULATE",
-    "ebitda_margin_previous": "ACTUAL %",
-    "roe": "CALCULATE PAT/Equity x 100 or Not available",
-    "roa": "CALCULATE PAT/Assets x 100 or Not available",
-    "key_cost_drivers": ["Actual cost item 1 with real numbers", "Cost driver 2 with trend"]
-  }},
+Net Margin = Net Profit / Revenue
 
-  "liquidity": {{
-    "analysis": "Analysis with real numbers or note data unavailability",
-    "current_ratio": "CALCULATE CA/CL or Not available",
-    "quick_ratio": "Calculate if data available or N/A",
-    "cash_position": "EXTRACT or Not available",
-    "operating_cash_flow": "EXTRACT from Cash Flow Statement or Not available",
-    "free_cash_flow": "OCF - Capex or Not available",
-    "day_to_day_assessment": "Smooth / Adequate / Tight / Insufficient data"
-  }},
+EBITDA Margin = EBITDA / Revenue
 
-  "highlights": [
-    "Specific strength 1 with actual numbers",
-    "Specific strength 2 with context",
-    "Specific strength 3",
-    "Specific strength 4",
-    "Specific strength 5"
-  ],
+Revenue Growth =
+(Current Revenue - Previous Revenue) / Previous Revenue
 
-  "risks": [
-    "Specific risk 1 tied to actual numbers — not generic",
-    "Specific risk 2",
-    "Specific risk 3",
-    "Specific risk 4",
-    "Specific risk 5"
-  ],
+━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━
 
-  "what_to_watch": [
-    "Specific watch item 1 for next reporting period",
-    "Specific watch item 2",
-    "Specific watch item 3"
-  ]
+Return ONLY valid JSON.
+
+{{
+"company_name": "",
+"statement_type": "",
+"period": "",
+
+"health_score": 0,
+"health_label": "",
+
+"headline": "",
+
+"executive_summary": "",
+
+"key_metrics": [
+{{"metric":"Revenue","current":"","previous":"","change":"","comment":""}},
+{{"metric":"Net Profit","current":"","previous":"","change":"","comment":""}},
+{{"metric":"EBITDA","current":"","previous":"","change":"","comment":""}},
+{{"metric":"EPS","current":"","previous":"","change":"","comment":""}}
+],
+
+"highlights": [],
+"risks": [],
+"what_to_watch": []
 }}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FINAL REMINDERS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Company name MUST be taken from the document — never invent it
-- Numbers MUST be copied exactly — never drop digits or shift decimals
-- If standalone and consolidated both appear, use standalone as primary
-- Missing data = "Not available in this filing" — never fabricate it
-- Rating MUST match score per calibration above
-- investor_faq must be company-specific questions, not generic
-- bottom_line must be one memorable, direct, quotable sentence
-- headline must stand alone as a financial news headline
+━━━━━━━━━━━━━━━━━━
+FINANCIAL DOCUMENT
+━━━━━━━━━━━━━━━━━━
 
-FINANCIAL DOCUMENT:
-{snippet}"""
+{snippet}
+"""
 
 def compress_prompt(prompt: str, max_chars: int = 40000) -> str:
     if len(prompt) > max_chars:
@@ -1198,6 +1058,16 @@ def _sync_openrouter(text: str) -> dict:
 
 # ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
 async def run_analysis(text: str) -> dict:
+
+    if not text or len(text.strip()) < 100:
+        raise Exception("PDF extraction returned insufficient text.")
+
+    # Split large documents
+    chunks = split_into_chunks(text)
+
+    # Use first few chunks to guide analysis
+    text = "\n\n".join(chunks[:4])
+
     # Guard: reject if text is too short or lacks any financial content
     if not text or len(text.strip()) < 100:
         raise Exception("PDF extraction returned insufficient text. The file may be scanned, empty, or corrupted.")
@@ -1230,7 +1100,25 @@ async def run_analysis(text: str) -> dict:
             continue
         try:
             logger.info(f"Trying {provider_name}...")
-            result = await loop.run_in_executor(executor, func, text)
+            tables = extract_tables_from_pdf(text.encode())
+            metrics = parse_financial_metrics(tables)
+            
+            logger.info(f"Structured metrics extracted: {metrics}")
+
+             enhanced_text = f"""
+        Extracted financial metrics:
+
+        {json.dumps(metrics, indent=2)}
+
+        Computed financial ratios:
+
+        {json.dumps(ratios, indent=2)}
+
+        Financial document:
+
+        {text}
+        """
+            result = await loop.run_in_executor(executor, func, enhanced_text)
             logger.info(f"{provider_name} succeeded!")
             return result
         except Exception as e:
