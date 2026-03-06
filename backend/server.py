@@ -862,7 +862,7 @@ FINAL REMINDERS
 - The headline must be punchy enough to stand alone as a news headline
 
 FINANCIAL DOCUMENT:
-{{snippet}}"""
+{snippet}"""
 
 # FIXED AI RUNNERS - Replace in your server_v12.py starting at line 660
 
