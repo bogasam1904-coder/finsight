@@ -473,7 +473,7 @@ def _validate_extracted_numbers(text: str, source_text: str) -> bool:
     return True
 
 
-def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 120000) -> str:
+def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 40000) -> str:
     """
     FIXED extraction pipeline:
     1. Select financial pages using keyword scoring
@@ -591,7 +591,7 @@ def _repair_json(s: str) -> str:
 
 # ─── AI PROMPT (UPGRADED) ────────────────────────────────────────────────────
 def build_prompt(text: str) -> str:
-    snippet = text[:120000]
+    snippet = text[:35000]
     logger.info(f"Prompt snippet: {len(snippet)} chars")
 
     # Sanity check — warn if snippet looks too short or lacks financial content
@@ -995,6 +995,11 @@ FINAL REMINDERS
 FINANCIAL DOCUMENT:
 {snippet}"""
 
+def compress_prompt(prompt: str, max_chars: int = 40000) -> str:
+    if len(prompt) > max_chars:
+        logger.warning(f"Prompt too large ({len(prompt)} chars) — compressing to {max_chars}")
+        return prompt[:max_chars] + "\n\n[Document truncated due to size limits]"
+    return prompt
 
 # ─── AI RUNNERS ──────────────────────────────────────────────────────────────
 
@@ -1005,16 +1010,16 @@ def _sync_gemini(text: str) -> dict:
 
         client = genai.Client(api_key=GEMINI_API_KEY)
         models_to_try = [
-            "gemini-2.0-flash",
-            "gemini-1.5-pro",
+            "gemini-2.0-flash-exp",
             "gemini-1.5-flash",
+            "gemini-1.5-pro-002",
         ]
 
         for model_name in models_to_try:
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=build_prompt(text),
+                prompt = compress_prompt(build_prompt(text))
+                    response = client.models.generate_content(
+                    model=model_name,contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.1,
                         max_output_tokens=8192,
@@ -1043,18 +1048,16 @@ def _sync_gemini(text: str) -> dict:
 
 GROQ_MODELS_ACTIVE = [
     "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "mixtral-8x7b-32768",
+    "llama-3.1-8b-instant",
+    "deepseek-r1-distill-llama-70b",
 ]
 
 def _sync_groq(text: str) -> dict:
     from groq import Groq
     gc = Groq(api_key=GROQ_API_KEY)
-    prompt = build_prompt(text)
+    prompt = compress_prompt(build_prompt(text))
 
-    if len(prompt) > 50000:
-        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 48000")
-        prompt = prompt[:48000] + "\n\n[Document truncated due to size limits. Analyze what is present.]"
+        prompt = prompt[:40000] + "\n\n[Document truncated due to size limits. Analyze what is present.]"
 
     for model in GROQ_MODELS_ACTIVE:
         try:
@@ -1095,7 +1098,8 @@ def _sync_together(text: str) -> dict:
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={
                     "model": model,
-                    "messages": [{"role": "user", "content": build_prompt(text)}],
+                    prompt = compress_prompt(build_prompt(text))
+                    "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.1,
                     "max_tokens": 8192
                 },
@@ -1138,7 +1142,8 @@ def _sync_openrouter(text: str) -> dict:
                     },
                     json={
                         "model": model,
-                        "messages": [{"role": "user", "content": build_prompt(text)}],
+                        prompt = compress_prompt(build_prompt(text))
+                        "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.1,
                         "max_tokens": 8192
                     },
