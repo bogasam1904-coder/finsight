@@ -1,3 +1,6 @@
+// COMPLETE FILE - app/(tabs)/index.tsx
+// WITH DEBUG LOGGING TO DIAGNOSE THE ISSUE
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
@@ -54,9 +57,19 @@ export default function HomeTab() {
     } catch { }
   };
 
+  // ✅ UPDATED WITH DEBUG LOGGING
   const uploadFile = async (uri: string, name: string, type: string) => {
     setUploading(true);
     setProgress('Uploading...');
+    
+    // DEBUG: Log upload start
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('🆕 NEW UPLOAD STARTING');
+    console.log('📄 Filename:', name);
+    console.log('📁 Type:', type);
+    console.log('⏰ Timestamp:', new Date().toISOString());
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    
     try {
       const token = await AsyncStorage.getItem('token');
       const formData = new FormData();
@@ -66,6 +79,7 @@ export default function HomeTab() {
         const resp = await fetch(uri);
         const blob = await resp.blob();
         formData.append('file', blob, name);
+        console.log('📦 Blob size:', blob.size, 'bytes');
       } else {
         formData.append('file', { uri, type, name } as any);
       }
@@ -74,26 +88,56 @@ export default function HomeTab() {
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
       setProgress('Analysing with AI...');
+      console.log('🚀 Calling backend /api/analyze...');
+      console.log('🔗 Backend URL:', BACKEND);
+      
       const res = await fetch(`${BACKEND}/api/analyze`, { method: 'POST', headers, body: formData });
+
+      console.log('📡 Response status:', res.status);
+      console.log('📡 Response OK:', res.ok);
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
+        console.error('❌ Backend error response:', errData);
         throw new Error(errData.detail || `Server error ${res.status}`);
       }
 
       const data = await res.json();
+      
+      // DEBUG: Log complete response
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.log('✅ BACKEND RESPONSE RECEIVED:');
+      console.log('🆔 analysis_id:', data.analysis_id);
+      console.log('📊 status:', data.status);
+      console.log('📄 filename (in response):', data.filename);
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      console.log('📈 RESULT DATA:');
+      console.log('🏢 company_name:', data.result?.company_name);
+      console.log('📅 period:', data.result?.period);
+      console.log('💯 health_score:', data.result?.health_score);
+      console.log('🏷️ statement_type:', data.result?.statement_type);
+      console.log('💰 currency:', data.result?.currency);
+      console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+      
       setProgress('Done!');
       
       setTimeout(() => {
         setUploading(false);
         setProgress('');
         if (data.status === 'completed' && data.analysis_id) {
+          console.log('🔀 REDIRECTING TO:', `/analysis/${data.analysis_id}`);
+          console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
           router.push(`/analysis/${data.analysis_id}`);
         } else {
+          console.error('⚠️ Analysis not completed. Status:', data.status);
+          console.error('⚠️ Message:', data.message);
           Alert.alert('Analysis Failed', data.message || 'Please try another document.');
         }
       }, 400);
     } catch (e: any) {
+      console.error('💥 UPLOAD ERROR:', e);
+      console.error('💥 Error message:', e.message);
+      console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
       setUploading(false);
       setProgress('');
       Alert.alert('Error', e.message || 'Upload failed. Please try again.');
@@ -166,8 +210,8 @@ export default function HomeTab() {
         {!user && (
           <View style={s.guestBanner}>
             <View style={s.guestBannerLeft}>
-              <Text style={s.guestBannerTitle}>👋 Using as Guest</Text>
-              <Text style={s.guestBannerSub}>Sign up to save & revisit analyses</Text>
+              <Text style={s.guestBannerTitle}>💎 Free account unlocks history</Text>
+              <Text style={s.guestBannerSub}>Save & revisit all your analyses</Text>
             </View>
             <View style={s.guestBannerBtns}>
               <TouchableOpacity style={s.guestSignIn} onPress={() => router.push('/login')}>
