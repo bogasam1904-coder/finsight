@@ -1009,22 +1009,26 @@ def _sync_gemini(text: str) -> dict:
         from google.genai import types
 
         client = genai.Client(api_key=GEMINI_API_KEY)
+
         models_to_try = [
             "gemini-2.0-flash-exp",
             "gemini-1.5-flash",
-            "gemini-1.5-pro-002",
+            "gemini-1.5-pro-002"
         ]
 
         for model_name in models_to_try:
             try:
                 prompt = compress_prompt(build_prompt(text))
-                    response = client.models.generate_content(
-                    model=model_name,contents=prompt,
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.1,
                         max_output_tokens=8192,
                     )
                 )
+
                 raw_text = response.text
                 logger.info(f"Gemini {model_name}: {len(raw_text)} chars")
                 return safe_parse_json(raw_text)
@@ -1032,17 +1036,22 @@ def _sync_gemini(text: str) -> dict:
             except Exception as e:
                 err_str = str(e)
                 logger.warning(f"Gemini {model_name} failed: {err_str[:150]}")
-                if "429" in err_str or "quota" in err_str.lower(): continue
-                if "404" in err_str or "not found" in err_str.lower(): continue
+                if "429" in err_str or "quota" in err_str.lower():
+                    continue
+                if "404" in err_str or "not found" in err_str.lower():
+                    continue
 
         raise Exception("All Gemini models failed")
 
     except ImportError:
         logger.warning("New google-genai package not found, using old API")
+
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
+
         model = genai.GenerativeModel("gemini-1.5-flash-latest")
         resp = model.generate_content(build_prompt(text))
+
         return safe_parse_json(resp.text)
 
 
@@ -1054,10 +1063,10 @@ GROQ_MODELS_ACTIVE = [
 
 def _sync_groq(text: str) -> dict:
     from groq import Groq
-    gc = Groq(api_key=GROQ_API_KEY)
-    prompt = compress_prompt(build_prompt(text))
 
-        prompt = prompt[:40000] + "\n\n[Document truncated due to size limits. Analyze what is present.]"
+    gc = Groq(api_key=GROQ_API_KEY)
+
+    prompt = compress_prompt(build_prompt(text))
 
     for model in GROQ_MODELS_ACTIVE:
         try:
@@ -1067,6 +1076,7 @@ def _sync_groq(text: str) -> dict:
                 temperature=0.1,
                 max_tokens=8192
             )
+
             raw = resp.choices[0].message.content
             logger.info(f"Groq {model}: {len(raw)} chars")
             return safe_parse_json(raw)
@@ -1074,12 +1084,15 @@ def _sync_groq(text: str) -> dict:
         except Exception as ex:
             err_str = str(ex)
             logger.warning(f"Groq {model} failed: {err_str[:150]}")
-            if "429" in err_str or "rate limit" in err_str.lower(): continue
-            if "400" in err_str or "decommissioned" in err_str.lower(): continue
-            if "413" in err_str or "too large" in err_str.lower(): continue
+
+            if "429" in err_str or "rate limit" in err_str.lower():
+                continue
+            if "400" in err_str or "decommissioned" in err_str.lower():
+                continue
+            if "413" in err_str or "too large" in err_str.lower():
+                continue
 
     raise Exception("All Groq models failed or unavailable")
-
 
 def _sync_together(text: str) -> dict:
     key = os.getenv("TOGETHER_API_KEY", "")
