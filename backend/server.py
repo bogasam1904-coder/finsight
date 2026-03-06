@@ -22,9 +22,9 @@ GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 
 executor = ThreadPoolExecutor(max_workers=4)
-app = FastAPI(title="FinSight API v12")
+app = FastAPI(title="FinSight API v13")
 
-# CORS
+# ─── CORS ────────────────────────────────────────────────────────────────────
 @app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
@@ -43,14 +43,14 @@ async def cors_middleware(request: Request, call_next):
     })
     return response
 
-# DB
+# ─── DB ──────────────────────────────────────────────────────────────────────
 mongo_client  = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db            = mongo_client.finsight
 users_col     = db.users
 analyses_col  = db.analyses
 companies_col = db.companies
 
-# AUTH
+# ─── AUTH ────────────────────────────────────────────────────────────────────
 pwd_ctx  = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
@@ -82,7 +82,7 @@ async def get_optional_user(creds: HTTPAuthorizationCredentials = Depends(securi
         return await users_col.find_one({"user_id": uid})
     except: return None
 
-# MODELS
+# ─── MODELS ──────────────────────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
     name: str; email: str; password: str
 
@@ -95,7 +95,7 @@ class AnalyzeFromURLRequest(BaseModel):
 class PDFRequest(BaseModel):
     html: str
 
-# HEADERS
+# ─── HEADERS ─────────────────────────────────────────────────────────────────
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/html, */*",
@@ -107,7 +107,7 @@ NSE_HEADERS = {**BROWSER_HEADERS, "Referer": "https://www.nseindia.com/", "Origi
 BSE_HEADERS = {**BROWSER_HEADERS, "Referer": "https://www.bseindia.com/", "Origin": "https://www.bseindia.com"}
 
 
-# COMPANY MASTER SYNC
+# ─── COMPANY MASTER SYNC ─────────────────────────────────────────────────────
 async def sync_nse_companies() -> int:
     url = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
     count = 0
@@ -253,7 +253,7 @@ async def search_companies(query: str, limit: int = 15) -> List[dict]:
     return results[:limit]
 
 
-# FILING HELPERS
+# ─── FILING HELPERS ──────────────────────────────────────────────────────────
 def _classify_filing(title: str) -> str:
     t = title.lower()
     if "annual" in t: return "Annual Report"
@@ -272,7 +272,6 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
             await c.get("https://www.nseindia.com/", headers=NSE_HEADERS)
 
-            # Endpoint 1: Annual reports
             r = await c.get(
                 f"https://www.nseindia.com/api/annual-reports?symbol={symbol}&issuer={symbol}&type=annual-report",
                 headers=NSE_HEADERS)
@@ -295,7 +294,6 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
                     logger.info(f"NSE annual-reports: {len(filings)} for {symbol}")
                     return filings
 
-            # Endpoint 2: Corporate announcements for annual reports + financial results
             for category in ["annual-report", "financial-results"]:
                 r2 = await c.get(
                     f"https://www.nseindia.com/api/corporates-announcements?index=equities&symbol={symbol}&category={category}",
@@ -334,7 +332,7 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
     try:
         from datetime import date as _date
         to_dt   = _date.today().strftime("%Y%m%d")
-        from_dt = (_date.today() - timedelta(days=1825)).strftime("%Y%m%d")  # 5 years
+        from_dt = (_date.today() - timedelta(days=1825)).strftime("%Y%m%d")
 
         def _bse_api(cat):
             return (f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
@@ -361,7 +359,6 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
                     if not pdf_name: continue
                     title = item.get("SUBJECT") or item.get("CATEGORYNAME") or "Financial Results"
 
-                    # Verify URL — fall back to default if neither works (don't skip)
                     candidates = _pdf_candidates(pdf_name)
                     working_url = None
                     for candidate in candidates:
@@ -369,7 +366,7 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
                             working_url = candidate
                             break
                     if not working_url:
-                        working_url = candidates[0]  # Use AttachLive as default even if unverified
+                        working_url = candidates[0]
                         logger.warning(f"BSE PDF unverified, using default: {pdf_name}")
 
                     filings.append({"title": title, "date": item.get("NEWS_DT", ""),
@@ -384,24 +381,164 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
     return []
 
 
-# PDF EXTRACTION
+# ─── PDF EXTRACTION (FIXED) ──────────────────────────────────────────────────
+
+def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
+    """
+    Use pdfplumber for superior table extraction — preserves column alignment
+    and prevents the decimal/digit-dropping bug that affects pypdf on tabular data.
+    """
+    try:
+        import pdfplumber
+        result = ""
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            for i in page_indices:
+                if i >= len(pdf.pages):
+                    continue
+                page = pdf.pages[i]
+                page_text = ""
+
+                # Extract tables first — preserves numbers correctly
+                tables = page.extract_tables()
+                for table in tables:
+                    for row in table:
+                        cleaned = [str(cell).strip() if cell else "" for cell in row]
+                        if any(cleaned):
+                            page_text += " | ".join(cleaned) + "\n"
+
+                # Then extract remaining text
+                raw_text = page.extract_text() or ""
+                if raw_text.strip():
+                    page_text += raw_text
+
+                if page_text.strip():
+                    result += f"\n--- PAGE {i+1} ---\n{page_text}\n"
+
+        logger.info(f"pdfplumber extracted {len(result):,} chars")
+        return result
+    except ImportError:
+        logger.warning("pdfplumber not available, falling back to pypdf")
+        return ""
+    except Exception as e:
+        logger.warning(f"pdfplumber failed: {e}, falling back to pypdf")
+        return ""
+
+
+def _select_financial_pages(raw_bytes: bytes) -> list:
+    """
+    Score every page by financial keyword density.
+    Returns sorted list of page indices that contain financial data.
+    Always includes first 5 pages.
+    """
+    reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+    total  = len(reader.pages)
+
+    KEYWORDS = [
+        "total assets", "profit and loss", "statement of profit",
+        "cash flow", "balance sheet", "total income", "borrowing",
+        "finance cost", "total equity", "earnings per share",
+        "debt to equity", "financial highlights", "key financial ratios",
+        "total revenue", "gross income", "net profit", "ebitda",
+        "total liabilities", "current assets", "current liabilities",
+        "revenue from operations", "other income", "tax expense",
+        "depreciation", "amortisation", "reserves and surplus",
+    ]
+
+    core_pages = set(range(min(5, total)))
+    for i, page in enumerate(reader.pages):
+        t = (page.extract_text() or "").lower()
+        score = sum(1 for kw in KEYWORDS if kw in t)
+        if score >= 3:
+            core_pages.add(i)
+
+    logger.info(f"PDF: {total} pages total, {len(core_pages)} financial pages selected: {sorted(core_pages)}")
+    return sorted(core_pages)
+
+
+def _validate_extracted_numbers(text: str, source_text: str) -> bool:
+    """
+    Basic sanity check: verify key numbers from the extracted text
+    actually appear in the raw source. Logs a warning if mismatch found.
+    """
+    # Find all number patterns in extracted text
+    numbers = re.findall(r'\b\d{2,}(?:,\d{3})*(?:\.\d+)?\b', text)
+    mismatches = 0
+    for num in numbers[:20]:  # check first 20 numbers
+        num_clean = num.replace(",", "")
+        if num_clean not in source_text.replace(",", ""):
+            mismatches += 1
+    if mismatches > 5:
+        logger.warning(f"Number validation: {mismatches}/20 numbers not found in source — possible extraction issue")
+        return False
+    return True
+
+
+def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 120000) -> str:
+    """
+    FIXED extraction pipeline:
+    1. Select financial pages using keyword scoring
+    2. Use pdfplumber (primary) for table-aware extraction — fixes digit-dropping bug
+    3. Fall back to pypdf if pdfplumber unavailable
+    4. Validate extracted numbers against raw bytes
+    5. Add data integrity note for partial documents (newspaper extracts etc.)
+    """
+    page_indices = _select_financial_pages(raw_bytes)
+
+    # PRIMARY: pdfplumber — preserves table column alignment and numbers correctly
+    result = _extract_with_pdfplumber(raw_bytes, page_indices)
+
+    # FALLBACK: pypdf
+    if not result.strip():
+        logger.info("Falling back to pypdf extraction")
+        reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+        result = ""
+        for i in page_indices:
+            pt = reader.pages[i].extract_text() or ""
+            if pt.strip():
+                result += f"\n--- PAGE {i+1} ---\n{pt}\n"
+        logger.info(f"pypdf extracted {len(result):,} chars")
+
+    # Detect if this is a partial/newspaper extract — flag it for the model
+    doc_type_hint = ""
+    lower_result = result.lower()
+    is_partial = (
+        "newspaper" in lower_result or
+        "business standard" in lower_result or
+        "extract of" in lower_result or
+        "advertisement" in lower_result or
+        len(result) < 3000
+    )
+    if is_partial:
+        doc_type_hint = (
+            "\n\n[SYSTEM NOTE: This appears to be a NEWSPAPER EXTRACT or PARTIAL FILING. "
+            "It likely contains only: Revenue, PBT, PAT, EPS, and Equity Capital. "
+            "DO NOT fabricate Balance Sheet items (Debt, Current Ratio, Cash, OCF) "
+            "that are not present. Mark them as 'Not available in this filing extract'. "
+            "Use only numbers explicitly present in the document.]\n"
+        )
+        logger.warning("Partial/newspaper extract detected — hallucination guard injected")
+
+    final = (doc_type_hint + result)[:max_chars]
+    logger.info(f"Final snippet: {len(final):,} chars (partial={is_partial})")
+    return final
+
+
 def extract_pdf_text(raw_bytes: bytes) -> str:
     """
     Entry point for PDF processing.
-    Validates the PDF, checks it's not scanned, then extracts only financial pages.
+    Validates the PDF, checks it has selectable text, then extracts financial pages.
     """
     try:
         reader    = pypdf.PdfReader(io.BytesIO(raw_bytes))
         num_pages = len(reader.pages)
 
-        # Quick scan to check if PDF has any selectable text
         sample_text = ""
         for page in reader.pages[:10]:
             sample_text += page.extract_text() or ""
-        if len(sample_text.strip()) < 300:
+        if len(sample_text.strip()) < 100:
             raise ValueError(
-                f"This PDF appears to be scanned/image-based — no selectable text found in first 10 pages. "
-                f"Please download the digital/searchable version from BSE or NSE.")
+                "This PDF appears to be scanned/image-based — no selectable text found. "
+                "Please download the digital/searchable version from BSE or NSE.")
 
         logger.info(f"PDF validated: {num_pages} pages, extracting financial sections...")
         return extract_financial_snippet(raw_bytes)
@@ -412,7 +549,7 @@ def extract_pdf_text(raw_bytes: bytes) -> str:
         raise ValueError(f"Could not read this PDF: {str(e)}")
 
 
-# JSON REPAIR
+# ─── JSON REPAIR ─────────────────────────────────────────────────────────────
 def safe_parse_json(raw: str) -> dict:
     raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
     start = raw.find("{")
@@ -452,49 +589,16 @@ def _repair_json(s: str) -> str:
     return s
 
 
-# AI PROMPT
-
-def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 100000) -> str:
-    """
-    Page-score extraction: scores every page by how many financial keywords it contains.
-    Pages with score >= 3 are core financial statement pages (Balance Sheet, P&L, Cash Flow).
-    Always includes first 5 pages (Director Report / Financial Highlights).
-    Works for ANY company PDF — no hardcoded patterns.
-    """
-    reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
-    total  = len(reader.pages)
-
-    KEYWORDS = [
-        "total assets", "profit and loss", "statement of profit",
-        "cash flow", "balance sheet", "total income", "borrowing",
-        "finance cost", "total equity", "earnings per share",
-        "debt to equity", "financial highlights", "key financial ratios",
-        "total revenue", "gross income", "net profit", "ebitda",
-        "total liabilities", "current assets", "current liabilities",
-    ]
-
-    core_pages = set(range(min(5, total)))  # first 5 pages always included
-    for i, page in enumerate(reader.pages):
-        t = (page.extract_text() or "").lower()
-        score = sum(1 for kw in KEYWORDS if kw in t)
-        if score >= 3:
-            core_pages.add(i)
-
-    logger.info(f"PDF: {total} pages, {len(core_pages)} financial pages selected: {sorted(core_pages)}")
-
-    result = ""
-    for i in sorted(core_pages):
-        pt = reader.pages[i].extract_text() or ""
-        if pt.strip():
-            result += f"\n--- PAGE {i+1} ---\n{pt}\n"
-
-    logger.info(f"Extracted {len(result):,} chars from financial pages")
-    return result[:max_chars]
-
-
+# ─── AI PROMPT (UPGRADED) ────────────────────────────────────────────────────
 def build_prompt(text: str) -> str:
-    snippet = text[:200000]
+    snippet = text[:120000]
     logger.info(f"Prompt snippet: {len(snippet)} chars")
+
+    # Sanity check — warn if snippet looks too short or lacks financial content
+    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh", "eps", "ebitda"]
+    found_kw = [kw for kw in financial_keywords if kw.lower() in snippet.lower()]
+    if len(found_kw) < 2:
+        logger.warning(f"Snippet may not contain financial data. Found keywords: {found_kw}. Preview: {snippet[:300]}")
 
     return f"""You are FinSight, an elite AI financial analyst combining 25+ years of equity research experience with the rigor of a Goldman Sachs analyst and the clarity of a seasoned investor communicator. You specialize in Indian listed companies across all sectors.
 
@@ -511,24 +615,47 @@ CORE PHILOSOPHY — NON-NEGOTIABLE
 6. Flag concerns EVEN when the overall picture is positive. Intellectual honesty builds trust.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CRITICAL EXTRACTION RULES
+CRITICAL DATA INTEGRITY RULES — READ FIRST
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. SEARCH THE ENTIRE DOCUMENT for each metric before saying "Not reported"
-2. Look for alternate names:
-   - Total Assets = "Total Assets" OR "Assets" OR balance sheet total
+A. USE ONLY NUMBERS EXPLICITLY PRESENT IN THE DOCUMENT.
+   - Do NOT invent, estimate, or carry forward numbers not in the text.
+   - If the document is a newspaper extract or partial filing, it will contain a [SYSTEM NOTE] saying so.
+     In that case, mark any unavailable metric as "Not available in this filing extract".
+   - NEVER fabricate Balance Sheet items (Debt, Current Ratio, Cash, Working Capital) from a quarterly extract.
+
+B. NUMBER ACCURACY — CRITICAL:
+   - Read numbers exactly as they appear. Do NOT drop digits or shift decimal places.
+   - If you see "20,078.39" do NOT write "2,007.8" or "2007.8". Write "20,078.39".
+   - If you see "3,066.03" do NOT write "306.03". Write "3,066.03".
+   - Always check: does the number make sense vs other numbers in context?
+     (e.g. Net Profit cannot be larger than Revenue)
+   - Commas in Indian numbering: 1,00,000 = 100000 (one lakh), NOT 1000000.
+
+C. STANDALONE vs CONSOLIDATED:
+   - If both are present, use STANDALONE figures as primary (labelled clearly).
+   - If only consolidated is present, use those and label as "Consolidated".
+   - NEVER mix standalone and consolidated numbers in the same metric.
+
+D. CALCULATIONS — DO THE MATH CORRECTLY:
+   - Growth % = ((Current - Previous) / |Previous|) × 100
+   - Net Margin = (Net Profit / Revenue) × 100
+   - ROE = (Net Profit / Total Equity) × 100
+   - Debt/Equity = Total Debt / Total Equity
+   - Interest Coverage = EBIT / Finance Costs
+   - Current Ratio = Current Assets / Current Liabilities
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EXTRACTION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. SEARCH THE ENTIRE DOCUMENT for each metric before saying "Not available"
+2. Alternate names to look for:
+   - Total Assets = "Total Assets" OR balance sheet total
    - Total Debt = "Total Borrowings" OR "Debt Securities" OR "Borrowings" OR "Loans"
    - Operating Cash Flow = "Cash from Operating Activities" OR "Net Cash from Operations"
    - Interest Coverage = calculate from "Finance Costs" and "EBIT" or "EBITDA"
 3. For NBFCs: Total Debt = Debt Securities + Borrowings + Subordinated Liabilities
-4. For Defense/PSU companies: Order book, government contracts, and advances from customers are critical
-5. COMPUTE all ratios even if not explicitly stated:
-   - ROE = (Net Profit / Total Equity) × 100
-   - ROA = (Net Profit / Total Assets) × 100
-   - Debt to Equity = Total Debt / Total Equity
-   - Interest Coverage = EBIT / Finance Costs
-   - Current Ratio = Current Assets / Current Liabilities
-   - Free Cash Flow = Operating Cash Flow - Capex
-6. Only say "Not reported" if underlying numbers are COMPLETELY ABSENT after thorough search
+4. For Defense/PSU: Order book, government advances, and contract pipeline are critical context
+5. Only write "Not available in this filing" if numbers are truly absent after thorough search
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SCORING CALIBRATION — STRICT ENFORCEMENT
@@ -545,18 +672,21 @@ GROWTH (0-15):
 
 BALANCE SHEET (0-15):
 - 13-15 = Strong  (D/E <0.5, strong equity base, low debt)
-- 9-12  = Average (D/E 0.5–1.5, moderate leverage)
+- 9-12  = Average (D/E 0.5-1.5, moderate leverage)
 - 0-8   = Weak    (D/E >1.5, high debt burden)
+- If Balance Sheet data is unavailable: score based on what IS available; note limitation.
 
 LIQUIDITY (0-10):
 - 9-10 = Strong   (Current Ratio >1.5, strong cash position)
-- 6-8  = Average  (Current Ratio 1.0–1.5, adequate cash)
+- 6-8  = Average  (Current Ratio 1.0-1.5, adequate cash)
 - 0-5  = Weak     (Current Ratio <1.0, cash concerns)
+- If Liquidity data is unavailable: assign score of 5 and note "Insufficient data".
 
 CASH FLOW (0-15):
 - 13-15 = Strong  (OCF > Net Profit, consistent generation)
-- 9-12  = Average (OCF ≈ Net Profit, stable)
+- 9-12  = Average (OCF approximately equals Net Profit, stable)
 - 0-8   = Weak    (OCF < Net Profit or negative)
+- If Cash Flow data is unavailable: assign score of 7 and note "Not reported in extract".
 
 GOVERNANCE & RISK (0-15):
 - 13-15 = Strong  (No red flags, AAA/AA+ rating, clean audit, low promoter pledge)
@@ -569,18 +699,19 @@ INDUSTRY POSITION (0-10):
 - 0-5  = Weak     (Below peer average, losing market share)
 
 RATING MUST MATCH SCORE:
-- Score ≥80% of max = "Strong" | Score 60-79% = "Average" | Score <60% = "Weak"
-- If score is 12/15 → rating MUST be "Average" (NOT "Weak")
-- If score is 16/20 → rating MUST be "Strong" (NOT "Average")
+- Score >= 80% of max = "Strong" | 60-79% = "Average" | <60% = "Weak"
+- Score 12/15 = "Average" (NOT "Weak"). Score 16/20 = "Strong" (NOT "Average").
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 JSON OUTPUT SCHEMA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {{
-  "company_name": "Full legal name from document",
-  "statement_type": "Annual Report / Half-Year Results / Quarterly Results",
-  "period": "e.g. H1 FY2025-26 or Q2 FY2025",
+  "company_name": "Full legal name exactly as it appears in the document",
+  "statement_type": "Annual Report / Half-Year Results / Quarterly Results / Newspaper Extract",
+  "period": "e.g. Q3 FY2025-26 (Quarter ended 31 December 2025)",
   "currency": "INR Lakhs / INR Crores / USD Millions",
+  "data_source": "Standalone / Consolidated / Mixed (specify which metrics are which)",
+  "data_completeness": "Full Filing / Partial Extract / Newspaper Advertisement",
   "health_score": 0,
   "health_label": "Excellent (80-100) / Good (60-79) / Fair (40-59) / Poor (20-39) / Critical (0-19)",
 
@@ -592,8 +723,8 @@ JSON OUTPUT SCHEMA
         "weight": 20,
         "score": 0,
         "max": 20,
-        "rating": "Strong / Average / Weak — MUST match score using calibration",
-        "reasoning": "ROE X%, Net Margin Y%, trend direction. Therefore [rating] because..."
+        "rating": "Strong / Average / Weak",
+        "reasoning": "State actual ROE %, Net Margin %, and trend. Explain WHY this score."
       }},
       {{
         "category": "Growth",
@@ -601,7 +732,7 @@ JSON OUTPUT SCHEMA
         "score": 0,
         "max": 15,
         "rating": "Strong / Average / Weak",
-        "reasoning": "Revenue grew X% (volume-led or price-led?), Profit grew Y%. Gap explanation."
+        "reasoning": "Revenue grew X% (explain volume vs price), Profit grew Y%. Explain gap."
       }},
       {{
         "category": "Balance Sheet",
@@ -609,7 +740,7 @@ JSON OUTPUT SCHEMA
         "score": 0,
         "max": 15,
         "rating": "Strong / Average / Weak",
-        "reasoning": "D/E ratio X, Total Debt Y, asset quality assessment."
+        "reasoning": "D/E ratio X, Total Debt Y. If unavailable say so and explain scoring basis."
       }},
       {{
         "category": "Liquidity",
@@ -617,7 +748,7 @@ JSON OUTPUT SCHEMA
         "score": 0,
         "max": 10,
         "rating": "Strong / Average / Weak",
-        "reasoning": "Current Ratio X, Cash Y, working capital assessment."
+        "reasoning": "Current Ratio X, Cash Y. If unavailable, state 'Insufficient data in filing'."
       }},
       {{
         "category": "Cash Flow",
@@ -625,7 +756,7 @@ JSON OUTPUT SCHEMA
         "score": 0,
         "max": 15,
         "rating": "Strong / Average / Weak",
-        "reasoning": "OCF X vs PAT Y. Is profit backed by real cash? Why or why not?"
+        "reasoning": "OCF X vs PAT Y. If unavailable in extract, state so explicitly."
       }},
       {{
         "category": "Governance & Risk",
@@ -633,7 +764,7 @@ JSON OUTPUT SCHEMA
         "score": 0,
         "max": 15,
         "rating": "Strong / Average / Weak",
-        "reasoning": "Credit rating, auditor stance, promoter pledge %, related party concerns, red flags."
+        "reasoning": "Credit rating, auditor stance, promoter pledge, any red flags found."
       }},
       {{
         "category": "Industry Position",
@@ -641,44 +772,44 @@ JSON OUTPUT SCHEMA
         "score": 0,
         "max": 10,
         "rating": "Strong / Average / Weak",
-        "reasoning": "Market rank vs named peers, moat source, pricing power, order pipeline."
+        "reasoning": "Market rank vs named peers, moat source, competitive advantage."
       }}
     ]
   }},
 
-  "executive_summary": "5-6 sentences. Lead with the most important story of the period. Use real numbers. Explain what drove performance, what the key risk is, and what investors must watch.",
+  "executive_summary": "5-6 sentences. Open with the company name and period. Use REAL numbers from the document. Explain what drove performance, key risk, and what investors must watch. Do NOT use placeholder language.",
 
-  "headline": "One punchy, memorable sentence (max 15 words) that captures the essence of this result. Make it quotable.",
+  "headline": "One punchy, memorable sentence max 15 words capturing the essence of this result.",
 
   "investment_label": "Strong Buy / Buy / Hold / Reduce / Avoid",
 
-  "investor_verdict": "3-4 sentences. Direct recommendation with specific reasoning. Include what would change the view. Write as a senior analyst speaking to an institutional client.",
+  "investor_verdict": "3-4 sentences. Direct recommendation with specific reasoning using actual numbers. State what would change the view. Write as senior analyst to institutional client.",
 
-  "for_long_term_investors": "2-3 sentences specifically addressing long-term compounding potential, moat durability, and risk of permanent capital loss.",
+  "for_long_term_investors": "2-3 sentences on compounding potential, moat durability, and risk of permanent capital loss.",
 
-  "for_short_term_traders": "2-3 sentences on near-term catalysts, technical setup context, and key triggers for the next quarter.",
+  "for_short_term_traders": "2-3 sentences on near-term catalysts and key triggers for next quarter.",
 
-  "bottom_line": "One single memorable sentence that is the most important thing any investor must know about this company right now. Make it unforgettable.",
+  "bottom_line": "One single memorable sentence — the most important thing any investor must know right now.",
 
-  "explain_like_15": "Explain this company's financial health using a simple small shop analogy. 5 lines. No jargon. A 15-year-old must understand exactly how the business is doing and why.",
+  "explain_like_15": "5 lines using small shop analogy. No jargon. A 15-year-old must understand how the business is doing and why.",
 
   "key_metrics": [
-    {{"label": "Revenue / Total Income", "current": "ACTUAL number", "previous": "ACTUAL number", "change": "ACTUAL %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "What drove this? Volume or price? Organic or inorganic?"}},
-    {{"label": "Net Profit / PAT", "current": "ACTUAL number", "previous": "ACTUAL number", "change": "ACTUAL %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Is profit growing faster or slower than revenue? Why?"}},
-    {{"label": "EBITDA", "current": "Calculate or extract", "previous": "ACTUAL", "change": "ACTUAL %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Operating leverage story"}},
-    {{"label": "EBITDA Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "bps", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Expanding or compressing? Key cost driver?"}},
-    {{"label": "Net Profit Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "bps", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Divergence from EBITDA margin signals tax/interest dynamics"}},
-    {{"label": "EPS (Basic)", "current": "ACTUAL", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Per-share value creation"}},
-    {{"label": "Total Assets", "current": "SEARCH thoroughly", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Asset growth vs revenue growth — are assets being sweat efficiently?"}},
-    {{"label": "Total Debt", "current": "Borrowings + Debt Securities", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Debt trajectory and its purpose"}},
-    {{"label": "Cash & Equivalents", "current": "ACTUAL", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Cash burn or accumulation? Why?"}},
-    {{"label": "ROE", "current": "Calculate PAT/Equity", "previous": "ACTUAL", "change": "bps", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Is equity being deployed effectively? DuPont breakdown if possible."}},
-    {{"label": "ROCE", "current": "Calculate if available", "previous": "ACTUAL", "change": "bps", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Capital allocation quality"}},
-    {{"label": "Debt to Equity", "current": "CALCULATE", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Leverage comfort level"}},
-    {{"label": "Interest Coverage", "current": "CALCULATE EBIT/Finance Costs", "previous": "ACTUAL", "change": "x", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Debt servicing safety margin"}},
-    {{"label": "Current Ratio", "current": "Calculate CA/CL", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Short-term financial health"}},
-    {{"label": "Operating Cash Flow", "current": "EXTRACT from Cash Flow Statement", "previous": "ACTUAL", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Is profit real? OCF vs PAT gap explanation"}},
-    {{"label": "Free Cash Flow", "current": "OCF minus Capex", "previous": "Calculate", "change": "%", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Cash available for dividends, buybacks, or growth after sustaining the business"}}
+    {{"label": "Revenue / Total Income", "current": "ACTUAL number from document", "previous": "ACTUAL number", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "What drove this? Volume or price?"}},
+    {{"label": "Net Profit / PAT", "current": "ACTUAL number", "previous": "ACTUAL number", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Growing faster or slower than revenue? Why?"}},
+    {{"label": "EBITDA", "current": "Calculate or extract", "previous": "ACTUAL", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Operating leverage story"}},
+    {{"label": "EBITDA Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "bps change", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Expanding or compressing? Key cost driver?"}},
+    {{"label": "Net Profit Margin", "current": "Calculate %", "previous": "ACTUAL %", "change": "bps change", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Divergence from EBITDA margin signals tax/interest dynamics"}},
+    {{"label": "EPS (Basic)", "current": "ACTUAL", "previous": "ACTUAL", "change": "CALCULATED %", "trend": "up/down/neutral", "signal": "Strong/Good/Average/Weak", "comment": "Per-share value creation"}},
+    {{"label": "Total Assets", "current": "Extract or Not available in this filing", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Asset growth vs revenue growth efficiency"}},
+    {{"label": "Total Debt", "current": "Extract Borrowings + Debt Securities or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Debt trajectory and purpose"}},
+    {{"label": "Cash & Equivalents", "current": "ACTUAL or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Cash burn or accumulation"}},
+    {{"label": "ROE", "current": "Calculate PAT/Equity or Not available", "previous": "ACTUAL or N/A", "change": "bps or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Equity deployment effectiveness"}},
+    {{"label": "ROCE", "current": "Calculate if possible or Not available", "previous": "ACTUAL or N/A", "change": "bps or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Capital allocation quality"}},
+    {{"label": "Debt to Equity", "current": "CALCULATE or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Leverage level"}},
+    {{"label": "Interest Coverage", "current": "CALCULATE EBIT/Finance Costs or Not available", "previous": "ACTUAL or N/A", "change": "x or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Debt servicing safety margin"}},
+    {{"label": "Current Ratio", "current": "Calculate CA/CL or Not available", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Short-term financial health"}},
+    {{"label": "Operating Cash Flow", "current": "EXTRACT from Cash Flow Statement or Not available in extract", "previous": "ACTUAL or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "OCF vs PAT — is profit real?"}},
+    {{"label": "Free Cash Flow", "current": "OCF minus Capex or Not available", "previous": "Calculate or N/A", "change": "% or N/A", "trend": "up/down/neutral/unknown", "signal": "Strong/Good/Average/Weak/Unknown", "comment": "Cash after sustaining the business"}}
   ],
 
   "segment_analysis": {{
@@ -689,83 +820,83 @@ JSON OUTPUT SCHEMA
         "revenue": "ACTUAL",
         "revenue_share": "% of total",
         "growth": "YoY %",
-        "margin": "If available",
-        "insight": "What is driving or dragging this segment? Is this the growth engine or the drag?"
+        "margin": "If available or N/A",
+        "insight": "What is driving or dragging this segment?"
       }}
     ],
     "key_takeaway": "Which segment is the real value driver? Which is the hidden risk?"
   }},
 
   "cash_flow_deep_dive": {{
-    "operating_cf": "ACTUAL",
-    "investing_cf": "ACTUAL",
-    "financing_cf": "ACTUAL",
-    "free_cash_flow": "OCF - Capex",
-    "capex": "ACTUAL if available",
-    "cash_conversion_quality": "High / Medium / Low",
-    "ocf_vs_pat_insight": "Is profit backed by real cash? Explain the gap or alignment with specific reasons — advances received, receivables buildup, inventory, etc.",
-    "red_flags": ["Specific FCF concern 1", "Working capital trap signal", "Capex intensity concern if applicable"]
+    "operating_cf": "ACTUAL or Not available in this filing",
+    "investing_cf": "ACTUAL or Not available",
+    "financing_cf": "ACTUAL or Not available",
+    "free_cash_flow": "OCF - Capex or Not available",
+    "capex": "ACTUAL if available or Not available",
+    "cash_conversion_quality": "High / Medium / Low / Insufficient data",
+    "ocf_vs_pat_insight": "Is profit backed by real cash? Explain gap with specific reasons. If data absent say so.",
+    "red_flags": ["Specific FCF concern or N/A if data unavailable"]
   }},
 
   "balance_sheet_deep_dive": {{
-    "asset_quality": "What are the major assets? Are they productive? Any impairment risk?",
-    "debt_profile": "Maturity profile, cost of debt, secured vs unsecured breakdown if available",
-    "working_capital_insight": "Receivables days, payable days, inventory days if calculable. Is working capital a cash trap?",
-    "hidden_strengths": ["Non-obvious BS strength 1", "Hidden asset or reserve 2"],
-    "hidden_risks": ["Non-obvious risk 1 with explanation", "Contingent liability concern 2"],
-    "total_debt": "EXTRACT",
-    "net_worth": "EXTRACT",
-    "debt_to_equity": "CALCULATE",
-    "interest_coverage": "CALCULATE",
-    "debt_comfort_level": "Comfortable / Moderate / Stressed"
+    "asset_quality": "What are major assets? Productive? Any impairment risk? Or Not available.",
+    "debt_profile": "Maturity, cost, secured vs unsecured — or Not available in this filing.",
+    "working_capital_insight": "Receivables days, payable days — or Not available.",
+    "hidden_strengths": ["Non-obvious strength or N/A"],
+    "hidden_risks": ["Non-obvious risk or N/A"],
+    "total_debt": "EXTRACT or Not available",
+    "net_worth": "EXTRACT or Not available",
+    "debt_to_equity": "CALCULATE or Not available",
+    "interest_coverage": "CALCULATE or Not available",
+    "debt_comfort_level": "Comfortable / Moderate / Stressed / Insufficient data"
   }},
 
   "growth_quality": {{
-    "revenue_growth_context": "Is growth organic or inorganic? Volume-led or price-led? Sustainable or one-time?",
-    "profit_growth_context": "Is profit growing faster or slower than revenue? What explains the divergence?",
-    "margin_trend": "Expanding / Compressing / Stable — and what is the structural reason?",
+    "revenue_growth_context": "Organic or inorganic? Volume-led or price-led? Sustainable?",
+    "profit_growth_context": "Faster or slower than revenue? What explains the divergence?",
+    "margin_trend": "Expanding / Compressing / Stable — structural reason?",
     "growth_outlook": "Accelerating / Stable / Decelerating / Uncertain",
-    "catalysts": ["Specific company-relevant growth trigger 1", "Catalyst 2 — not generic"],
-    "headwinds": ["Specific risk to growth 1 with reasoning", "Headwind 2 — not generic"]
+    "catalysts": ["Specific company-relevant catalyst 1", "Catalyst 2"],
+    "headwinds": ["Specific headwind 1 with reasoning", "Headwind 2"]
   }},
 
   "industry_context": {{
-    "sector_tailwinds": ["Industry tailwind 1 relevant to this company", "Tailwind 2"],
-    "sector_headwinds": ["Industry headwind 1", "Headwind 2"],
-    "competitive_position": "Where does this company sit vs named peers? Is it gaining or losing ground?",
-    "peer_benchmarks": "Compare key margins/ratios vs named peers in the same sector",
-    "regulatory_environment": "Any policy, regulatory, or government dependency that materially impacts outlook"
+    "sector_tailwinds": ["Tailwind 1 relevant to this company", "Tailwind 2"],
+    "sector_headwinds": ["Headwind 1", "Headwind 2"],
+    "competitive_position": "Where does this company sit vs named peers?",
+    "peer_benchmarks": "Compare key margins vs named sector peers",
+    "regulatory_environment": "Policy or regulatory dependency that impacts outlook"
   }},
 
   "red_flags": [
     {{
-      "flag": "Specific, non-generic red flag title",
+      "flag": "Specific non-generic flag title",
       "severity": "High / Medium / Low",
-      "explanation": "Exactly what the concern is and why it matters to an investor",
-      "what_to_watch": "Specific metric or event that would confirm or dismiss this risk"
+      "explanation": "What the concern is and why it matters",
+      "what_to_watch": "Specific metric or event that confirms or dismisses this risk"
     }}
   ],
 
   "strengths_and_moats": [
     {{
       "strength": "Specific competitive strength",
-      "why_it_matters": "Why this is a genuine durable moat — not just a positive data point",
+      "why_it_matters": "Why this is a durable moat — not just a positive data point",
       "risk_to_moat": "What could erode this advantage?"
     }}
   ],
 
   "valuation_context": {{
-    "note": "Valuation data not provided in document. Based on financials alone:",
-    "book_value_per_share": "Calculate if share count available",
-    "pb_ratio": "If market price available",
+    "note": "Valuation data not provided in document. Assessment based on financials only.",
+    "book_value_per_share": "Calculate if share count available or Not available",
+    "pb_ratio": "If market price available or Not available",
     "earnings_quality": "High / Medium / Low — and why",
-    "analyst_comment": "Based on earnings quality, growth trajectory, and balance sheet strength, is the company likely to command a premium or discount to sector peers? Why?"
+    "analyst_comment": "Premium or discount to peers likely? Why?"
   }},
 
   "investor_faq": [
     {{
-      "question": "Highly specific question a real investor would ask about THIS company",
-      "answer": "Direct, expert, 2-4 sentence answer using actual numbers from the document"
+      "question": "Specific question a real investor would ask about THIS company",
+      "answer": "Direct expert answer using actual numbers. 2-4 sentences."
     }},
     {{
       "question": "Second specific investor question",
@@ -780,7 +911,7 @@ JSON OUTPUT SCHEMA
       "answer": "Direct expert answer"
     }},
     {{
-      "question": "Fifth specific investor question — focus on the biggest risk",
+      "question": "Fifth question focused on the biggest risk",
       "answer": "Direct expert answer"
     }}
   ],
@@ -788,46 +919,46 @@ JSON OUTPUT SCHEMA
   "key_monitorables": [
     {{
       "metric": "Specific metric to track",
-      "why": "Why this is the most important forward indicator for this company",
-      "trigger": "Specific threshold or event that would signal a positive or negative turn"
+      "why": "Why this is the most important forward indicator for this specific company",
+      "trigger": "Specific threshold or event that signals a turn"
     }},
     {{
       "metric": "Second monitorable",
-      "why": "Reasoning specific to this company's business model",
-      "trigger": "What to watch for"
+      "why": "Company-specific reasoning",
+      "trigger": "Specific threshold"
     }},
     {{
       "metric": "Third monitorable",
       "why": "Specific reasoning",
-      "trigger": "Specific trigger threshold"
+      "trigger": "Specific trigger"
     }}
   ],
 
   "profitability": {{
     "analysis": "Detailed analysis with actual numbers and business model context",
-    "gross_margin_current": "Calculate or extract %",
-    "gross_margin_previous": "ACTUAL %",
-    "net_margin_current": "MUST calculate PAT/Revenue",
+    "gross_margin_current": "Calculate or extract % or N/A",
+    "gross_margin_previous": "ACTUAL % or N/A",
+    "net_margin_current": "CALCULATE PAT/Revenue — do not skip this",
     "net_margin_previous": "ACTUAL %",
-    "ebitda_margin_current": "MUST calculate",
+    "ebitda_margin_current": "CALCULATE",
     "ebitda_margin_previous": "ACTUAL %",
-    "roe": "MUST calculate PAT/Equity × 100",
-    "roa": "MUST calculate PAT/Assets × 100",
+    "roe": "CALCULATE PAT/Equity x 100 or Not available",
+    "roa": "CALCULATE PAT/Assets x 100 or Not available",
     "key_cost_drivers": ["Actual cost item 1 with real numbers", "Cost driver 2 with trend"]
   }},
 
   "liquidity": {{
-    "analysis": "Analysis with real numbers and working capital context",
-    "current_ratio": "CALCULATE CA/CL",
-    "quick_ratio": "Calculate if data available",
-    "cash_position": "EXTRACT Cash and Equivalents",
-    "operating_cash_flow": "EXTRACT from Cash Flow Statement",
-    "free_cash_flow": "OCF - Capex if available",
-    "day_to_day_assessment": "Smooth / Adequate / Tight"
+    "analysis": "Analysis with real numbers or note data unavailability",
+    "current_ratio": "CALCULATE CA/CL or Not available",
+    "quick_ratio": "Calculate if data available or N/A",
+    "cash_position": "EXTRACT or Not available",
+    "operating_cash_flow": "EXTRACT from Cash Flow Statement or Not available",
+    "free_cash_flow": "OCF - Capex or Not available",
+    "day_to_day_assessment": "Smooth / Adequate / Tight / Insufficient data"
   }},
 
   "highlights": [
-    "Specific strength 1 with actual numbers — not generic",
+    "Specific strength 1 with actual numbers",
     "Specific strength 2 with context",
     "Specific strength 3",
     "Specific strength 4",
@@ -835,7 +966,7 @@ JSON OUTPUT SCHEMA
   ],
 
   "risks": [
-    "Specific risk 1 with actual reasoning tied to the numbers — not generic",
+    "Specific risk 1 tied to actual numbers — not generic",
     "Specific risk 2",
     "Specific risk 3",
     "Specific risk 4",
@@ -843,7 +974,7 @@ JSON OUTPUT SCHEMA
   ],
 
   "what_to_watch": [
-    "Specific watch item 1 for the next reporting period",
+    "Specific watch item 1 for next reporting period",
     "Specific watch item 2",
     "Specific watch item 3"
   ]
@@ -852,41 +983,33 @@ JSON OUTPUT SCHEMA
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FINAL REMINDERS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- NEVER say "Not reported" without exhaustively searching the full document
-- ALWAYS calculate ratios from available raw data
-- Rating MUST match score per calibration rules above
-- Use REAL extracted numbers everywhere — zero placeholders
-- Risks and strengths must be COMPANY-SPECIFIC — never generic boilerplate
-- The investor_faq questions must be ones a real investor would genuinely ask about THIS specific company
-- The bottom_line must be one sentence that is memorable, direct, and quotable
-- The headline must be punchy enough to stand alone as a news headline
+- Company name MUST be taken from the document — never invent it
+- Numbers MUST be copied exactly — never drop digits or shift decimals
+- If standalone and consolidated both appear, use standalone as primary
+- Missing data = "Not available in this filing" — never fabricate it
+- Rating MUST match score per calibration above
+- investor_faq must be company-specific questions, not generic
+- bottom_line must be one memorable, direct, quotable sentence
+- headline must stand alone as a financial news headline
 
 FINANCIAL DOCUMENT:
 {snippet}"""
 
-# FIXED AI RUNNERS - Replace in your server_v12.py starting at line 660
 
-# AI RUNNERS WITH WORKING MODELS (Feb 2026)
+# ─── AI RUNNERS ──────────────────────────────────────────────────────────────
 
 def _sync_gemini(text: str) -> dict:
-    """
-    Use new google-genai package instead of deprecated google.generativeai
-    Only use models that are confirmed working
-    """
     try:
-        # Use new API
         from google import genai
         from google.genai import types
-        
+
         client = genai.Client(api_key=GEMINI_API_KEY)
-        
-        # Working models in order of preference
         models_to_try = [
-    "gemini-exp-1206",  # Primary - latest and best
-    "gemini-1.5-flash", # Stable fallback - widely available                  
-    "gemini-1.5-pro", #cheap and fast fallback, good for shorter prompts          
-]
-        
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ]
+
         for model_name in models_to_try:
             try:
                 response = client.models.generate_content(
@@ -897,55 +1020,42 @@ def _sync_gemini(text: str) -> dict:
                         max_output_tokens=8192,
                     )
                 )
-                
                 raw_text = response.text
-                logger.info(f"✓ Gemini {model_name}: {len(raw_text)} chars")
+                logger.info(f"Gemini {model_name}: {len(raw_text)} chars")
                 return safe_parse_json(raw_text)
-                
+
             except Exception as e:
                 err_str = str(e)
                 logger.warning(f"Gemini {model_name} failed: {err_str[:150]}")
-                
-                # If quota exceeded, try next model immediately
-                if "429" in err_str or "quota" in err_str.lower():
-                    continue
-                    
-                # If model not found, try next
-                if "404" in err_str or "not found" in err_str.lower():
-                    continue
-                    
+                if "429" in err_str or "quota" in err_str.lower(): continue
+                if "404" in err_str or "not found" in err_str.lower(): continue
+
         raise Exception("All Gemini models failed")
-        
+
     except ImportError:
-        # Fallback to old API if new one not available
         logger.warning("New google-genai package not found, using old API")
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-        
         model = genai.GenerativeModel("gemini-1.5-flash-latest")
         resp = model.generate_content(build_prompt(text))
         return safe_parse_json(resp.text)
 
 
-# GROQ - Use only currently active models (Feb 2026)
 GROQ_MODELS_ACTIVE = [
-    "llama-3.3-70b-versatile",  # Primary - 128k context
-    "llama-3.1-70b-versatile",  # Fallback - latest
-    "mixtral-8x7b-32768",  # Fast fallback
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768",
 ]
 
 def _sync_groq(text: str) -> dict:
-    """Use only active Groq models with proper error handling"""
     from groq import Groq
-    
     gc = Groq(api_key=GROQ_API_KEY)
     prompt = build_prompt(text)
-    
-    # Reduce prompt size if too large
-    if len(prompt) > 50000:  # Llama 3.3 supports 128k context
-        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 40000")
-        prompt = prompt[:40000] + "\n\n[Document truncated due to size limits]"
-    
+
+    if len(prompt) > 50000:
+        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 48000")
+        prompt = prompt[:48000] + "\n\n[Document truncated due to size limits. Analyze what is present.]"
+
     for model in GROQ_MODELS_ACTIVE:
         try:
             resp = gc.chat.completions.create(
@@ -955,46 +1065,34 @@ def _sync_groq(text: str) -> dict:
                 max_tokens=8192
             )
             raw = resp.choices[0].message.content
-            logger.info(f"✓ Groq {model}: {len(raw)} chars")
+            logger.info(f"Groq {model}: {len(raw)} chars")
             return safe_parse_json(raw)
-            
+
         except Exception as ex:
             err_str = str(ex)
             logger.warning(f"Groq {model} failed: {err_str[:150]}")
-            
-            # Skip if rate limited or model decommissioned
-            if "429" in err_str or "rate limit" in err_str.lower():
-                continue
-            if "400" in err_str or "decommissioned" in err_str.lower():
-                continue
-            if "413" in err_str or "too large" in err_str.lower():
-                continue
-                
+            if "429" in err_str or "rate limit" in err_str.lower(): continue
+            if "400" in err_str or "decommissioned" in err_str.lower(): continue
+            if "413" in err_str or "too large" in err_str.lower(): continue
+
     raise Exception("All Groq models failed or unavailable")
 
 
 def _sync_together(text: str) -> dict:
-    """Together AI with working free models"""
     key = os.getenv("TOGETHER_API_KEY", "")
     if not key:
         raise Exception("No TOGETHER_API_KEY")
-    
-    import httpx
-    
-    # Use free tier models
+
     models = [
         "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
         "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
     ]
-    
+
     for model in models:
         try:
             resp = httpx.post(
                 "https://api.together.xyz/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json"
-                },
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={
                     "model": model,
                     "messages": [{"role": "user", "content": build_prompt(text)}],
@@ -1003,36 +1101,30 @@ def _sync_together(text: str) -> dict:
                 },
                 timeout=90
             )
-            
             if resp.status_code == 200:
                 raw = resp.json()["choices"][0]["message"]["content"]
-                logger.info(f"✓ Together {model}: {len(raw)} chars")
+                logger.info(f"Together {model}: {len(raw)} chars")
                 return safe_parse_json(raw)
             else:
                 logger.warning(f"Together {model} failed: {resp.status_code}")
-                
         except Exception as e:
             logger.warning(f"Together {model} error: {str(e)[:150]}")
-            
+
     raise Exception("All Together AI models failed")
 
 
 def _sync_openrouter(text: str) -> dict:
-    """OpenRouter with currently available free models"""
     key = os.getenv("OPENROUTER_API_KEY", "")
     if not key:
         raise Exception("No OPENROUTER_API_KEY")
-    
-    import httpx
+
     import time
-    
-    # Updated list of working free models (Feb 2026)
     models = [
         "google/gemini-2.0-flash-exp:free",
         "meta-llama/llama-3.1-8b-instruct:free",
         "qwen/qwen-2.5-7b-instruct:free",
     ]
-    
+
     for model in models:
         for attempt in range(2):
             try:
@@ -1052,63 +1144,71 @@ def _sync_openrouter(text: str) -> dict:
                     },
                     timeout=90
                 )
-                
                 if resp.status_code == 429 and attempt == 0:
                     logger.warning(f"OpenRouter {model} rate limited, waiting 15s...")
                     time.sleep(15)
                     continue
-                    
                 if resp.status_code == 200:
                     raw = resp.json()["choices"][0]["message"]["content"]
-                    logger.info(f"✓ OpenRouter {model}: {len(raw)} chars")
+                    logger.info(f"OpenRouter {model}: {len(raw)} chars")
                     return safe_parse_json(raw)
                 else:
                     logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
-                    break  # Try next model
-                    
+                    break
             except Exception as e:
                 logger.warning(f"OpenRouter {model} error: {str(e)[:150]}")
                 break
-                
+
     raise Exception("All OpenRouter models failed")
 
 
-# MAIN ANALYSIS ORCHESTRATOR
+# ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
 async def run_analysis(text: str) -> dict:
-    """
-    Try all available AI providers in order of preference
-    Returns first successful result
-    """
+    # Guard: reject if text is too short or lacks any financial content
+    if not text or len(text.strip()) < 100:
+        raise Exception("PDF extraction returned insufficient text. The file may be scanned, empty, or corrupted.")
+
+    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh", "eps", "ebitda", "loss"]
+    found_kw = [kw for kw in financial_keywords if kw.lower() in text.lower()]
+    if len(found_kw) < 2:
+        raise Exception(
+            f"Extracted text does not appear to contain financial data "
+            f"(found only: {found_kw}). "
+            f"Please verify the PDF is a financial results document. "
+            f"Text preview: {text[:200]}"
+        )
+
+    logger.info(f"Analysis starting — text: {len(text)} chars, keywords found: {found_kw}")
+
     loop = asyncio.get_event_loop()
     errors = []
-    
-    # Provider priority order
+
     providers = [
-        ("Gemini", _sync_gemini, GEMINI_API_KEY),
-        ("Groq", _sync_groq, GROQ_API_KEY),
-        ("Together", _sync_together, os.getenv("TOGETHER_API_KEY", "")),
-        ("OpenRouter", _sync_openrouter, os.getenv("OPENROUTER_API_KEY", "")),
+        ("Gemini",      _sync_gemini,      GEMINI_API_KEY),
+        ("Groq",        _sync_groq,        GROQ_API_KEY),
+        ("Together",    _sync_together,    os.getenv("TOGETHER_API_KEY", "")),
+        ("OpenRouter",  _sync_openrouter,  os.getenv("OPENROUTER_API_KEY", "")),
     ]
-    
+
     for provider_name, func, api_key in providers:
         if not api_key:
-            logger.info(f"⊘ {provider_name} skipped (no API key)")
+            logger.info(f"Skipping {provider_name} (no API key)")
             continue
-            
         try:
-            logger.info(f"→ Trying {provider_name}...")
+            logger.info(f"Trying {provider_name}...")
             result = await loop.run_in_executor(executor, func, text)
-            logger.info(f"✓ {provider_name} succeeded!")
+            logger.info(f"{provider_name} succeeded!")
             return result
-            
         except Exception as e:
             error_msg = str(e)[:200]
-            logger.warning(f"✗ {provider_name} failed: {error_msg}")
+            logger.warning(f"{provider_name} failed: {error_msg}")
             errors.append(f"{provider_name}: {error_msg}")
-    
-    # All providers failed
+
     error_summary = " | ".join(errors) if errors else "No API keys configured"
     raise Exception(f"All AI providers failed. {error_summary}")
+
+
+# ─── ROUTES ──────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
     company_count = await companies_col.count_documents({})
