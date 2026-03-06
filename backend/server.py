@@ -1092,7 +1092,7 @@ def _sync_groq(text: str) -> dict:
             if "413" in err_str or "too large" in err_str.lower():
                 continue
 
-    raise Exception("All Groq models failed or unavailable")
+    raise Exception("All Groq models failed or unavailable")    
 
 def _sync_together(text: str) -> dict:
     key = os.getenv("TOGETHER_API_KEY", "")
@@ -1104,26 +1104,34 @@ def _sync_together(text: str) -> dict:
         "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
     ]
 
+    prompt = compress_prompt(build_prompt(text))
+
     for model in models:
         try:
             resp = httpx.post(
                 "https://api.together.xyz/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json"
+                },
                 json={
                     "model": model,
-                    prompt = compress_prompt(build_prompt(text))
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
                     "temperature": 0.1,
                     "max_tokens": 8192
                 },
                 timeout=90
             )
+
             if resp.status_code == 200:
                 raw = resp.json()["choices"][0]["message"]["content"]
                 logger.info(f"Together {model}: {len(raw)} chars")
                 return safe_parse_json(raw)
             else:
                 logger.warning(f"Together {model} failed: {resp.status_code}")
+
         except Exception as e:
             logger.warning(f"Together {model} error: {str(e)[:150]}")
 
