@@ -1144,11 +1144,14 @@ def _sync_openrouter(text: str) -> dict:
         raise Exception("No OPENROUTER_API_KEY")
 
     import time
+
     models = [
         "google/gemini-2.0-flash-exp:free",
         "meta-llama/llama-3.1-8b-instruct:free",
         "qwen/qwen-2.5-7b-instruct:free",
     ]
+
+    prompt = compress_prompt(build_prompt(text))
 
     for model in models:
         for attempt in range(2):
@@ -1163,24 +1166,29 @@ def _sync_openrouter(text: str) -> dict:
                     },
                     json={
                         "model": model,
-                        prompt = compress_prompt(build_prompt(text))
-                        "messages": [{"role": "user", "content": prompt}],
+                        "messages": [
+                            {"role": "user", "content": prompt}
+                        ],
                         "temperature": 0.1,
                         "max_tokens": 8192
                     },
                     timeout=90
                 )
+
                 if resp.status_code == 429 and attempt == 0:
                     logger.warning(f"OpenRouter {model} rate limited, waiting 15s...")
                     time.sleep(15)
                     continue
+
                 if resp.status_code == 200:
                     raw = resp.json()["choices"][0]["message"]["content"]
                     logger.info(f"OpenRouter {model}: {len(raw)} chars")
                     return safe_parse_json(raw)
+
                 else:
                     logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
                     break
+
             except Exception as e:
                 logger.warning(f"OpenRouter {model} error: {str(e)[:150]}")
                 break
