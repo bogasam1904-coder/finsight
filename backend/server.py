@@ -493,7 +493,7 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 100000) -> str:
 
 
 def build_prompt(text: str) -> str:
-    snippet = text[:150000]
+    snippet = text[:200000]
     logger.info(f"Prompt snippet: {len(snippet)} chars")
 
     return f"""You are FinSight, an elite AI financial analyst combining 25+ years of equity research experience with the rigor of a Goldman Sachs analyst and the clarity of a seasoned investor communicator. You specialize in Indian listed companies across all sectors.
@@ -882,9 +882,9 @@ def _sync_gemini(text: str) -> dict:
         
         # Working models in order of preference
         models_to_try = [
-    "gemini-2.0-flash-thinking-exp-01-21",  # ✅ Latest (Jan 2025)
-    "gemini-2.0-flash-exp",                  # ✅ Experimental
-    "gemini-1.5-flash-latest",               # ✅ Stable fallback
+    "gemini-2.0-flash",  # Primary - latest and best
+    "gemini-1.5-flash-002", # Stable fallback - widely available                  
+    "gemini-2.0-flash-lite", #cheap and fast fallback, good for shorter prompts          
 ]
         
         for model_name in models_to_try:
@@ -942,9 +942,9 @@ def _sync_groq(text: str) -> dict:
     prompt = build_prompt(text)
     
     # Reduce prompt size if too large
-    if len(prompt) > 120000:  # Llama 3.3 supports 128k context
-        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 100000")
-        prompt = prompt[:100000] + "\n\n[Document truncated due to size limits]"
+    if len(prompt) > 220000:  # Llama 3.3 supports 128k context
+        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 200000")
+        prompt = prompt[:200000] + "\n\n[Document truncated due to size limits]"
     
     for model in GROQ_MODELS_ACTIVE:
         try:
