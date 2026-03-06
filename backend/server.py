@@ -882,9 +882,9 @@ def _sync_gemini(text: str) -> dict:
         
         # Working models in order of preference
         models_to_try = [
-    "gemini-2.0-flash",  # Primary - latest and best
-    "gemini-1.5-flash-002", # Stable fallback - widely available                  
-    "gemini-2.0-flash-lite", #cheap and fast fallback, good for shorter prompts          
+    "gemini-exp-1206",  # Primary - latest and best
+    "gemini-1.5-flash", # Stable fallback - widely available                  
+    "gemini-1.5-pro", #cheap and fast fallback, good for shorter prompts          
 ]
         
         for model_name in models_to_try:
@@ -930,8 +930,8 @@ def _sync_gemini(text: str) -> dict:
 # GROQ - Use only currently active models (Feb 2026)
 GROQ_MODELS_ACTIVE = [
     "llama-3.3-70b-versatile",  # Primary - 128k context
-    "llama-3.2-90b-vision-preview",  # Fallback - latest
-    "gemma2-9b-it",  # Fast fallback
+    "llama-3.1-70b-versatile",  # Fallback - latest
+    "mixtral-8x7b-32768",  # Fast fallback
 ]
 
 def _sync_groq(text: str) -> dict:
@@ -942,9 +942,9 @@ def _sync_groq(text: str) -> dict:
     prompt = build_prompt(text)
     
     # Reduce prompt size if too large
-    if len(prompt) > 220000:  # Llama 3.3 supports 128k context
-        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 200000")
-        prompt = prompt[:200000] + "\n\n[Document truncated due to size limits]"
+    if len(prompt) > 50000:  # Llama 3.3 supports 128k context
+        logger.warning(f"Prompt too large ({len(prompt)} chars), truncating to 40000")
+        prompt = prompt[:40000] + "\n\n[Document truncated due to size limits]"
     
     for model in GROQ_MODELS_ACTIVE:
         try:
