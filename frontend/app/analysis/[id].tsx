@@ -17,61 +17,310 @@ const LIGHT = {
   textSub: '#6B7280', border: '#E5E7EB', accent: '#0052FF', accentBg: '#EEF4FF',
 };
 
+// ─── helpers ────────────────────────────────────────────────────────────────
+const val = (obj: any, ...keys: string[]) => {
+  for (const k of keys) { if (obj?.[k] && obj[k] !== 'N/A' && obj[k] !== '') return obj[k]; }
+  return null;
+};
+const pct = (obj: any) => val(obj, 'yoy_chg_pct', 'change_pct');
+const curr = (obj: any) => val(obj, 'current');
+const prev = (obj: any) => val(obj, 'previous');
+
+// ─── PDF HTML generator ──────────────────────────────────────────────────────
 function pdfHTML(r: any, dark: boolean): string {
   const sc = r.health_score >= 80 ? '#22c55e' : r.health_score >= 60 ? '#f59e0b' : '#ef4444';
-  const metricRows = (r.key_metrics || []).filter((m: any) => m.current && m.current !== 'N/A')
-    .map((m: any) => `<tr>
-      <td style="padding:10px 12px;border-bottom:1px solid ${dark?'#1E2D4A':'#eee'};color:${dark?'#b0c0e0':'#333'};font-size:13px">${m.label}<br/><span style="font-size:11px;color:${dark?'#6B82A8':'#999'}">${m.comment||''}</span></td>
-      <td style="padding:10px 12px;border-bottom:1px solid ${dark?'#1E2D4A':'#eee'};font-weight:700;text-align:right;color:${dark?'#F0F4FF':'#0A0E1A'}">${m.current}</td>
-      <td style="padding:10px 12px;border-bottom:1px solid ${dark?'#1E2D4A':'#eee'};text-align:right;color:${dark?'#6B82A8':'#888'};font-size:12px">${m.previous||'—'}</td>
-      <td style="padding:10px 12px;border-bottom:1px solid ${dark?'#1E2D4A':'#eee'};text-align:right;font-weight:700;font-size:12px;color:${m.trend==='up'?'#22c55e':m.trend==='down'?'#ef4444':'#888'}">${m.change||'—'}</td>
-    </tr>`).join('');
+  const d = dark;
+  const bg   = d ? '#060B18' : '#ffffff';
+  const cardBg = d ? '#0D1426' : '#f8faff';
+  const textC  = d ? '#F0F4FF' : '#0A0E1A';
+  const subC   = d ? '#6B82A8' : '#6b7280';
+  const borderC = d ? '#1E2D4A' : '#e5e7eb';
+  const accentC = d ? '#4F8AFF' : '#0052FF';
 
-  const scoreRows = (r.health_score_breakdown?.components || []).map((c: any) => {
-    const col = c.rating === 'Strong' ? '#22c55e' : c.rating === 'Moderate' ? '#f59e0b' : '#ef4444';
-    const pct = c.max > 0 ? Math.round((c.score / c.max) * 100) : 0;
-    return `<div style="background:${dark?'#111B35':'#f8faff'};border-radius:10px;padding:14px;margin-bottom:10px;border:1px solid ${dark?'#1E2D4A':'#e5e7eb'}">
-      <div style="display:flex;justify-content:space-between;margin-bottom:8px">
-        <span style="font-weight:700;font-size:14px;color:${dark?'#F0F4FF':'#0A0E1A'}">${c.category}</span>
-        <span style="font-weight:700;color:${col}">${c.score}/${c.max} — ${c.rating}</span>
-      </div>
-      <div style="background:${dark?'#1E2D4A':'#e5e7eb'};border-radius:4px;height:6px;margin-bottom:8px">
-        <div style="background:${col};height:6px;border-radius:4px;width:${pct}%"></div>
-      </div>
-      <p style="margin:0;font-size:12px;color:${dark?'#6B82A8':'#555'};line-height:1.6">${c.reasoning}</p>
+  const section = (title: string, body: string) =>
+    `<div style="margin-bottom:28px;page-break-inside:avoid">
+      <div style="font-size:13px;font-weight:800;color:${textC};margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid ${borderC};text-transform:uppercase;letter-spacing:1px">${title}</div>
+      ${body}
     </div>`;
+
+  const pill = (label: string, color: string) =>
+    `<span style="display:inline-block;background:${color}22;color:${color};font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;margin-right:6px">${label}</span>`;
+
+  const table = (rows: string) =>
+    `<table style="width:100%;border-collapse:collapse;font-size:13px">${rows}</table>`;
+
+  const th = (label: string) =>
+    `<th style="background:${cardBg};padding:8px 12px;font-size:11px;color:${subC};text-align:left;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid ${borderC}">${label}</th>`;
+
+  const td = (val: string, right = false, bold = false, color = '') =>
+    `<td style="padding:9px 12px;border-bottom:1px solid ${borderC};${right ? 'text-align:right;' : ''}${bold ? 'font-weight:700;' : ''}color:${color || textC};font-size:13px">${val || '—'}</td>`;
+
+  const statBox = (label: string, value: string, color = accentC) =>
+    `<div style="background:${cardBg};border:1px solid ${borderC};border-radius:10px;padding:14px 16px;display:inline-block;min-width:120px;margin:4px">
+      <div style="font-size:18px;font-weight:800;color:${color}">${value || '—'}</div>
+      <div style="font-size:11px;color:${subC};margin-top:4px">${label}</div>
+    </div>`;
+
+  const li = (arr: any[]) =>
+    (arr || []).filter(Boolean).map(x =>
+      `<li style="margin-bottom:7px;font-size:13px;color:${textC};line-height:1.7">${x}</li>`
+    ).join('');
+
+  // ── Rating badge ──
+  const ratingColor = r.analyst_rating === 'BUY' ? '#22c55e' : r.analyst_rating === 'SELL' ? '#ef4444' : '#f59e0b';
+  const ratingBadge = r.analyst_rating
+    ? `<div style="display:inline-block;background:${ratingColor};color:#fff;font-size:14px;font-weight:900;padding:6px 20px;border-radius:8px;margin-left:12px">${r.analyst_rating}</div>`
+    : '';
+
+  // ── Score breakdown ──
+  const breakdown = r.health_score_breakdown || {};
+  const bKeys = ['revenue_growth','net_margin','ebitda_margin','debt_to_equity','current_ratio','ocf_quality','roe','eps_growth'];
+  const scoreRows = bKeys.map(k => {
+    const c = breakdown[k];
+    if (!c) return '';
+    const col = c.pts >= c.max * 0.7 ? '#22c55e' : c.pts >= c.max * 0.4 ? '#f59e0b' : '#ef4444';
+    const pct = c.max > 0 ? Math.round((c.pts / c.max) * 100) : 0;
+    const label = k.replace(/_/g,' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
+    return `<tr>
+      <td style="padding:10px 12px;border-bottom:1px solid ${borderC};color:${textC};font-size:13px;font-weight:600">${label}</td>
+      <td style="padding:10px 12px;border-bottom:1px solid ${borderC};color:${subC};font-size:12px">${c.value || '—'}</td>
+      <td style="padding:10px 12px;border-bottom:1px solid ${borderC}">
+        <div style="background:${borderC};border-radius:3px;height:5px;width:100px">
+          <div style="background:${col};height:5px;border-radius:3px;width:${pct}%"></div>
+        </div>
+      </td>
+      <td style="padding:10px 12px;border-bottom:1px solid ${borderC};text-align:right;font-weight:800;color:${col}">${c.pts}/${c.max}</td>
+    </tr><tr><td colspan="4" style="padding:4px 12px 10px;border-bottom:1px solid ${borderC};font-size:11px;color:${subC}">${c.reason || ''}</td></tr>`;
   }).join('');
 
-  const li = (arr: string[]) =>
-    (arr || []).map(x => `<li style="margin-bottom:6px;font-size:13px;color:${dark?'#b0c0e0':'#333'};line-height:1.6">${x}</li>`).join('');
+  // ── Key metrics table ──
+  const metricRows = (r.key_metrics || [])
+    .filter((m: any) => m.current && m.current !== 'N/A' && m.current !== '')
+    .map((m: any) => `<tr>
+      ${td(m.metric, false, true)}
+      ${td(m.current, true, true)}
+      ${td(m.previous || '—', true)}
+      ${td(m.change_pct || m.change || '—', true, true, m.change_pct?.includes('-') ? '#ef4444' : '#22c55e')}
+    </tr>`).join('');
+
+  // ── Income statement table ──
+  const is = r.income_statement || {};
+  const isFields = [
+    ['Revenue', is.revenue], ['Other Income', is.other_income], ['Total Income', is.total_income],
+    ['COGS', is.cost_of_goods_sold], ['Gross Profit', is.gross_profit], ['Employee Costs', is.employee_costs],
+    ['EBITDA', is.ebitda], ['Depreciation', is.depreciation], ['EBIT', is.ebit],
+    ['Finance Cost', is.finance_cost], ['PBT', is.pbt], ['Tax', is.tax_expense],
+    ['PAT', is.pat], ['EPS Basic', is.eps_basic], ['EPS Diluted', is.eps_diluted],
+  ];
+  const isRows = isFields.filter(([, obj]) => curr(obj)).map(([label, obj]: any) =>
+    `<tr>${td(label,false,true)}${td(curr(obj)||'—',true,true)}${td(prev(obj)||'—',true)}${td(pct(obj)||'—',true,false,pct(obj)?.includes('-')?'#ef4444':'#22c55e')}</tr>`
+  ).join('');
+
+  // ── Balance sheet ──
+  const bs = r.balance_sheet || {};
+  const bsFields = [
+    ['Total Assets', bs.total_assets], ['Current Assets', bs.current_assets],
+    ['Inventories', bs.inventories], ['Trade Receivables', bs.trade_receivables],
+    ['Cash & Equivalents', bs.cash_equivalents], ['Total Equity', bs.total_equity],
+    ['Reserves & Surplus', bs.reserves_surplus], ['Total Borrowings', bs.total_borrowings],
+    ['LT Borrowings', bs.long_term_borrowings], ['ST Borrowings', bs.short_term_borrowings],
+    ['Trade Payables', bs.trade_payables], ['Current Liabilities', bs.current_liabilities],
+  ];
+  const bsRows = bsFields.filter(([, obj]) => curr(obj)).map(([label, obj]: any) =>
+    `<tr>${td(label,false,true)}${td(curr(obj)||'—',true,true)}${td(prev(obj)||'—',true)}${td(pct(obj)||'—',true,false,pct(obj)?.includes('-')?'#ef4444':'#22c55e')}</tr>`
+  ).join('');
+
+  // ── Cash flow ──
+  const cf = r.cash_flow_statement || {};
+  const cfFields = [
+    ['Operating CF', cf.operating_cash_flow], ['Investing CF', cf.investing_cash_flow],
+    ['Financing CF', cf.financing_cash_flow], ['Capex', cf.capex], ['Free Cash Flow', cf.free_cash_flow],
+  ];
+  const cfRows = cfFields.filter(([, obj]) => curr(obj)).map(([label, obj]: any) =>
+    `<tr>${td(label,false,true)}${td(curr(obj)||'—',true,true)}${td(prev(obj)||'—',true)}<td style="padding:9px 12px;border-bottom:1px solid ${borderC}"></td></tr>`
+  ).join('');
+
+  // ── Ratios ──
+  const pa = r.profitability_analysis || {};
+  const la = r.liquidity_analysis || {};
+  const lv = r.leverage_analysis || {};
+  const rr = r.rates_of_return || {};
+  const ea = r.efficiency_analysis || {};
+
+  // ── Investment thesis ──
+  const thesis = r.investment_thesis || {};
+
+  // ── Segments ──
+  const sa = r.segment_analysis || {};
+  const segRows = (sa.segments || []).filter((s: any) => s.name).map((s: any) =>
+    `<tr>${td(s.name,false,true)}${td(s.revenue||'—',true)}${td(s.revenue_pct_total||'—',true)}${td(s.ebit||'—',true)}${td(s.ebit_margin||'—',true)}</tr>`
+  ).join('');
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,'Segoe UI',sans-serif;background:${dark?'#060B18':'#fff'};color:${dark?'#F0F4FF':'#0A0E1A'};-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:820px;margin:0 auto;padding:40px}.hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:32px;padding-bottom:24px;border-bottom:2px solid ${dark?'#4F8AFF':'#0052FF'}}.logo{font-size:20px;font-weight:900;color:${dark?'#4F8AFF':'#0052FF'}}.sec{margin-bottom:28px;page-break-inside:avoid}.sec-title{font-size:14px;font-weight:700;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid ${dark?'#1E2D4A':'#f0f0f0'}}table{width:100%;border-collapse:collapse}th{background:${dark?'#111B35':'#f8faff'};padding:8px 12px;font-size:11px;color:${dark?'#6B82A8':'#888'};text-align:left;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid ${dark?'#1E2D4A':'#eee'}}.foot{text-align:center;color:${dark?'#3A5080':'#999'};font-size:11px;margin-top:40px;padding-top:20px;border-top:1px solid ${dark?'#1E2D4A':'#eee'}}ul{padding-left:20px;margin:8px 0}@page{margin:0.5in}</style></head>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;background:${bg};color:${textC};-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .page{max-width:860px;margin:0 auto;padding:48px 40px}
+  table{width:100%;border-collapse:collapse}
+  ul{padding-left:18px;margin:6px 0}
+  @page{margin:0.5in}
+  @media print{.page{padding:0}}
+</style></head>
 <body><div class="page">
-  <div class="hdr">
-    <div><div class="logo">📊 FinSight</div><div style="font-size:12px;color:${dark?'#6B82A8':'#888'};margin-top:4px">AI Financial Analysis Report</div></div>
+
+  <!-- Header -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:36px;padding-bottom:24px;border-bottom:3px solid ${accentC}">
+    <div>
+      <div style="font-size:22px;font-weight:900;color:${accentC};letter-spacing:-0.5px">📊 FinSight</div>
+      <div style="font-size:12px;color:${subC};margin-top:4px">AI Equity Research Report</div>
+    </div>
     <div style="text-align:right">
-      <div style="font-size:20px;font-weight:800">${r.company_name||'Analysis'}</div>
-      <div style="font-size:13px;color:${dark?'#6B82A8':'#666'};margin-top:4px">${r.statement_type||''} · ${r.period||''} · ${r.currency||''}</div>
-      <div style="font-size:11px;color:${dark?'#3A5080':'#999'};margin-top:4px">Generated ${new Date().toLocaleDateString('en-IN',{day:'numeric',month:'long',year:'numeric'})}</div>
+      <div style="font-size:22px;font-weight:900;color:${textC}">${r.company_name || 'Analysis'}${ratingBadge}</div>
+      <div style="font-size:13px;color:${subC};margin-top:5px">${r.ticker || ''} ${r.exchange ? '· ' + r.exchange : ''} ${r.statement_type ? '· ' + r.statement_type : ''}</div>
+      <div style="font-size:13px;color:${subC};margin-top:3px">${r.period || ''} · ${r.unit || ''} · ${r.reporting_currency || 'INR'}</div>
+      <div style="font-size:11px;color:${subC};margin-top:5px">Generated ${new Date().toLocaleDateString('en-IN',{day:'numeric',month:'long',year:'numeric'})}</div>
     </div>
   </div>
-  <div style="text-align:center;background:${dark?'#0D1426':'#f4f7ff'};border-radius:20px;padding:32px;margin-bottom:28px;border:1px solid ${dark?'#1E2D4A':'#e5e7eb'}">
-    <div style="font-size:12px;color:${dark?'#6B82A8':'#888'};text-transform:uppercase;letter-spacing:2px;margin-bottom:12px">Financial Health Score</div>
-    <div style="font-size:80px;font-weight:900;color:${sc};line-height:1;letter-spacing:-3px">${r.health_score}<span style="font-size:30px;color:${dark?'#3A5080':'#ccc'}">/100</span></div>
-    <div style="display:inline-block;background:${sc}25;color:${sc};font-weight:700;font-size:17px;padding:6px 20px;border-radius:30px;margin-top:12px">${r.health_label}</div>
+
+  <!-- Headline -->
+  ${r.headline ? `<div style="font-size:16px;font-weight:700;color:${textC};background:${cardBg};border-left:4px solid ${accentC};padding:14px 18px;border-radius:0 10px 10px 0;margin-bottom:28px;line-height:1.5">${r.headline}</div>` : ''}
+
+  <!-- Health Score -->
+  <div style="text-align:center;background:${cardBg};border-radius:18px;padding:36px;margin-bottom:28px;border:1px solid ${borderC}">
+    <div style="font-size:11px;color:${subC};text-transform:uppercase;letter-spacing:3px;margin-bottom:12px">Financial Health Score</div>
+    <div style="font-size:90px;font-weight:900;color:${sc};line-height:1;letter-spacing:-4px">${r.health_score}<span style="font-size:32px;color:${subC}">/100</span></div>
+    ${pill(r.health_label || '', sc)}
+    ${r.analyst_rating ? `<div style="margin-top:16px">${pill('Analyst: ' + r.analyst_rating, ratingColor)}</div>` : ''}
   </div>
-  ${scoreRows ? `<div class="sec"><div class="sec-title">📐 Score Breakdown</div>${scoreRows}</div>` : ''}
-  <div class="sec"><div class="sec-title">📋 Executive Summary</div><p style="font-size:14px;line-height:1.9;color:${dark?'#b0c0e0':'#333'}">${r.executive_summary||''}</p></div>
-  ${r.investor_verdict ? `<div class="sec"><div class="sec-title">💡 Verdict</div><div style="background:${dark?'#0D1D3A':'#eef4ff'};border-left:3px solid ${dark?'#4F8AFF':'#0052FF'};padding:14px 18px;border-radius:0 10px 10px 0;font-size:13px;line-height:1.8;color:${dark?'#b0c0e0':'#333'}">${r.investor_verdict}</div></div>` : ''}
-  ${metricRows ? `<div class="sec"><div class="sec-title">📊 Key Metrics</div><table><tr><th>Metric</th><th style="text-align:right">Current</th><th style="text-align:right">Previous</th><th style="text-align:right">Change</th></tr>${metricRows}</table></div>` : ''}
-  ${r.highlights?.length ? `<div class="sec"><div class="sec-title">✅ Strengths</div><ul>${li(r.highlights)}</ul></div>` : ''}
-  ${r.risks?.length ? `<div class="sec"><div class="sec-title">⚠️ Risks</div><ul>${li(r.risks)}</ul></div>` : ''}
-  ${r.what_to_watch?.length ? `<div class="sec"><div class="sec-title">🔭 Watch</div><ul>${li(r.what_to_watch)}</ul></div>` : ''}
-  <div class="foot">Generated by FinSight · finsight-vert.vercel.app · ${dark?'Dark':'Light'} Theme · Not financial advice</div>
+
+  <!-- Score Breakdown -->
+  ${scoreRows ? section('📐 Score Breakdown', `<table><thead><tr>${th('Component')}${th('Value')}${th('Score Bar')}${th('Pts')}</tr></thead><tbody>${scoreRows}</tbody></table>`) : ''}
+
+  <!-- Analyst Rating Rationale -->
+  ${r.analyst_rating_rationale ? section('🎯 Investment Recommendation', `<div style="background:${cardBg};border-left:4px solid ${ratingColor};padding:14px 18px;border-radius:0 10px 10px 0;font-size:14px;line-height:1.8;color:${textC}">${r.analyst_rating_rationale}</div>`) : ''}
+
+  <!-- Executive Summary -->
+  ${r.executive_summary ? section('📋 Executive Summary', `<p style="font-size:14px;line-height:1.9;color:${textC}">${r.executive_summary}</p>`) : ''}
+
+  <!-- Investment Thesis -->
+  ${(thesis.bull_case || thesis.bear_case) ? section('⚖️ Investment Thesis', `
+    ${thesis.bull_case ? `<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:800;color:#22c55e;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">🐂 Bull Case</div><p style="font-size:13px;line-height:1.8;color:${textC}">${thesis.bull_case}</p></div>` : ''}
+    ${thesis.bear_case ? `<div style="margin-bottom:14px"><div style="font-size:12px;font-weight:800;color:#ef4444;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">🐻 Bear Case</div><p style="font-size:13px;line-height:1.8;color:${textC}">${thesis.bear_case}</p></div>` : ''}
+    ${thesis.key_monitorables?.length ? `<div><div style="font-size:12px;font-weight:800;color:${subC};text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Key Monitorables</div><ul>${li(thesis.key_monitorables)}</ul></div>` : ''}
+  `) : ''}
+
+  <!-- Key Metrics -->
+  ${metricRows ? section('📊 Key Metrics', table(`<thead><tr>${th('Metric')}${th('Current')}${th('Previous')}${th('YoY Δ')}</tr></thead><tbody>${metricRows}</tbody>`)) : ''}
+
+  <!-- Income Statement -->
+  ${isRows ? section('📈 Income Statement', table(`<thead><tr>${th('Line Item')}${th('Current')}${th('Previous')}${th('YoY %')}</tr></thead><tbody>${isRows}</tbody>`)) : ''}
+
+  <!-- Balance Sheet -->
+  ${bsRows ? section('🏦 Balance Sheet', table(`<thead><tr>${th('Line Item')}${th('Current')}${th('Previous')}${th('YoY %')}</tr></thead><tbody>${bsRows}</tbody>`)) : ''}
+
+  <!-- Cash Flow -->
+  ${cfRows ? section('💰 Cash Flow Statement', table(`<thead><tr>${th('Line Item')}${th('Current')}${th('Previous')}${th('')}</tr></thead><tbody>${cfRows}</tbody>`)) : ''}
+
+  <!-- Profitability -->
+  ${pa.commentary ? section('💹 Profitability Analysis', `
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px">
+      ${pa.gross_margin_pct ? statBox('Gross Margin', pa.gross_margin_pct + '%', '#22c55e') : ''}
+      ${pa.ebitda_margin_pct ? statBox('EBITDA Margin', pa.ebitda_margin_pct + '%', '#4F8AFF') : ''}
+      ${pa.net_profit_margin_pct ? statBox('Net Margin', pa.net_profit_margin_pct + '%', '#f59e0b') : ''}
+      ${pa.roe_pct ? statBox('ROE', pa.roe_pct + '%', '#22c55e') : ''}
+      ${pa.roa_pct ? statBox('ROA', pa.roa_pct + '%', '#22c55e') : ''}
+      ${pa.roic_pct ? statBox('ROIC', pa.roic_pct + '%', '#22c55e') : ''}
+      ${pa.roce_pct ? statBox('ROCE', pa.roce_pct + '%', '#22c55e') : ''}
+    </div>
+    <p style="font-size:13px;line-height:1.8;color:${textC}">${pa.commentary}</p>
+  `) : ''}
+
+  <!-- Leverage -->
+  ${lv.commentary ? section('🏗️ Leverage & Debt', `
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px">
+      ${lv.debt_to_equity ? statBox('D/E Ratio', lv.debt_to_equity, '#f59e0b') : ''}
+      ${lv.net_debt_to_ebitda ? statBox('Net Debt/EBITDA', lv.net_debt_to_ebitda, '#f59e0b') : ''}
+      ${lv.interest_coverage_ratio ? statBox('Interest Cover', lv.interest_coverage_ratio + 'x', '#22c55e') : ''}
+      ${lv.net_debt ? statBox('Net Debt', lv.net_debt) : ''}
+    </div>
+    <p style="font-size:13px;line-height:1.8;color:${textC}">${lv.commentary}</p>
+  `) : ''}
+
+  <!-- Liquidity -->
+  ${la.commentary ? section('💧 Liquidity Analysis', `
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px">
+      ${la.current_ratio ? statBox('Current Ratio', la.current_ratio, '#4F8AFF') : ''}
+      ${la.quick_ratio ? statBox('Quick Ratio', la.quick_ratio, '#4F8AFF') : ''}
+      ${la.cash_ratio ? statBox('Cash Ratio', la.cash_ratio, '#4F8AFF') : ''}
+      ${la.net_working_capital ? statBox('Net Working Capital', la.net_working_capital) : ''}
+    </div>
+    <p style="font-size:13px;line-height:1.8;color:${textC}">${la.commentary}</p>
+  `) : ''}
+
+  <!-- Cash Flow Analysis -->
+  ${r.cash_flow_analysis?.commentary ? section('🌊 Cash Flow Quality', `
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px">
+      ${r.cash_flow_analysis.ocf_to_pat_ratio ? statBox('OCF/PAT', r.cash_flow_analysis.ocf_to_pat_ratio + 'x') : ''}
+      ${r.cash_flow_analysis.fcf_margin_pct ? statBox('FCF Margin', r.cash_flow_analysis.fcf_margin_pct + '%') : ''}
+      ${r.cash_flow_analysis.cash_quality ? `<div style="background:${ r.cash_flow_analysis.cash_quality==='Strong'?'#22c55e22':'#f59e0b22'};border:1px solid ${borderC};border-radius:10px;padding:14px 16px;display:inline-block"><div style="font-size:15px;font-weight:800;color:${ r.cash_flow_analysis.cash_quality==='Strong'?'#22c55e':'#f59e0b'}">${r.cash_flow_analysis.cash_quality}</div><div style="font-size:11px;color:${subC};margin-top:4px">Cash Quality</div></div>` : ''}
+    </div>
+    <p style="font-size:13px;line-height:1.8;color:${textC}">${r.cash_flow_analysis.commentary}</p>
+  `) : ''}
+
+  <!-- Efficiency -->
+  ${ea.commentary ? section('⚙️ Efficiency Analysis', `
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px">
+      ${ea.inventory_turnover_days ? statBox('Inventory Days', ea.inventory_turnover_days) : ''}
+      ${ea.receivables_turnover_days ? statBox('Receivable Days', ea.receivables_turnover_days) : ''}
+      ${ea.payables_turnover_days ? statBox('Payable Days', ea.payables_turnover_days) : ''}
+      ${ea.cash_conversion_cycle_days ? statBox('CCC Days', ea.cash_conversion_cycle_days) : ''}
+      ${ea.asset_turnover ? statBox('Asset Turnover', ea.asset_turnover + 'x') : ''}
+    </div>
+    <p style="font-size:13px;line-height:1.8;color:${textC}">${ea.commentary}</p>
+  `) : ''}
+
+  <!-- Segment Analysis -->
+  ${segRows ? section('🏢 Segment Analysis', `
+    ${table(`<thead><tr>${th('Segment')}${th('Revenue')}${th('% of Total')}${th('EBIT')}${th('EBIT Margin')}</tr></thead><tbody>${segRows}</tbody>`)}
+    ${sa.commentary ? `<p style="font-size:13px;line-height:1.8;color:${textC};margin-top:12px">${sa.commentary}</p>` : ''}
+  `) : ''}
+
+  <!-- Horizontal Analysis -->
+  ${r.horizontal_analysis?.notable_trends?.length ? section('📉 Trend Analysis', `
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px">
+      ${r.horizontal_analysis.revenue_growth_yoy_pct ? statBox('Revenue Growth', r.horizontal_analysis.revenue_growth_yoy_pct + '%', '#22c55e') : ''}
+      ${r.horizontal_analysis.pat_growth_yoy_pct ? statBox('PAT Growth', r.horizontal_analysis.pat_growth_yoy_pct + '%', '#22c55e') : ''}
+      ${r.horizontal_analysis.eps_growth_yoy_pct ? statBox('EPS Growth', r.horizontal_analysis.eps_growth_yoy_pct + '%', '#22c55e') : ''}
+    </div>
+    <ul>${li(r.horizontal_analysis.notable_trends)}</ul>
+  `) : ''}
+
+  <!-- Management Commentary -->
+  ${r.management_commentary?.guidance || r.management_commentary?.key_developments?.length ? section('🎙️ Management Commentary', `
+    ${r.management_commentary.guidance ? `<div style="background:${cardBg};border-left:4px solid ${accentC};padding:12px 16px;border-radius:0 10px 10px 0;margin-bottom:12px"><div style="font-size:11px;font-weight:800;color:${accentC};text-transform:uppercase;letter-spacing:1px;margin-bottom:5px">Guidance</div><p style="font-size:13px;line-height:1.8;color:${textC}">${r.management_commentary.guidance}</p></div>` : ''}
+    ${r.management_commentary.key_developments?.length ? `<ul>${li(r.management_commentary.key_developments)}</ul>` : ''}
+  `) : ''}
+
+  <!-- Highlights + Risks + Watch -->
+  ${r.highlights?.length ? section('✅ Key Strengths', `<ul>${li(r.highlights)}</ul>`) : ''}
+  ${r.risks?.length ? section('⚠️ Key Risks', `<ul>${li(r.risks)}</ul>`) : ''}
+  ${r.what_to_watch?.length ? section('🔭 What to Watch', `<ul>${li(r.what_to_watch)}</ul>`) : ''}
+
+  <!-- Peer Context -->
+  ${r.peer_context ? section('🔗 Peer Context', `<p style="font-size:13px;line-height:1.8;color:${textC}">${r.peer_context}</p>`) : ''}
+
+  <!-- Investor Verdict -->
+  ${r.investor_verdict ? section('💡 Investor Verdict', `<div style="background:${cardBg};border-left:4px solid ${accentC};padding:16px 20px;border-radius:0 12px 12px 0;font-size:14px;line-height:1.9;color:${textC}">${r.investor_verdict}</div>`) : ''}
+
+  <!-- Footer -->
+  <div style="text-align:center;color:${subC};font-size:11px;margin-top:48px;padding-top:20px;border-top:1px solid ${borderC}">
+    Generated by FinSight · finsight-vert.vercel.app · ${dark ? 'Dark' : 'Light'} Theme · Not financial advice
+  </div>
+
 </div></body></html>`;
 }
 
+// ─── Main component ──────────────────────────────────────────────────────────
 export default function AnalysisScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const router = useRouter();
@@ -80,8 +329,6 @@ export default function AnalysisScreen() {
   const [dark, setDark] = useState(true);
   const [downloading, setDownloading] = useState(false);
   const [copied, setCopied] = useState(false);
-  
-  // FIX #2: useNativeDriver set to false for web compatibility
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const t = dark ? DARK : LIGHT;
 
@@ -97,193 +344,81 @@ export default function AnalysisScreen() {
       if (!res.ok) throw new Error(`${res.status}`);
       const data = await res.json();
       setAnalysis(data);
-      // useNativeDriver false for web compatibility
       Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: false }).start();
     } catch {
       try {
         const res2 = await fetch(`${BACKEND}/api/public/analyses/${id}`);
         if (res2.ok) {
-          const data2 = await res2.json();
-          setAnalysis(data2);
+          setAnalysis(await res2.json());
           Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: false }).start();
-        } else {
-          setAnalysis(null);
-        }
-      } catch {
-        setAnalysis(null);
-      }
-    } finally {
-      setLoading(false);
-    }
+        } else { setAnalysis(null); }
+      } catch { setAnalysis(null); }
+    } finally { setLoading(false); }
   };
 
-  // FIX #1: Enhanced PDF download with proper error handling and logging
   const handleDownloadPDF = async () => {
     if (!analysis?.result) return;
     setDownloading(true);
     try {
       const company = (analysis.result.company_name || 'FinSight').replace(/[^a-z0-9]/gi, '_');
-      const filename = `${company}_Analysis`;
       const html = pdfHTML(analysis.result, dark);
-
       if (Platform.OS === 'web') {
-        // ── Call OUR backend proxy which calls html2pdf.app server-side ──
-        // This avoids the 403 CORS error from calling html2pdf.app directly in browser
-        console.log('🔄 Calling backend PDF generation endpoint...');
         const response = await fetch(`${BACKEND}/api/generate-pdf`, {
           method: 'POST',
-          headers: { 
-            'Content-Type': 'application/json',
-            'Accept': 'application/pdf'
-          },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/pdf' },
           body: JSON.stringify({ html }),
         });
-
-        console.log('📄 PDF Response status:', response.status);
-
-        if (!response.ok) {
-          const err = await response.text().catch(() => '');
-          console.error('❌ PDF generation error:', err);
-          throw new Error(`PDF generation failed (${response.status}): ${err.substring(0, 100)}`);
-        }
-
+        if (!response.ok) throw new Error(`PDF generation failed (${response.status})`);
         const blob = await response.blob();
-        console.log('✅ PDF blob size:', blob.size, 'bytes');
-        
-        // Verify it's actually a PDF
-        if (blob.size < 1000) {
-          throw new Error('PDF file seems too small, generation may have failed');
-        }
-        
+        if (blob.size < 1000) throw new Error('PDF too small — generation may have failed');
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = url;
-        a.download = `${filename}.pdf`;
-        document.body.appendChild(a);
-        a.click();
-        
-        // Clean up after a short delay
-        setTimeout(() => {
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-        }, 100);
-        
-        console.log('✅ PDF download initiated');
+        a.href = url; a.download = `${company}_Analysis.pdf`;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
       } else {
-        // ── Mobile: expo-print + expo-sharing ──
-        const [PrintModule, SharingModule] = await Promise.all([
-          import('expo-print'),
-          import('expo-sharing'),
-        ]);
+        const [PrintModule, SharingModule] = await Promise.all([import('expo-print'), import('expo-sharing')]);
         const { uri } = await PrintModule.printToFileAsync({ html, base64: false });
         if (await SharingModule.isAvailableAsync()) {
-          await SharingModule.shareAsync(uri, {
-            mimeType: 'application/pdf',
-            dialogTitle: `Save ${filename}.pdf`,
-            UTI: 'com.adobe.pdf',
-          });
+          await SharingModule.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: `Save ${company}.pdf`, UTI: 'com.adobe.pdf' });
         }
       }
     } catch (e: any) {
-      console.error('❌ PDF download error:', e);
-      Alert.alert('Download Failed', e.message || 'Could not generate PDF. Please try again.');
-    } finally {
-      setDownloading(false);
-    }
+      Alert.alert('Download Failed', e.message || 'Could not generate PDF.');
+    } finally { setDownloading(false); }
   };
 
-  // FIX #3: Update share URL to use correct domain
   const shareUrl = `https://finsight-vert.vercel.app/share/${id}`;
 
   const handleCopyLink = async () => {
-    if (Platform.OS === 'web' && navigator?.clipboard) {
-      await navigator.clipboard.writeText(shareUrl).catch(() => {});
-    } else {
-      try { await Share.share({ message: shareUrl }); } catch {}
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 3000);
+    if (Platform.OS === 'web' && navigator?.clipboard) await navigator.clipboard.writeText(shareUrl).catch(() => {});
+    else { try { await Share.share({ message: shareUrl }); } catch {} }
+    setCopied(true); setTimeout(() => setCopied(false), 3000);
   };
 
-  const openURL = (url: string) => {
-    if (Platform.OS === 'web') { window.open(url, '_blank'); }
-    else { Linking.openURL(url).catch(() => {}); }
-  };
-
-  const shareMsg = () => {
+  const handleWhatsAppShare = () => {
     const r = analysis?.result;
-    if (!r) return '';
-    return `📊 ${r.company_name} — Health Score: ${r.health_score}/100 (${r.health_label})\n\n${(r.investor_verdict || '').substring(0, 180)}...\n\nFull analysis: ${shareUrl}`;
+    if (!r) return;
+    const msg = `📊 *${r.company_name}* Financial Analysis\n\n💯 Health Score: *${r.health_score}/100* (${r.health_label})\n${r.analyst_rating ? `🎯 Rating: *${r.analyst_rating}*\n` : ''}\n${(r.investor_verdict || r.executive_summary || '').substring(0, 200)}\n\n📱 Full analysis:\n${shareUrl}\n\n_Powered by FinSight_`;
+    const url = `https://wa.me/?text=${encodeURIComponent(msg)}`;
+    Platform.OS === 'web' ? window.open(url, '_blank') : Linking.openURL(url).catch(() => Alert.alert('Error', 'Could not open WhatsApp'));
   };
 
-  // ✅ WhatsApp Share
-const handleWhatsAppShare = () => {
-  const r = analysis?.result;
-  if (!r) return;
-  
-  const message = `📊 *${r.company_name}* Financial Analysis
-
-💯 Health Score: *${r.health_score}/100* (${r.health_label})
-
-${r.investor_verdict || r.executive_summary || ''}
-
-📱 View full analysis:
-${shareUrl}
-
-_Powered by FinSight_`;
-
-  const url = `https://wa.me/?text=${encodeURIComponent(message)}`;
-  
-  if (Platform.OS === 'web') {
-    window.open(url, '_blank');
-  } else {
-    Linking.openURL(url).catch(() => Alert.alert('Error', 'Could not open WhatsApp'));
-  }
-};
-
-// ✅ Twitter Share
-const handleTwitterShare = () => {
-  const r = analysis?.result;
-  if (!r) return;
-  
-  const tweet = `📊 ${r.company_name} - Financial Health: ${r.health_score}/100 (${r.health_label})
-
-${r.investor_verdict ? r.investor_verdict.substring(0, 100) + '...' : ''}
-
-Full analysis:`;
-
-  const url = `https://twitter.com/intent/tweet?text=${encodeURIComponent(tweet)}&url=${encodeURIComponent(shareUrl)}`;
-  
-  if (Platform.OS === 'web') {
-    window.open(url, '_blank');
-  } else {
-    Linking.openURL(url).catch(() => Alert.alert('Error', 'Could not open Twitter'));
-  }
-};
-
-// ✅ Generic Share
-const handleGenericShare = async () => {
-  const r = analysis?.result;
-  if (!r) return;
-  
-  try {
-    await Share.share({
-      message: `📊 ${r.company_name} - Health Score: ${r.health_score}/100
-
-${r.investor_verdict || ''}
-
-View analysis: ${shareUrl}`,
-      title: `${r.company_name} - Financial Analysis`,
-    });
-  } catch (error) {
-    console.error('Share error:', error);
-  }
-};
-
-  const handleBack = () => {
-    if (router.canGoBack()) router.back();
-    else router.replace('/(tabs)');
+  const handleTwitterShare = () => {
+    const r = analysis?.result;
+    if (!r) return;
+    const tweet = `📊 ${r.company_name} — Health: ${r.health_score}/100 (${r.health_label})${r.analyst_rating ? ` · ${r.analyst_rating}` : ''}\n\n${(r.investor_verdict || '').substring(0, 120)}...\n\nFull analysis:`;
+    const url = `https://twitter.com/intent/tweet?text=${encodeURIComponent(tweet)}&url=${encodeURIComponent(shareUrl)}`;
+    Platform.OS === 'web' ? window.open(url, '_blank') : Linking.openURL(url).catch(() => {});
   };
+
+  const handleGenericShare = async () => {
+    const r = analysis?.result;
+    if (!r) return;
+    try { await Share.share({ message: `📊 ${r.company_name} — ${r.health_score}/100\n${r.investor_verdict || ''}\n\n${shareUrl}`, title: `${r.company_name} — Financial Analysis` }); } catch {}
+  };
+
+  const handleBack = () => { if (router.canGoBack()) router.back(); else router.replace('/(tabs)'); };
 
   if (loading) return (
     <View style={[gs.center, { backgroundColor: t.bg }]}>
@@ -298,89 +433,109 @@ View analysis: ${shareUrl}`,
       <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} />
       <Text style={{ fontSize: 52, marginBottom: 16 }}>📄</Text>
       <Text style={{ color: t.text, fontSize: 22, fontWeight: '800', marginBottom: 8 }}>Analysis Not Found</Text>
-      <Text style={{ color: t.textSub, fontSize: 14, textAlign: 'center', lineHeight: 22, marginBottom: 28, paddingHorizontal: 32 }}>
-        This analysis may have been deleted or the link is incorrect.
-      </Text>
-      <TouchableOpacity style={[gs.btn, { backgroundColor: t.accent }]} onPress={handleBack}>
-        <Text style={gs.btnText}>← Go Back</Text>
-      </TouchableOpacity>
+      <Text style={{ color: t.textSub, fontSize: 14, textAlign: 'center', lineHeight: 22, marginBottom: 28, paddingHorizontal: 32 }}>This analysis may have been deleted or the link is incorrect.</Text>
+      <TouchableOpacity style={[gs.btn, { backgroundColor: t.accent }]} onPress={handleBack}><Text style={gs.btnText}>← Go Back</Text></TouchableOpacity>
     </View>
   );
 
   const r = analysis.result;
   const sc = r.health_score >= 80 ? '#22c55e' : r.health_score >= 60 ? '#f59e0b' : r.health_score >= 40 ? '#ef4444' : '#dc2626';
+  const ratingColor = r.analyst_rating === 'BUY' ? '#22c55e' : r.analyst_rating === 'SELL' ? '#ef4444' : '#f59e0b';
+  const breakdown = r.health_score_breakdown || {};
+  const bKeys = ['revenue_growth','net_margin','ebitda_margin','debt_to_equity','current_ratio','ocf_quality','roe','eps_growth'];
 
+  // ── Sub-components ──
   const Card = ({ title, leftBorder, children }: any) => (
-    <View style={[gs.card, {
-      backgroundColor: t.card,
-      borderColor: leftBorder ? 'transparent' : t.border,
-      borderLeftColor: leftBorder || t.border,
-      borderLeftWidth: leftBorder ? 3 : 1,
-    }]}>
-      {title ? <Text style={[gs.cardTitle, { color: t.text }]}>{title}</Text> : null}
+    <View style={[gs.card, { backgroundColor: t.card, borderColor: leftBorder ? 'transparent' : t.border, borderLeftColor: leftBorder || t.border, borderLeftWidth: leftBorder ? 3 : 1 }]}>
+      {title && <Text style={[gs.cardTitle, { color: t.text }]}>{title}</Text>}
       {children}
     </View>
   );
 
-  const Row = ({ m }: any) => {
-    if (!m?.current || m.current === 'N/A') return null;
-    const tc = m.trend === 'up' ? '#22c55e' : m.trend === 'down' ? '#ef4444' : t.textSub;
+  const Stat = ({ label, value, color }: any) => {
+    if (!value || value === 'N/A' || value === '') return null;
+    return (
+      <View style={[gs.statBox, { backgroundColor: t.cardAlt, borderColor: t.border }]}>
+        <Text style={{ fontSize: 16, fontWeight: '800', color: color || t.accent }}>{value}</Text>
+        <Text style={{ fontSize: 10, color: t.textSub, marginTop: 4, textAlign: 'center', fontWeight: '600' }}>{label}</Text>
+      </View>
+    );
+  };
+
+  const MetricRow = ({ m }: any) => {
+    if (!m?.current || m.current === 'N/A' || m.current === '') return null;
+    const chg = m.change_pct || m.change || '';
+    const isNeg = chg.includes('-');
     return (
       <View style={[gs.row, { borderBottomColor: t.border }]}>
         <View style={{ flex: 1, paddingRight: 8 }}>
-          <Text style={[gs.rowLabel, { color: t.text }]}>{m.label}</Text>
+          <Text style={{ fontSize: 13, fontWeight: '600', color: t.text }}>{m.metric || m.label}</Text>
           {m.comment && m.comment !== 'N/A' && <Text style={{ fontSize: 11, color: t.textSub, marginTop: 2, fontStyle: 'italic' }}>{m.comment}</Text>}
         </View>
-        <View style={{ alignItems: 'flex-end', minWidth: 100 }}>
+        <View style={{ alignItems: 'flex-end', minWidth: 110 }}>
           <Text style={{ fontSize: 14, fontWeight: '800', color: t.text }}>{m.current}</Text>
           {m.previous && m.previous !== 'N/A' && <Text style={{ fontSize: 11, color: t.textSub, marginTop: 2 }}>vs {m.previous}</Text>}
-          {m.change && m.change !== 'N/A' && <Text style={{ fontSize: 12, color: tc, fontWeight: '700', marginTop: 2 }}>{m.trend === 'up' ? '▲' : m.trend === 'down' ? '▼' : ''} {m.change}</Text>}
+          {chg && chg !== 'N/A' && <Text style={{ fontSize: 12, fontWeight: '700', marginTop: 2, color: isNeg ? '#ef4444' : '#22c55e' }}>{isNeg ? '▼' : '▲'} {chg}</Text>}
         </View>
       </View>
     );
   };
 
-  const Stat = ({ label, val, prev, color }: any) => {
-    if (!val || val === 'N/A') return null;
+  const ISRow = ({ label, obj }: any) => {
+    const c = curr(obj); if (!c) return null;
+    const p = prev(obj); const chg = pct(obj);
+    const isNeg = chg?.includes('-');
     return (
-      <View style={[gs.stat, { backgroundColor: t.cardAlt, borderColor: t.border }]}>
-        <Text style={[gs.statVal, { color: color || t.accent }]}>{val}</Text>
-        {prev && prev !== 'N/A' && <Text style={{ fontSize: 10, color: t.textSub, marginTop: 2 }}>vs {prev}</Text>}
-        <Text style={[gs.statLabel, { color: t.textSub }]}>{label}</Text>
+      <View style={[gs.row, { borderBottomColor: t.border }]}>
+        <Text style={{ flex: 1, fontSize: 13, fontWeight: '600', color: t.text }}>{label}</Text>
+        <View style={{ alignItems: 'flex-end', minWidth: 140 }}>
+          <Text style={{ fontSize: 13, fontWeight: '800', color: t.text }}>{c}</Text>
+          {p && <Text style={{ fontSize: 11, color: t.textSub }}>vs {p}</Text>}
+          {chg && <Text style={{ fontSize: 11, fontWeight: '700', color: isNeg ? '#ef4444' : '#22c55e' }}>{isNeg ? '▼' : '▲'} {chg}</Text>}
+        </View>
       </View>
     );
   };
 
-  const ScoreBar = ({ c }: any) => {
-    const col = c.rating === 'Strong' ? '#22c55e' : c.rating === 'Moderate' ? '#f59e0b' : '#ef4444';
-    const pct = c.max > 0 ? (c.score / c.max) * 100 : 0;
+  const ScoreBar = ({ k }: any) => {
+    const c = breakdown[k]; if (!c) return null;
+    const col = c.pts >= c.max * 0.7 ? '#22c55e' : c.pts >= c.max * 0.4 ? '#f59e0b' : '#ef4444';
+    const pct2 = c.max > 0 ? (c.pts / c.max) * 100 : 0;
+    const label = k.replace(/_/g, ' ').replace(/\b\w/g, (l: string) => l.toUpperCase());
     return (
       <View style={[gs.scoreBar, { backgroundColor: t.cardAlt, borderColor: t.border }]}>
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-          <Text style={{ color: t.text, fontSize: 13, fontWeight: '700' }}>{c.category}</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <View style={{ backgroundColor: col + '25', borderRadius: 6, paddingHorizontal: 7, paddingVertical: 2 }}>
-              <Text style={{ color: col, fontSize: 10, fontWeight: '800' }}>{c.rating}</Text>
-            </View>
-            <Text style={{ color: col, fontSize: 13, fontWeight: '800' }}>{c.score}/{c.max}</Text>
-          </View>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <Text style={{ color: t.text, fontSize: 13, fontWeight: '700' }}>{label}</Text>
+          <Text style={{ color: col, fontSize: 13, fontWeight: '800' }}>{c.pts}/{c.max}</Text>
         </View>
-        <View style={{ height: 6, backgroundColor: t.border, borderRadius: 3, overflow: 'hidden', marginBottom: 8 }}>
-          <View style={{ height: 6, backgroundColor: col, borderRadius: 3, width: `${pct}%` as any }} />
+        {c.value ? <Text style={{ fontSize: 12, color: t.accent, marginBottom: 6, fontWeight: '600' }}>{c.value}</Text> : null}
+        <View style={{ height: 5, backgroundColor: t.border, borderRadius: 3, overflow: 'hidden', marginBottom: 6 }}>
+          <View style={{ height: 5, backgroundColor: col, borderRadius: 3, width: `${pct2}%` as any }} />
         </View>
-        <Text style={{ color: t.textSub, fontSize: 12, lineHeight: 18 }}>{c.reasoning}</Text>
+        {c.reason ? <Text style={{ color: t.textSub, fontSize: 12, lineHeight: 17 }}>{c.reason}</Text> : null}
       </View>
     );
   };
 
   const Dot = ({ text, color }: any) => (
     <View style={gs.dotRow}>
-      <View style={[gs.dot, { backgroundColor: color + '25' }]}>
-        <Text style={{ color, fontSize: 10, fontWeight: '800' }}>·</Text>
-      </View>
+      <View style={[gs.dot, { backgroundColor: color + '25' }]}><Text style={{ color, fontSize: 10, fontWeight: '800' }}>·</Text></View>
       <Text style={{ flex: 1, fontSize: 14, lineHeight: 22, color: t.text }}>{text}</Text>
     </View>
   );
+
+  const pa = r.profitability_analysis || {};
+  const la = r.liquidity_analysis || {};
+  const lv = r.leverage_analysis || {};
+  const ea = r.efficiency_analysis || {};
+  const cfa = r.cash_flow_analysis || {};
+  const ha = r.horizontal_analysis || {};
+  const thesis = r.investment_thesis || {};
+  const sa = r.segment_analysis || {};
+  const mc = r.management_commentary || {};
+  const is = r.income_statement || {};
+  const bs = r.balance_sheet || {};
+  const cf = r.cash_flow_statement || {};
 
   return (
     <View style={{ flex: 1, backgroundColor: t.bg }}>
@@ -389,170 +544,266 @@ View analysis: ${shareUrl}`,
 
         {/* Top bar */}
         <View style={[gs.topBar, { borderBottomColor: t.border }]}>
-          <TouchableOpacity onPress={handleBack}>
-            <Text style={[gs.backText, { color: t.accent }]}>← Back</Text>
-          </TouchableOpacity>
+          <TouchableOpacity onPress={handleBack}><Text style={[gs.backText, { color: t.accent }]}>← Back</Text></TouchableOpacity>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
             <Text style={{ fontSize: 18 }}>📊</Text>
             <Text style={{ color: t.accent, fontSize: 17, fontWeight: '900', letterSpacing: -0.5 }}>FinSight</Text>
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
             <Text style={{ fontSize: 14 }}>{dark ? '🌙' : '☀️'}</Text>
-            <Switch value={dark} onValueChange={setDark}
-              trackColor={{ false: '#CBD5E1', true: t.accent }}
-              thumbColor="#fff" style={{ transform: [{ scale: 0.8 }] }} />
+            <Switch value={dark} onValueChange={setDark} trackColor={{ false: '#CBD5E1', true: t.accent }} thumbColor="#fff" style={{ transform: [{ scale: 0.8 }] }} />
           </View>
         </View>
 
         <View style={{ paddingHorizontal: 16 }}>
+
           {/* Company header */}
           <View style={{ paddingTop: 20, paddingBottom: 16 }}>
-            <Text style={{ fontSize: 26, fontWeight: '900', letterSpacing: -0.8, color: t.text, marginBottom: 4 }}>{r.company_name}</Text>
-            <Text style={{ fontSize: 13, color: t.textSub }}>{r.statement_type} · {r.period} · {r.currency}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 6 }}>
+              <Text style={{ fontSize: 26, fontWeight: '900', letterSpacing: -0.8, color: t.text }}>{r.company_name}</Text>
+              {r.analyst_rating && (
+                <View style={{ backgroundColor: ratingColor, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 5 }}>
+                  <Text style={{ color: '#fff', fontSize: 13, fontWeight: '900' }}>{r.analyst_rating}</Text>
+                </View>
+              )}
+            </View>
+            <Text style={{ fontSize: 13, color: t.textSub }}>
+              {[r.ticker, r.exchange, r.statement_type, r.period, r.unit].filter(Boolean).join(' · ')}
+            </Text>
           </View>
 
-          {/* Score card */}
+          {/* Bloomberg headline */}
+          {r.headline && (
+            <View style={{ backgroundColor: t.accentBg, borderLeftWidth: 3, borderLeftColor: t.accent, borderRadius: 12, padding: 14, marginBottom: 14 }}>
+              <Text style={{ fontSize: 14, fontWeight: '700', color: t.text, lineHeight: 21 }}>{r.headline}</Text>
+            </View>
+          )}
+
+          {/* Health score card */}
           <View style={[gs.scoreCard, { backgroundColor: t.card, borderColor: t.border }]}>
-            <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 2, textTransform: 'uppercase', color: t.textSub, marginBottom: 10 }}>FINANCIAL HEALTH SCORE</Text>
+            <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 2, textTransform: 'uppercase', color: t.textSub, marginBottom: 10 }}>Financial Health Score</Text>
             <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
               <Text style={{ fontSize: 82, fontWeight: '900', lineHeight: 90, letterSpacing: -4, color: sc }}>{r.health_score}</Text>
               <Text style={{ fontSize: 28, fontWeight: '600', color: t.textSub, marginBottom: 14 }}>/100</Text>
             </View>
-            <View style={{ borderRadius: 24, paddingHorizontal: 22, paddingVertical: 7, backgroundColor: sc + '20' }}>
+            <View style={{ borderRadius: 24, paddingHorizontal: 22, paddingVertical: 7, backgroundColor: sc + '20', marginBottom: r.analyst_rating ? 10 : 0 }}>
               <Text style={{ fontSize: 16, fontWeight: '800', color: sc }}>{r.health_label}</Text>
             </View>
-            {r.health_score_breakdown?.components?.length > 0 && (
+            {r.analyst_rating_rationale && (
+              <Text style={{ fontSize: 12, color: t.textSub, marginTop: 12, textAlign: 'center', lineHeight: 18 }}>{r.analyst_rating_rationale}</Text>
+            )}
+            {bKeys.some(k => breakdown[k]) && (
               <View style={{ width: '100%', marginTop: 22 }}>
                 <Text style={[gs.cardTitle, { color: t.text, marginBottom: 12 }]}>Score Breakdown</Text>
-                {r.health_score_breakdown.components.map((c: any, i: number) => <ScoreBar key={i} c={c} />)}
+                {bKeys.map(k => <ScoreBar key={k} k={k} />)}
               </View>
             )}
           </View>
 
+          {/* Executive Summary */}
           {r.executive_summary && (
             <Card title="📋 Executive Summary">
               <Text style={{ fontSize: 14, lineHeight: 23, color: t.text }}>{r.executive_summary}</Text>
             </Card>
           )}
 
+          {/* Investment Thesis */}
+          {(thesis.bull_case || thesis.bear_case || thesis.key_monitorables?.length) && (
+            <Card title="⚖️ Investment Thesis">
+              {thesis.bull_case && (
+                <View style={{ marginBottom: 14 }}>
+                  <Text style={{ fontSize: 11, fontWeight: '800', color: '#22c55e', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>🐂 Bull Case</Text>
+                  <Text style={{ fontSize: 13, lineHeight: 21, color: t.text }}>{thesis.bull_case}</Text>
+                </View>
+              )}
+              {thesis.bear_case && (
+                <View style={{ marginBottom: 14 }}>
+                  <Text style={{ fontSize: 11, fontWeight: '800', color: '#ef4444', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>🐻 Bear Case</Text>
+                  <Text style={{ fontSize: 13, lineHeight: 21, color: t.text }}>{thesis.bear_case}</Text>
+                </View>
+              )}
+              {thesis.key_monitorables?.length > 0 && (
+                <View>
+                  <Text style={{ fontSize: 11, fontWeight: '800', color: t.textSub, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>Key Monitorables</Text>
+                  {thesis.key_monitorables.map((item: string, i: number) => <Dot key={i} text={item} color={t.accent} />)}
+                </View>
+              )}
+            </Card>
+          )}
+
+          {/* Investor Verdict */}
           {r.investor_verdict && (
-            <Card title="💡 Plain English Verdict" leftBorder={t.accent}>
+            <Card title="💡 Investor Verdict" leftBorder={t.accent}>
               <View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 16 }}>
                 <Text style={{ fontSize: 14, lineHeight: 23, color: t.text }}>{r.investor_verdict}</Text>
               </View>
             </Card>
           )}
 
-          {r.key_metrics?.filter((m: any) => m.current && m.current !== 'N/A').length > 0 && (
+          {/* Key Metrics */}
+          {r.key_metrics?.filter((m: any) => m.current && m.current !== 'N/A' && m.current !== '').length > 0 && (
             <Card title="📊 Key Metrics">
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: t.border, marginBottom: 4 }}>
                 <Text style={{ fontSize: 10, fontWeight: '700', color: t.textSub, textTransform: 'uppercase', letterSpacing: 0.5 }}>Metric</Text>
                 <Text style={{ fontSize: 10, fontWeight: '700', color: t.textSub, textTransform: 'uppercase', letterSpacing: 0.5 }}>Now · Before · Δ</Text>
               </View>
-              {r.key_metrics.map((m: any, i: number) => <Row key={i} m={m} />)}
+              {r.key_metrics.map((m: any, i: number) => <MetricRow key={i} m={m} />)}
             </Card>
           )}
 
-          {r.profitability?.analysis && (
-            <Card title="💰 Profitability">
-              <Text style={{ fontSize: 14, lineHeight: 23, color: t.text, marginBottom: 14 }}>{r.profitability.analysis}</Text>
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: r.profitability.key_cost_drivers?.length ? 14 : 0 }}>
-                <Stat label="Gross Margin" val={r.profitability.gross_margin_current} prev={r.profitability.gross_margin_previous} />
-                <Stat label="EBITDA Margin" val={r.profitability.ebitda_margin_current} prev={r.profitability.ebitda_margin_previous} />
-                <Stat label="Net Margin" val={r.profitability.net_margin_current} prev={r.profitability.net_margin_previous} />
-                <Stat label="ROE" val={r.profitability.roe} color="#22c55e" />
-                <Stat label="ROA" val={r.profitability.roa} color="#22c55e" />
+          {/* Income Statement */}
+          {curr(is.revenue) && (
+            <Card title="📈 Income Statement">
+              {[
+                ['Revenue', is.revenue], ['Other Income', is.other_income], ['Total Income', is.total_income],
+                ['COGS', is.cost_of_goods_sold], ['Gross Profit', is.gross_profit], ['Employee Costs', is.employee_costs],
+                ['EBITDA', is.ebitda], ['Depreciation', is.depreciation], ['EBIT', is.ebit],
+                ['Finance Cost', is.finance_cost], ['PBT', is.pbt], ['Tax', is.tax_expense],
+                ['PAT', is.pat], ['EPS Basic', is.eps_basic], ['EPS Diluted', is.eps_diluted],
+              ].map(([label, obj]: any, i) => <ISRow key={i} label={label} obj={obj} />)}
+            </Card>
+          )}
+
+          {/* Balance Sheet */}
+          {curr(bs.total_assets) && (
+            <Card title="🏦 Balance Sheet">
+              {[
+                ['Total Assets', bs.total_assets], ['Current Assets', bs.current_assets],
+                ['Inventories', bs.inventories], ['Trade Receivables', bs.trade_receivables],
+                ['Cash & Equivalents', bs.cash_equivalents], ['Total Equity', bs.total_equity],
+                ['Total Borrowings', bs.total_borrowings], ['LT Borrowings', bs.long_term_borrowings],
+                ['ST Borrowings', bs.short_term_borrowings], ['Trade Payables', bs.trade_payables],
+                ['Current Liabilities', bs.current_liabilities],
+              ].map(([label, obj]: any, i) => <ISRow key={i} label={label} obj={obj} />)}
+            </Card>
+          )}
+
+          {/* Cash Flow */}
+          {curr(cf.operating_cash_flow) && (
+            <Card title="💰 Cash Flow Statement">
+              {[
+                ['Operating CF', cf.operating_cash_flow], ['Investing CF', cf.investing_cash_flow],
+                ['Financing CF', cf.financing_cash_flow], ['Capex', cf.capex], ['Free Cash Flow', cf.free_cash_flow],
+              ].map(([label, obj]: any, i) => <ISRow key={i} label={label} obj={obj} />)}
+            </Card>
+          )}
+
+          {/* Profitability */}
+          {pa.commentary && (
+            <Card title="💹 Profitability Analysis">
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                <Stat label="Gross Margin" value={pa.gross_margin_pct ? pa.gross_margin_pct + '%' : null} color="#22c55e" />
+                <Stat label="EBITDA Margin" value={pa.ebitda_margin_pct ? pa.ebitda_margin_pct + '%' : null} color="#4F8AFF" />
+                <Stat label="Net Margin" value={pa.net_profit_margin_pct ? pa.net_profit_margin_pct + '%' : null} color="#f59e0b" />
+                <Stat label="ROE" value={pa.roe_pct ? pa.roe_pct + '%' : null} color="#22c55e" />
+                <Stat label="ROA" value={pa.roa_pct ? pa.roa_pct + '%' : null} color="#22c55e" />
+                <Stat label="ROIC" value={pa.roic_pct ? pa.roic_pct + '%' : null} color="#22c55e" />
+                <Stat label="ROCE" value={pa.roce_pct ? pa.roce_pct + '%' : null} color="#22c55e" />
               </View>
-              {r.profitability.key_cost_drivers?.length > 0 && (
-                <>
-                  <Text style={{ fontSize: 12, fontWeight: '700', color: t.text, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>Cost Drivers</Text>
-                  {r.profitability.key_cost_drivers.map((d: string, i: number) => (
-                    <Text key={i} style={{ fontSize: 13, lineHeight: 22, color: t.textSub, marginBottom: 4 }}>· {d}</Text>
-                  ))}
-                </>
-              )}
+              <Text style={{ fontSize: 14, lineHeight: 22, color: t.text }}>{pa.commentary}</Text>
             </Card>
           )}
 
-          {r.growth?.analysis && (
-            <Card title="📈 Growth">
-              <Text style={{ fontSize: 14, lineHeight: 23, color: t.text, marginBottom: 14 }}>{r.growth.analysis}</Text>
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: r.growth.guidance && r.growth.guidance !== 'N/A' ? 14 : 0 }}>
-                <Stat label="Revenue Growth" val={r.growth.revenue_growth_yoy} color="#22c55e" />
-                <Stat label="Profit Growth" val={r.growth.profit_growth_yoy} color="#22c55e" />
+          {/* Leverage */}
+          {lv.commentary && (
+            <Card title="🏗️ Leverage & Debt">
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                <Stat label="D/E Ratio" value={lv.debt_to_equity} color="#f59e0b" />
+                <Stat label="Net Debt/EBITDA" value={lv.net_debt_to_ebitda} color="#f59e0b" />
+                <Stat label="Interest Cover" value={lv.interest_coverage_ratio ? lv.interest_coverage_ratio + 'x' : null} color="#22c55e" />
+                <Stat label="Net Debt" value={lv.net_debt} />
               </View>
-              {r.growth.guidance && r.growth.guidance !== 'N/A' && (
-                <View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 14 }}>
-                  <Text style={{ fontSize: 12, fontWeight: '700', color: t.accent, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>📌 Management Guidance</Text>
-                  <Text style={{ fontSize: 13, lineHeight: 20, color: t.text }}>{r.growth.guidance}</Text>
-                </View>
-              )}
+              <Text style={{ fontSize: 14, lineHeight: 22, color: t.text }}>{lv.commentary}</Text>
             </Card>
           )}
 
-          {r.liquidity?.analysis && (
-            <Card title="💧 Liquidity & Cash">
-              <Text style={{ fontSize: 14, lineHeight: 23, color: t.text, marginBottom: 14 }}>{r.liquidity.analysis}</Text>
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-                <Stat label="Current Ratio" val={r.liquidity.current_ratio} />
-                <Stat label="Cash" val={r.liquidity.cash_position} />
-                <Stat label="Operating CF" val={r.liquidity.operating_cash_flow} />
-                <Stat label="Free CF" val={r.liquidity.free_cash_flow} />
+          {/* Liquidity */}
+          {la.commentary && (
+            <Card title="💧 Liquidity">
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                <Stat label="Current Ratio" value={la.current_ratio} color="#4F8AFF" />
+                <Stat label="Quick Ratio" value={la.quick_ratio} color="#4F8AFF" />
+                <Stat label="Cash Ratio" value={la.cash_ratio} color="#4F8AFF" />
+                <Stat label="NWC" value={la.net_working_capital} />
               </View>
+              <Text style={{ fontSize: 14, lineHeight: 22, color: t.text }}>{la.commentary}</Text>
             </Card>
           )}
 
-          {r.debt?.analysis && (
-            <Card title="🏦 Debt & Leverage">
-              <Text style={{ fontSize: 14, lineHeight: 23, color: t.text, marginBottom: 14 }}>{r.debt.analysis}</Text>
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: r.debt.debt_trend ? 12 : 0 }}>
-                <Stat label="Total Debt" val={r.debt.total_debt} />
-                <Stat label="D/E" val={r.debt.debt_to_equity} />
-                <Stat label="Interest Coverage" val={r.debt.interest_coverage} />
-              </View>
-              {r.debt.debt_trend && (
-                <View style={{ backgroundColor: r.debt.debt_trend === 'Decreasing' ? '#22c55e15' : r.debt.debt_trend === 'Increasing' ? '#ef444415' : t.cardAlt, borderRadius: 10, padding: 10, alignSelf: 'flex-start' }}>
-                  <Text style={{ color: r.debt.debt_trend === 'Decreasing' ? '#22c55e' : r.debt.debt_trend === 'Increasing' ? '#ef4444' : t.textSub, fontWeight: '700', fontSize: 13 }}>Trend: {r.debt.debt_trend}</Text>
-                </View>
-              )}
-            </Card>
-          )}
-
-          {r.management_commentary && (
-            <Card title="🎙️ Management Commentary">
-              {r.management_commentary.overall_tone && (
-                <View style={{ backgroundColor: r.management_commentary.overall_tone === 'Positive' ? '#22c55e15' : r.management_commentary.overall_tone === 'Concerned' ? '#ef444415' : '#f59e0b15', borderRadius: 10, padding: 10, marginBottom: 14, alignSelf: 'flex-start' }}>
-                  <Text style={{ color: r.management_commentary.overall_tone === 'Positive' ? '#22c55e' : r.management_commentary.overall_tone === 'Concerned' ? '#ef4444' : '#f59e0b', fontWeight: '700', fontSize: 13 }}>Tone: {r.management_commentary.overall_tone}</Text>
-                </View>
-              )}
-              {r.management_commentary.key_points?.map((p: string, i: number) => (
-                <Text key={i} style={{ fontSize: 13, lineHeight: 22, color: t.text, marginBottom: 6 }}>· {p}</Text>
-              ))}
-              {r.management_commentary.outlook_statement && r.management_commentary.outlook_statement !== 'N/A' && (
-                <View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 14, marginTop: 12 }}>
-                  <Text style={{ fontSize: 12, fontWeight: '700', color: t.accent, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 }}>Outlook</Text>
-                  <Text style={{ fontSize: 13, lineHeight: 20, color: t.text }}>{r.management_commentary.outlook_statement}</Text>
-                </View>
-              )}
-            </Card>
-          )}
-
-          {r.segments?.filter((seg: any) => seg.name).length > 0 && (
-            <Card title="🏢 Segments">
-              {r.segments.filter((seg: any) => seg.name).map((seg: any, i: number) => (
-                <View key={i} style={[gs.segCard, { backgroundColor: t.cardAlt, borderColor: t.border }]}>
-                  <Text style={{ color: t.text, fontSize: 14, fontWeight: '700', marginBottom: 8 }}>{seg.name}</Text>
-                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
-                    {seg.revenue && <View style={{ backgroundColor: t.accentBg, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 }}><Text style={{ color: t.accent, fontSize: 11, fontWeight: '700' }}>Rev: {seg.revenue}</Text></View>}
-                    {seg.growth && <View style={{ backgroundColor: '#22c55e20', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 }}><Text style={{ color: '#22c55e', fontSize: 11, fontWeight: '700' }}>↑ {seg.growth}</Text></View>}
-                    {seg.margin && <View style={{ backgroundColor: '#f59e0b20', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 }}><Text style={{ color: '#f59e0b', fontSize: 11, fontWeight: '700' }}>Margin: {seg.margin}</Text></View>}
+          {/* Cash Flow Analysis */}
+          {cfa.commentary && (
+            <Card title="🌊 Cash Flow Quality">
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                <Stat label="OCF/PAT" value={cfa.ocf_to_pat_ratio ? cfa.ocf_to_pat_ratio + 'x' : null} />
+                <Stat label="FCF Margin" value={cfa.fcf_margin_pct ? cfa.fcf_margin_pct + '%' : null} />
+                {cfa.cash_quality && (
+                  <View style={[gs.statBox, { backgroundColor: cfa.cash_quality === 'Strong' ? '#22c55e20' : '#f59e0b20', borderColor: t.border }]}>
+                    <Text style={{ fontSize: 14, fontWeight: '800', color: cfa.cash_quality === 'Strong' ? '#22c55e' : '#f59e0b' }}>{cfa.cash_quality}</Text>
+                    <Text style={{ fontSize: 10, color: t.textSub, marginTop: 4, fontWeight: '600' }}>Cash Quality</Text>
                   </View>
-                  {seg.comment && <Text style={{ fontSize: 12, color: t.textSub }}>{seg.comment}</Text>}
-                </View>
-              ))}
+                )}
+              </View>
+              <Text style={{ fontSize: 14, lineHeight: 22, color: t.text }}>{cfa.commentary}</Text>
             </Card>
           )}
 
+          {/* Efficiency */}
+          {ea.commentary && (
+            <Card title="⚙️ Efficiency Analysis">
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                <Stat label="Inventory Days" value={ea.inventory_turnover_days} />
+                <Stat label="Receivable Days" value={ea.receivables_turnover_days} />
+                <Stat label="Payable Days" value={ea.payables_turnover_days} />
+                <Stat label="CCC Days" value={ea.cash_conversion_cycle_days} />
+                <Stat label="Asset Turnover" value={ea.asset_turnover ? ea.asset_turnover + 'x' : null} />
+              </View>
+              <Text style={{ fontSize: 14, lineHeight: 22, color: t.text }}>{ea.commentary}</Text>
+            </Card>
+          )}
+
+          {/* Segments */}
+          {sa.segments?.filter((s: any) => s.name).length > 0 && (
+            <Card title="🏢 Segment Analysis">
+              {sa.segments.filter((s: any) => s.name).map((s: any, i: number) => (
+                <View key={i} style={[gs.segCard, { backgroundColor: t.cardAlt, borderColor: t.border }]}>
+                  <Text style={{ color: t.text, fontSize: 14, fontWeight: '700', marginBottom: 8 }}>{s.name}</Text>
+                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                    {s.revenue && <View style={{ backgroundColor: t.accentBg, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 }}><Text style={{ color: t.accent, fontSize: 11, fontWeight: '700' }}>Rev: {s.revenue}</Text></View>}
+                    {s.revenue_pct_total && <View style={{ backgroundColor: '#f59e0b20', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 }}><Text style={{ color: '#f59e0b', fontSize: 11, fontWeight: '700' }}>{s.revenue_pct_total} of total</Text></View>}
+                    {s.ebit_margin && <View style={{ backgroundColor: '#22c55e20', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 4 }}><Text style={{ color: '#22c55e', fontSize: 11, fontWeight: '700' }}>Margin: {s.ebit_margin}</Text></View>}
+                  </View>
+                </View>
+              ))}
+              {sa.commentary && <Text style={{ fontSize: 13, color: t.textSub, lineHeight: 20 }}>{sa.commentary}</Text>}
+            </Card>
+          )}
+
+          {/* Horizontal Analysis */}
+          {ha.notable_trends?.length > 0 && (
+            <Card title="📉 Trend Analysis">
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
+                <Stat label="Revenue Growth" value={ha.revenue_growth_yoy_pct ? ha.revenue_growth_yoy_pct + '%' : null} color="#22c55e" />
+                <Stat label="PAT Growth" value={ha.pat_growth_yoy_pct ? ha.pat_growth_yoy_pct + '%' : null} color="#22c55e" />
+                <Stat label="EPS Growth" value={ha.eps_growth_yoy_pct ? ha.eps_growth_yoy_pct + '%' : null} color="#22c55e" />
+              </View>
+              {ha.notable_trends.map((trend: string, i: number) => <Dot key={i} text={trend} color={t.accent} />)}
+            </Card>
+          )}
+
+          {/* Management Commentary */}
+          {(mc.guidance || mc.key_developments?.length) && (
+            <Card title="🎙️ Management Commentary">
+              {mc.guidance && (
+                <View style={{ backgroundColor: t.accentBg, borderLeftWidth: 3, borderLeftColor: t.accent, borderRadius: 10, padding: 14, marginBottom: 14 }}>
+                  <Text style={{ fontSize: 11, fontWeight: '800', color: t.accent, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 }}>Guidance</Text>
+                  <Text style={{ fontSize: 13, lineHeight: 20, color: t.text }}>{mc.guidance}</Text>
+                </View>
+              )}
+              {mc.key_developments?.map((d: string, i: number) => <Dot key={i} text={d} color={t.accent} />)}
+            </Card>
+          )}
+
+          {/* Strengths / Risks / Watch */}
           {r.highlights?.length > 0 && (
             <Card title="✅ Key Strengths">
               {r.highlights.map((h: string, i: number) => <Dot key={i} text={h} color="#22c55e" />)}
@@ -571,49 +822,32 @@ View analysis: ${shareUrl}`,
             </Card>
           )}
 
-          {/* Save & Share Panel */}
+          {/* Peer Context */}
+          {r.peer_context && (
+            <Card title="🔗 Peer Context">
+              <Text style={{ fontSize: 14, lineHeight: 22, color: t.text }}>{r.peer_context}</Text>
+            </Card>
+          )}
+
+          {/* Save & Share */}
           <View style={[gs.sharePanel, { backgroundColor: t.card, borderColor: t.border }]}>
             <Text style={{ fontSize: 10, fontWeight: '800', letterSpacing: 2, textTransform: 'uppercase', color: t.textSub, textAlign: 'center', marginBottom: 18 }}>SAVE & SHARE</Text>
-
-            <TouchableOpacity
-              style={[gs.pdfBtn, { backgroundColor: t.accent, opacity: downloading ? 0.7 : 1 }]}
-              onPress={handleDownloadPDF}
-              disabled={downloading}
-            >
-              {downloading
-                ? <ActivityIndicator color="#fff" />
-                : <>
-                    <Text style={{ fontSize: 22 }}>⬇️</Text>
-                    <View>
-                      <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Download PDF Report</Text>
-                      <Text style={{ color: 'rgba(255,255,255,0.65)', fontSize: 11, marginTop: 2 }}>Saves in {dark ? 'dark' : 'light'} theme</Text>
-                    </View>
-                  </>
-              }
+            <TouchableOpacity style={[gs.pdfBtn, { backgroundColor: t.accent, opacity: downloading ? 0.7 : 1 }]} onPress={handleDownloadPDF} disabled={downloading}>
+              {downloading ? <ActivityIndicator color="#fff" /> : <>
+                <Text style={{ fontSize: 22 }}>⬇️</Text>
+                <View>
+                  <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Download Full PDF Report</Text>
+                  <Text style={{ color: 'rgba(255,255,255,0.65)', fontSize: 11, marginTop: 2 }}>Institutional-grade · {dark ? 'Dark' : 'Light'} theme</Text>
+                </View>
+              </>}
             </TouchableOpacity>
-
             <View style={{ flexDirection: 'row', gap: 10, marginBottom: 12 }}>
-              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#25D366' }]} onPress={handleWhatsAppShare}>
-                <Text style={{ fontSize: 18, marginBottom: 3 }}>💬</Text>
-                <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>WhatsApp</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#000' }]} onPress={handleTwitterShare}>
-                <Text style={{ fontSize: 18, marginBottom: 3 }}>𝕏</Text>
-                <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Twitter</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#0052FF' }]} onPress={handleGenericShare}>
-                <Text style={{ fontSize: 18, marginBottom: 3 }}>📤</Text>
-                <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Share</Text>
-              </TouchableOpacity>
+              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#25D366' }]} onPress={handleWhatsAppShare}><Text style={{ fontSize: 18, marginBottom: 3 }}>💬</Text><Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>WhatsApp</Text></TouchableOpacity>
+              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: '#000' }]} onPress={handleTwitterShare}><Text style={{ fontSize: 18, marginBottom: 3 }}>𝕏</Text><Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Twitter</Text></TouchableOpacity>
+              <TouchableOpacity style={[gs.shareBtn, { backgroundColor: t.accent }]} onPress={handleGenericShare}><Text style={{ fontSize: 18, marginBottom: 3 }}>📤</Text><Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Share</Text></TouchableOpacity>
             </View>
-
-            <TouchableOpacity
-              style={[gs.copyBtn, { borderColor: copied ? '#22c55e' : t.accent, backgroundColor: copied ? '#22c55e15' : t.accentBg }]}
-              onPress={handleCopyLink}
-            >
-              <Text style={{ color: copied ? '#22c55e' : t.accent, fontSize: 15, fontWeight: '700' }}>
-                {copied ? '✅ Link Copied!' : '🔗 Copy Shareable Link'}
-              </Text>
+            <TouchableOpacity style={[gs.copyBtn, { borderColor: copied ? '#22c55e' : t.accent, backgroundColor: copied ? '#22c55e15' : t.accentBg }]} onPress={handleCopyLink}>
+              <Text style={{ color: copied ? '#22c55e' : t.accent, fontSize: 15, fontWeight: '700' }}>{copied ? '✅ Link Copied!' : '🔗 Copy Shareable Link'}</Text>
               {!copied && <Text style={{ color: t.textSub, fontSize: 11, marginTop: 4, textAlign: 'center' }}>Anyone can open this — no login needed</Text>}
             </TouchableOpacity>
           </View>
@@ -639,10 +873,7 @@ const gs = StyleSheet.create({
   scoreCard:  { borderRadius: 22, padding: 24, alignItems: 'center', marginBottom: 14, borderWidth: 1 },
   scoreBar:   { borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1 },
   row:        { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 11, borderBottomWidth: 1 },
-  rowLabel:   { fontSize: 13, fontWeight: '600' },
-  stat:       { borderRadius: 14, padding: 14, minWidth: '30%', flex: 1, alignItems: 'center', borderWidth: 1 },
-  statVal:    { fontSize: 16, fontWeight: '800', letterSpacing: -0.5 },
-  statLabel:  { fontSize: 10, marginTop: 5, textAlign: 'center', fontWeight: '600' },
+  statBox:    { borderRadius: 14, padding: 14, minWidth: '30%', flex: 1, alignItems: 'center', borderWidth: 1 },
   dotRow:     { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 12 },
   dot:        { width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center', marginRight: 12, marginTop: 1, flexShrink: 0 },
   segCard:    { borderRadius: 14, padding: 14, marginBottom: 10, borderWidth: 1 },
