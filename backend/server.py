@@ -11,6 +11,13 @@ import motor.motor_asyncio
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import pypdf
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("yfinance not installed — run: pip install yfinance")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -1404,6 +1411,216 @@ Financial document:
     raise Exception(f"All AI providers failed. {error_summary}")
 
 
+# ─── YAHOO FINANCE HELPERS ───────────────────────────────────────────────────
+
+# Simple in-memory TTL cache: { symbol: (timestamp, data) }
+_yf_cache: dict = {}
+_YF_CACHE_TTL = 300   # 5 minutes
+
+def _yf_ticker_symbol(symbol: str) -> str:
+    """
+    Convert an NSE symbol to Yahoo Finance ticker.
+    NSE symbols use .NS suffix; BSE use .BO suffix.
+    BSE-only symbols are prefixed BSE_ in our DB.
+    """
+    sym = symbol.upper().strip()
+    if sym.startswith("BSE_"):
+        # BSE-only — use .BO suffix with the numeric code
+        return sym.replace("BSE_", "") + ".BO"
+    return sym + ".NS"
+
+
+def _safe_val(info: dict, *keys):
+    """Return first non-None value from info dict for given keys."""
+    for k in keys:
+        v = info.get(k)
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _fmt_large(val) -> str:
+    """Format large numbers into readable crore / lakh strings."""
+    try:
+        v = float(val)
+        if abs(v) >= 1e11:
+            return f"₹{v/1e7:,.2f} Cr"
+        if abs(v) >= 1e7:
+            return f"₹{v/1e7:,.2f} Cr"
+        if abs(v) >= 1e5:
+            return f"₹{v/1e5:,.2f} L"
+        return str(round(v, 2))
+    except (TypeError, ValueError):
+        return str(val) if val is not None else "N/A"
+
+
+def _fetch_yf_quote(ticker_sym: str) -> dict:
+    """
+    Synchronous yfinance fetch — runs inside ThreadPoolExecutor.
+    Returns a clean, frontend-ready dict.
+    """
+    if not YFINANCE_AVAILABLE:
+        raise Exception("yfinance is not installed on this server. Run: pip install yfinance")
+
+    ticker = yf.Ticker(ticker_sym)
+    info   = ticker.info or {}
+
+    # Detect missing / delisted
+    if not info or info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
+        raise Exception(f"No data found for {ticker_sym}. The symbol may be delisted or unsupported by Yahoo Finance.")
+
+    price       = _safe_val(info, "currentPrice", "regularMarketPrice", "previousClose")
+    prev_close  = _safe_val(info, "previousClose", "regularMarketPreviousClose")
+    open_price  = _safe_val(info, "open", "regularMarketOpen")
+    day_high    = _safe_val(info, "dayHigh", "regularMarketDayHigh")
+    day_low     = _safe_val(info, "dayLow", "regularMarketDayLow")
+    week52_high = _safe_val(info, "fiftyTwoWeekHigh")
+    week52_low  = _safe_val(info, "fiftyTwoWeekLow")
+    volume      = _safe_val(info, "volume", "regularMarketVolume")
+    avg_volume  = _safe_val(info, "averageVolume", "averageDailyVolume10Day")
+    market_cap  = _safe_val(info, "marketCap")
+    pe_ratio    = _safe_val(info, "trailingPE", "forwardPE")
+    pb_ratio    = _safe_val(info, "priceToBook")
+    div_yield   = _safe_val(info, "dividendYield")
+    eps         = _safe_val(info, "trailingEps", "epsTrailingTwelveMonths")
+    beta        = _safe_val(info, "beta")
+    roe         = _safe_val(info, "returnOnEquity")
+    roa         = _safe_val(info, "returnOnAssets")
+    revenue     = _safe_val(info, "totalRevenue")
+    net_income  = _safe_val(info, "netIncomeToCommon")
+    gross_margins     = _safe_val(info, "grossMargins")
+    operating_margins = _safe_val(info, "operatingMargins")
+    profit_margins    = _safe_val(info, "profitMargins")
+    debt_to_equity    = _safe_val(info, "debtToEquity")
+    current_ratio     = _safe_val(info, "currentRatio")
+    quick_ratio       = _safe_val(info, "quickRatio")
+    free_cashflow     = _safe_val(info, "freeCashflow")
+    operating_cashflow= _safe_val(info, "operatingCashflow")
+    book_value        = _safe_val(info, "bookValue")
+
+    # Calculate day change
+    day_change = day_change_pct = None
+    if price is not None and prev_close:
+        try:
+            day_change     = round(float(price) - float(prev_close), 2)
+            day_change_pct = round((day_change / float(prev_close)) * 100, 2)
+        except (TypeError, ValueError):
+            pass
+
+    # 52-week position (0–100%)
+    week52_position = None
+    if week52_high and week52_low and price:
+        try:
+            rng = float(week52_high) - float(week52_low)
+            if rng > 0:
+                week52_position = round(((float(price) - float(week52_low)) / rng) * 100, 1)
+        except (TypeError, ValueError):
+            pass
+
+    # Historical close for sparkline (last 30 trading days)
+    sparkline = []
+    try:
+        hist = ticker.history(period="1mo", interval="1d")
+        if not hist.empty:
+            sparkline = [round(float(v), 2) for v in hist["Close"].dropna().tolist()]
+    except Exception:
+        pass
+
+    return {
+        "symbol":          ticker_sym,
+        "exchange":        "NSE" if ticker_sym.endswith(".NS") else "BSE",
+        "company_name":    _safe_val(info, "longName", "shortName") or ticker_sym,
+        "sector":          _safe_val(info, "sector"),
+        "industry":        _safe_val(info, "industry"),
+        "currency":        _safe_val(info, "currency") or "INR",
+
+        # Price data
+        "price":           price,
+        "prev_close":      prev_close,
+        "open":            open_price,
+        "day_high":        day_high,
+        "day_low":         day_low,
+        "day_change":      day_change,
+        "day_change_pct":  day_change_pct,
+        "week_52_high":    week52_high,
+        "week_52_low":     week52_low,
+        "week_52_position_pct": week52_position,
+        "volume":          volume,
+        "avg_volume":      avg_volume,
+
+        # Valuation
+        "market_cap":      market_cap,
+        "market_cap_fmt":  _fmt_large(market_cap),
+        "pe_ratio":        round(float(pe_ratio), 2) if pe_ratio else None,
+        "pb_ratio":        round(float(pb_ratio), 2) if pb_ratio else None,
+        "book_value":      round(float(book_value), 2) if book_value else None,
+        "eps":             round(float(eps), 2) if eps else None,
+        "beta":            round(float(beta), 2) if beta else None,
+
+        # Dividend
+        "dividend_yield_pct": round(float(div_yield) * 100, 2) if div_yield else None,
+
+        # Profitability
+        "gross_margin_pct":     round(float(gross_margins) * 100, 2) if gross_margins else None,
+        "operating_margin_pct": round(float(operating_margins) * 100, 2) if operating_margins else None,
+        "net_margin_pct":       round(float(profit_margins) * 100, 2) if profit_margins else None,
+        "roe_pct":              round(float(roe) * 100, 2) if roe else None,
+        "roa_pct":              round(float(roa) * 100, 2) if roa else None,
+
+        # Financial health
+        "debt_to_equity":    round(float(debt_to_equity), 2) if debt_to_equity else None,
+        "current_ratio":     round(float(current_ratio), 2) if current_ratio else None,
+        "quick_ratio":       round(float(quick_ratio), 2) if quick_ratio else None,
+        "free_cashflow":     free_cashflow,
+        "free_cashflow_fmt": _fmt_large(free_cashflow),
+        "operating_cashflow":     operating_cashflow,
+        "operating_cashflow_fmt": _fmt_large(operating_cashflow),
+
+        # Scale
+        "total_revenue":     revenue,
+        "total_revenue_fmt": _fmt_large(revenue),
+        "net_income":        net_income,
+        "net_income_fmt":    _fmt_large(net_income),
+
+        # Sparkline
+        "sparkline_30d": sparkline,
+
+        "data_source": "Yahoo Finance (yfinance)",
+        "fetched_at":  datetime.utcnow().isoformat() + "Z",
+    }
+
+
+async def get_yf_quote(symbol: str) -> dict:
+    """
+    Async wrapper around _fetch_yf_quote with TTL cache.
+    Tries .NS first; falls back to .BO if no price found.
+    """
+    sym_upper = symbol.upper().strip()
+    cached = _yf_cache.get(sym_upper)
+    if cached:
+        ts, data = cached
+        if (datetime.utcnow() - ts).total_seconds() < _YF_CACHE_TTL:
+            logger.info(f"YF cache hit for {sym_upper}")
+            return data
+
+    loop = asyncio.get_event_loop()
+
+    # Try NSE (.NS) first, then BSE (.BO)
+    ns_ticker = _yf_ticker_symbol(sym_upper)
+    try:
+        data = await loop.run_in_executor(executor, _fetch_yf_quote, ns_ticker)
+    except Exception as e_ns:
+        logger.warning(f"YF .NS failed for {sym_upper}: {e_ns} — trying .BO")
+        bo_ticker = sym_upper + ".BO"
+        try:
+            data = await loop.run_in_executor(executor, _fetch_yf_quote, bo_ticker)
+        except Exception as e_bo:
+            raise Exception(f"Yahoo Finance: No data for {sym_upper}. NS error: {e_ns} | BO error: {e_bo}")
+
+    _yf_cache[sym_upper] = (datetime.utcnow(), data)
+    return data
+
+
 # ─── ROUTES ──────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
@@ -1411,7 +1628,208 @@ async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat(),
             "gemini": bool(GEMINI_API_KEY), "groq": bool(GROQ_API_KEY),
             "openrouter": bool(os.getenv("OPENROUTER_API_KEY")),
+            "yfinance": YFINANCE_AVAILABLE,
             "companies_in_db": company_count}
+
+
+# ─── YAHOO FINANCE ROUTES ─────────────────────────────────────────────────────
+
+@app.get("/api/quote/{symbol}")
+async def get_quote(symbol: str):
+    """
+    Live market quote for a given NSE/BSE symbol via Yahoo Finance.
+    Returns price, valuation multiples, margins, ratios, and 30-day sparkline.
+    Data is cached for 5 minutes to avoid rate limits.
+
+    Example: GET /api/quote/RELIANCE
+    """
+    sym = symbol.upper().strip()
+    if not sym:
+        raise HTTPException(400, "Symbol is required")
+    try:
+        data = await get_yf_quote(sym)
+        return data
+    except Exception as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/quote/{symbol}/history")
+async def get_quote_history(symbol: str, period: str = "1y", interval: str = "1d"):
+    """
+    Historical OHLCV data for charting.
+    period options : 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max
+    interval options: 1m, 5m, 15m, 30m, 60m, 1d, 1wk, 1mo
+
+    Example: GET /api/quote/TCS/history?period=6mo&interval=1d
+    """
+    if not YFINANCE_AVAILABLE:
+        raise HTTPException(503, "yfinance not installed on this server")
+
+    sym = symbol.upper().strip()
+    valid_periods   = {"1d","5d","1mo","3mo","6mo","1y","2y","5y","10y","ytd","max"}
+    valid_intervals = {"1m","2m","5m","15m","30m","60m","90m","1h","1d","5d","1wk","1mo","3mo"}
+    if period not in valid_periods:
+        raise HTTPException(400, f"Invalid period '{period}'. Valid: {sorted(valid_periods)}")
+    if interval not in valid_intervals:
+        raise HTTPException(400, f"Invalid interval '{interval}'. Valid: {sorted(valid_intervals)}")
+
+    ticker_sym = _yf_ticker_symbol(sym)
+    loop = asyncio.get_event_loop()
+
+    def _fetch_history():
+        ticker = yf.Ticker(ticker_sym)
+        hist   = ticker.history(period=period, interval=interval)
+        if hist.empty:
+            raise Exception(f"No historical data for {ticker_sym}")
+        records = []
+        for ts, row in hist.iterrows():
+            records.append({
+                "date":   ts.strftime("%Y-%m-%d") if interval in ("1d","1wk","1mo","3mo") else ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                "open":   round(float(row["Open"]),  2) if row["Open"]   == row["Open"] else None,
+                "high":   round(float(row["High"]),  2) if row["High"]   == row["High"] else None,
+                "low":    round(float(row["Low"]),   2) if row["Low"]    == row["Low"]  else None,
+                "close":  round(float(row["Close"]), 2) if row["Close"]  == row["Close"] else None,
+                "volume": int(row["Volume"]) if row["Volume"] == row["Volume"] else None,
+            })
+        return records
+
+    try:
+        records = await loop.run_in_executor(executor, _fetch_history)
+        return {
+            "symbol":   sym,
+            "ticker":   ticker_sym,
+            "period":   period,
+            "interval": interval,
+            "count":    len(records),
+            "data":     records,
+            "fetched_at": datetime.utcnow().isoformat() + "Z",
+        }
+    except Exception as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/quote/{symbol}/financials")
+async def get_financials(symbol: str):
+    """
+    Structured annual financials from Yahoo Finance:
+    Income Statement, Balance Sheet, and Cash Flow (last 4 years).
+
+    Example: GET /api/quote/INFY/financials
+    """
+    if not YFINANCE_AVAILABLE:
+        raise HTTPException(503, "yfinance not installed on this server")
+
+    sym        = symbol.upper().strip()
+    ticker_sym = _yf_ticker_symbol(sym)
+    loop       = asyncio.get_event_loop()
+
+    def _fetch_financials():
+        ticker = yf.Ticker(ticker_sym)
+
+        def _df_to_records(df):
+            if df is None or df.empty:
+                return []
+            records = []
+            for col in df.columns:
+                row = {"period": str(col.date()) if hasattr(col, "date") else str(col)}
+                for idx in df.index:
+                    val = df.loc[idx, col]
+                    try:
+                        row[str(idx)] = None if val != val else round(float(val), 2)
+                    except (TypeError, ValueError):
+                        row[str(idx)] = str(val)
+                records.append(row)
+            return records
+
+        return {
+            "income_statement": _df_to_records(ticker.financials),
+            "balance_sheet":    _df_to_records(ticker.balance_sheet),
+            "cash_flow":        _df_to_records(ticker.cashflow),
+        }
+
+    try:
+        data = await loop.run_in_executor(executor, _fetch_financials)
+        return {
+            "symbol":     sym,
+            "ticker":     ticker_sym,
+            "source":     "Yahoo Finance",
+            "fetched_at": datetime.utcnow().isoformat() + "Z",
+            **data,
+        }
+    except Exception as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/api/quotes/batch")
+async def get_batch_quotes(body: dict):
+    """
+    Fetch live quotes for multiple symbols in one call.
+    Body: { "symbols": ["RELIANCE", "TCS", "INFY"] }
+    Returns a dict keyed by symbol. Errors per symbol are included without failing the whole batch.
+
+    Example: POST /api/quotes/batch  { "symbols": ["RELIANCE","TCS"] }
+    """
+    symbols: list = body.get("symbols", [])
+    if not symbols or not isinstance(symbols, list):
+        raise HTTPException(400, "Body must be { \"symbols\": [\"SYM1\", ...] }")
+    if len(symbols) > 20:
+        raise HTTPException(400, "Maximum 20 symbols per batch request")
+
+    results = {}
+    tasks   = {sym.upper().strip(): get_yf_quote(sym.upper().strip()) for sym in symbols if sym.strip()}
+
+    for sym, coro in tasks.items():
+        try:
+            results[sym] = await coro
+        except Exception as e:
+            results[sym] = {"symbol": sym, "error": str(e), "status": "failed"}
+
+    return {
+        "count":      len(results),
+        "results":    results,
+        "fetched_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/api/market/movers")
+async def get_market_movers():
+    """
+    Top gainers and losers among Nifty 50 stocks (live from Yahoo Finance).
+    Cached for 5 minutes.
+    """
+    NIFTY50 = [
+        "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","ITC","SBIN",
+        "BHARTIARTL","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","SUNPHARMA",
+        "TITAN","ULTRACEMCO","BAJFINANCE","WIPRO","NESTLEIND","HCLTECH","TECHM",
+        "POWERGRID","NTPC","TATAMOTORS","ADANIENT","JSWSTEEL","GRASIM","TATASTEEL",
+        "ADANIPORTS","ONGC","BAJAJFINSV","BRITANNIA","EICHERMOT","BPCL","COALINDIA",
+        "DIVISLAB","DRREDDY","CIPLA","APOLLOHOSP","HEROMOTOCO","INDUSINDBK","M&M",
+        "SHREECEM","UPL","TATACONSUM","BAJAJ-AUTO","HINDALCO","SBILIFE","HDFCLIFE"
+    ]
+
+    quotes = []
+    # Fetch in parallel using asyncio.gather with error isolation
+    async def _safe_quote(sym):
+        try:
+            return await get_yf_quote(sym)
+        except Exception:
+            return None
+
+    results = await asyncio.gather(*[_safe_quote(s) for s in NIFTY50])
+    quotes  = [r for r in results if r and r.get("day_change_pct") is not None]
+
+    quotes.sort(key=lambda x: x.get("day_change_pct", 0), reverse=True)
+    gainers = [{"symbol": q["symbol"].replace(".NS",""), "name": q["company_name"],
+                "price": q["price"], "change_pct": q["day_change_pct"]} for q in quotes[:5]]
+    losers  = [{"symbol": q["symbol"].replace(".NS",""), "name": q["company_name"],
+                "price": q["price"], "change_pct": q["day_change_pct"]} for q in quotes[-5:][::-1]]
+
+    return {
+        "gainers":    gainers,
+        "losers":     losers,
+        "universe":   "Nifty 50",
+        "fetched_at": datetime.utcnow().isoformat() + "Z",
+    }
 
 @app.post("/api/admin/sync-companies")
 async def trigger_sync():
