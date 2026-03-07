@@ -429,36 +429,68 @@ def extract_tables_from_pdf(raw_bytes: bytes):
 def parse_financial_metrics(tables):
     """
     Extract key financial metrics from tables.
+    Covers all major financial analysis types:
+    Vertical, Horizontal, Leverage, Liquidity, Profitability,
+    Efficiency, Cash Flow, Rates of Return, Valuation, Variance.
     """
 
     metrics = defaultdict(str)
 
     keywords = {
-        "revenue": [
-            "revenue",
-            "total income",
-            "income from operations"
-        ],
-        "net_profit": [
-            "net profit",
-            "profit after tax",
-            "pat"
-        ],
-        "ebitda": [
-            "ebitda"
-        ],
-        "eps": [
-            "earnings per share",
-            "eps"
-        ],
-        "total_assets": [
-            "total assets"
-        ],
-        "borrowings": [
-            "borrowings",
-            "total debt",
-            "loans"
-        ]
+        # ── Income Statement ──────────────────────────────────────────
+        "revenue": ["revenue", "total income", "income from operations", "net sales", "revenue from operations"],
+        "revenue_previous": ["previous revenue", "prior year revenue"],
+        "gross_profit": ["gross profit", "gross income"],
+        "ebitda": ["ebitda", "operating profit before depreciation"],
+        "ebit": ["ebit", "operating profit"],
+        "net_profit": ["net profit", "profit after tax", "pat", "profit for the period"],
+        "pbt": ["profit before tax", "pbt"],
+        "other_income": ["other income"],
+        "finance_cost": ["finance cost", "interest expense", "finance charges"],
+        "depreciation": ["depreciation", "amortisation", "amortization", "d&a"],
+        "tax_expense": ["tax expense", "income tax", "provision for tax"],
+        "eps_basic": ["basic eps", "basic earnings per share"],
+        "eps_diluted": ["diluted eps", "diluted earnings per share", "earnings per share", "eps"],
+
+        # ── Balance Sheet ─────────────────────────────────────────────
+        "total_assets": ["total assets"],
+        "current_assets": ["current assets", "total current assets"],
+        "non_current_assets": ["non-current assets", "non current assets", "fixed assets"],
+        "cash_equivalents": ["cash and cash equivalents", "cash & cash equivalents", "cash and bank"],
+        "inventory": ["inventories", "inventory", "stock in trade"],
+        "accounts_receivable": ["trade receivables", "accounts receivable", "debtors"],
+        "total_liabilities": ["total liabilities"],
+        "current_liabilities": ["current liabilities", "total current liabilities"],
+        "non_current_liabilities": ["non-current liabilities", "non current liabilities"],
+        "borrowings": ["borrowings", "total debt", "loans", "long-term borrowings", "short-term borrowings"],
+        "total_equity": ["total equity", "shareholders equity", "net worth", "stockholders equity"],
+        "reserves_surplus": ["reserves and surplus", "reserves & surplus"],
+        "share_capital": ["share capital", "equity capital"],
+
+        # ── Cash Flow ────────────────────────────────────────────────
+        "operating_cash_flow": ["cash flow from operating", "net cash from operations", "operating cash flow", "ocf"],
+        "investing_cash_flow": ["cash flow from investing", "investing activities"],
+        "financing_cash_flow": ["cash flow from financing", "financing activities"],
+        "free_cash_flow": ["free cash flow", "fcf"],
+        "capex": ["capital expenditure", "capex", "purchase of fixed assets", "additions to property"],
+
+        # ── Ratios (if directly stated in the document) ───────────────
+        "current_ratio": ["current ratio"],
+        "quick_ratio": ["quick ratio", "acid test ratio", "acid-test ratio"],
+        "debt_equity_ratio": ["debt to equity", "debt/equity", "d/e ratio"],
+        "debt_ebitda_ratio": ["debt/ebitda", "debt to ebitda"],
+        "interest_coverage": ["interest coverage", "interest cover", "ebit/interest"],
+        "inventory_turnover": ["inventory turnover", "stock turnover"],
+        "asset_turnover": ["asset turnover", "total asset turnover"],
+        "roe": ["return on equity", "roe"],
+        "roa": ["return on assets", "roa"],
+        "roic": ["return on invested capital", "roic", "return on capital employed", "roce"],
+        "gross_margin": ["gross margin", "gross profit margin"],
+        "ebitda_margin": ["ebitda margin"],
+        "net_margin": ["net profit margin", "net margin", "pat margin"],
+        "dividend_yield": ["dividend yield"],
+        "book_value": ["book value per share", "bvps", "net asset value per share"],
+        "price_earnings": ["price to earnings", "p/e ratio", "pe ratio"],
     }
 
     for table in tables:
@@ -469,10 +501,13 @@ def parse_financial_metrics(tables):
 
             for metric, keys in keywords.items():
 
+                if metrics.get(metric):   # already found — skip
+                    continue
+
                 if any(k in row_text for k in keys):
 
                     numbers = re.findall(
-                        r'\d[\d,\.]*',
+                        r'-?\d[\d,\.]*',
                         row_text
                     )
 
@@ -482,6 +517,120 @@ def parse_financial_metrics(tables):
     logger.info(f"Extracted metrics: {dict(metrics)}")
 
     return dict(metrics)
+
+
+def compute_financial_ratios(metrics: dict) -> dict:
+    """
+    Compute derived financial ratios from raw extracted metrics.
+    Covers Vertical, Leverage, Liquidity, Profitability, Efficiency, and Cash Flow analysis.
+    Returns only ratios that can be computed from available data.
+    """
+
+    def _to_float(val: str) -> Optional[float]:
+        if not val:
+            return None
+        try:
+            return float(str(val).replace(",", "").replace("%", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    def _pct(num, denom) -> Optional[str]:
+        n, d = _to_float(num), _to_float(denom)
+        if n is not None and d and d != 0:
+            return f"{round((n / d) * 100, 2)}%"
+        return None
+
+    def _ratio(num, denom, decimals=2) -> Optional[str]:
+        n, d = _to_float(num), _to_float(denom)
+        if n is not None and d and d != 0:
+            return str(round(n / d, decimals))
+        return None
+
+    ratios: dict = {}
+
+    rev  = metrics.get("revenue")
+    pat  = metrics.get("net_profit")
+    ebitda = metrics.get("ebitda")
+    ebit = metrics.get("ebit")
+    gross  = metrics.get("gross_profit")
+    debt   = metrics.get("borrowings")
+    equity = metrics.get("total_equity")
+    curr_a = metrics.get("current_assets")
+    curr_l = metrics.get("current_liabilities")
+    cash   = metrics.get("cash_equivalents")
+    inv    = metrics.get("inventory")
+    recv   = metrics.get("accounts_receivable")
+    assets = metrics.get("total_assets")
+    ocf    = metrics.get("operating_cash_flow")
+    fin_cost = metrics.get("finance_cost")
+    rev_prev = metrics.get("revenue_previous")
+
+    # ── Profitability Ratios ─────────────────────────────────────────
+    r = _pct(gross, rev)
+    if r: ratios["gross_margin_pct"] = r
+
+    r = _pct(ebitda, rev)
+    if r: ratios["ebitda_margin_pct"] = r
+
+    r = _pct(ebit, rev)
+    if r: ratios["ebit_margin_pct"] = r
+
+    r = _pct(pat, rev)
+    if r: ratios["net_profit_margin_pct"] = r
+
+    r = _pct(pat, equity)
+    if r: ratios["return_on_equity_pct"] = r
+
+    r = _pct(pat, assets)
+    if r: ratios["return_on_assets_pct"] = r
+
+    # ── Leverage Ratios ──────────────────────────────────────────────
+    r = _ratio(debt, equity)
+    if r: ratios["debt_to_equity"] = r
+
+    r = _ratio(debt, ebitda)
+    if r: ratios["debt_to_ebitda"] = r
+
+    # Interest coverage = EBIT / Finance Cost
+    r = _ratio(ebit or ebitda, fin_cost)
+    if r: ratios["interest_coverage_ratio"] = r
+
+    # ── Liquidity Ratios ─────────────────────────────────────────────
+    r = _ratio(curr_a, curr_l)
+    if r: ratios["current_ratio"] = r
+
+    # Quick ratio = (Current Assets - Inventory) / Current Liabilities
+    ca_f = _to_float(curr_a)
+    inv_f = _to_float(inv) or 0.0
+    cl_f  = _to_float(curr_l)
+    if ca_f is not None and cl_f and cl_f != 0:
+        ratios["quick_ratio"] = str(round((ca_f - inv_f) / cl_f, 2))
+
+    # Cash ratio
+    r = _ratio(cash, curr_l)
+    if r: ratios["cash_ratio"] = r
+
+    # ── Efficiency Ratios ────────────────────────────────────────────
+    r = _ratio(rev, assets)
+    if r: ratios["asset_turnover"] = r
+
+    r = _ratio(rev, inv)
+    if r: ratios["inventory_turnover"] = r
+
+    # Operating cash flow to current liabilities
+    r = _ratio(ocf, curr_l)
+    if r: ratios["ocf_to_current_liabilities"] = r
+
+    # ── Horizontal Analysis (YoY Revenue Growth) ─────────────────────
+    if rev and rev_prev:
+        rev_f  = _to_float(rev)
+        prev_f = _to_float(rev_prev)
+        if rev_f is not None and prev_f and prev_f != 0:
+            growth = ((rev_f - prev_f) / abs(prev_f)) * 100
+            ratios["revenue_growth_yoy_pct"] = f"{round(growth, 2)}%"
+
+    logger.info(f"Computed ratios: {ratios}")
+    return ratios
 
 def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
     """
@@ -740,112 +889,235 @@ def build_prompt(text: str) -> str:
         )
 
     return f"""
-You are FinSight — an institutional-grade equity research analyst.
+You are FinSight — an institutional-grade equity research analyst specialising in Indian listed companies.
 
-Your job is to analyze financial statements from Indian listed companies and produce an investor-grade report.
+Your job is to analyse financial statements and produce a comprehensive, investor-grade report covering ALL major types of financial analysis.
 
 ━━━━━━━━━━━━━━━━━━
 CRITICAL RULES
 ━━━━━━━━━━━━━━━━━━
 
 1. Use ONLY numbers that appear in the document.
-2. NEVER fabricate data.
-3. If a metric does not exist in the document, write:
-   "Not available in this filing".
-4. Always scan the FULL document before deciding data is unavailable.
-5. Copy numbers EXACTLY as they appear.
+2. NEVER fabricate or estimate data.
+3. If a metric is not in the document, write: "Not available in this filing".
+4. Scan the FULL document before declaring any data unavailable.
+5. Copy numbers EXACTLY as they appear — preserve commas and decimals.
 
 Example:
-If document shows:
-20,078.39
-
-Do NOT write:
-2007.8
-20078
-20.07
-
-Write exactly:
-20,078.39
+Document shows: 20,078.39
+Write exactly:  20,078.39  (not 2007.8, not 20078, not 20.07)
 
 ━━━━━━━━━━━━━━━━━━
-FINANCIAL EXTRACTION RULES
+WHAT IS FINANCIAL ANALYSIS?
 ━━━━━━━━━━━━━━━━━━
 
-Search the document carefully for the following sections:
-
-Income Statement keywords:
-- Revenue
-- Total Income
-- Income from Operations
-- Sales
-
-Profit keywords:
-- Net Profit
-- Profit After Tax
-- PAT
-
-Operating metrics:
-- EBITDA
-- Operating Profit
-- Operating Margin
-
-Balance sheet metrics:
-- Total Assets
-- Total Liabilities
-- Net Worth
-- Borrowings
-- Debt
-
-Cash flow metrics:
-- Cash Flow from Operating Activities
-- Net Cash from Operations
-
-EPS keywords:
-- Earnings Per Share
-- Basic EPS
-- Diluted EPS
+Financial analysis examines a company's financial data to understand its health, performance, and potential
+to improve decision-making. Ratios are preferred over individual numbers because they reveal relationships
+between figures. Past data is used to make projections. Key stakeholders — investors, analysts, lenders,
+auditors — all use financial analysis to assess whether a company is healthy, well-run, and fairly valued.
 
 ━━━━━━━━━━━━━━━━━━
-CALCULATIONS
+EXTRACTION TARGETS
 ━━━━━━━━━━━━━━━━━━
 
-Calculate if possible:
+Extract every available figure from these categories:
 
-Net Margin = Net Profit / Revenue
+INCOME STATEMENT
+  Revenue / Total Income / Income from Operations / Net Sales
+  Gross Profit
+  EBITDA / Operating Profit
+  EBIT
+  Finance Cost / Interest Expense
+  Depreciation & Amortisation
+  Profit Before Tax (PBT)
+  Net Profit / Profit After Tax (PAT)
+  Basic EPS / Diluted EPS
 
-EBITDA Margin = EBITDA / Revenue
+BALANCE SHEET
+  Total Assets | Current Assets | Non-Current Assets
+  Cash & Cash Equivalents
+  Inventories | Trade Receivables
+  Total Liabilities | Current Liabilities | Non-Current Liabilities
+  Borrowings / Total Debt
+  Total Equity / Net Worth / Shareholders' Equity
+  Reserves & Surplus | Share Capital
 
-Revenue Growth =
-(Current Revenue - Previous Revenue) / Previous Revenue
+CASH FLOW
+  Operating Cash Flow (OCF)
+  Investing Cash Flow
+  Financing Cash Flow
+  Free Cash Flow (FCF)
+  Capital Expenditure (CapEx)
 
 ━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT
+ANALYSIS FRAMEWORK — APPLY ALL 8 TYPES
 ━━━━━━━━━━━━━━━━━━
 
-Return ONLY valid JSON.
+1. VERTICAL ANALYSIS
+   Express each P&L line as % of Revenue; Balance Sheet lines as % of Total Assets.
+   Compare against industry norms where possible.
+   Flag if any cost exceeds typical benchmarks (e.g. COGS > 60% of revenue).
+
+2. HORIZONTAL ANALYSIS (Trend Analysis)
+   Calculate YoY and multi-period % changes for Revenue, Net Profit, EBITDA, Total Assets.
+   Identify: Revenue growing faster/slower than costs, AR growing faster than sales,
+   inventory outpacing sales, unusual spikes or drops.
+
+3. LEVERAGE ANALYSIS
+   Debt-to-Equity Ratio = Total Debt / Total Equity
+   Debt-to-EBITDA Ratio = Total Debt / EBITDA
+   Interest Coverage Ratio (EBIT / Finance Cost)
+   Flag if D/E > 2.0 or interest coverage < 2.0x as risk signals.
+
+4. LIQUIDITY ANALYSIS
+   Current Ratio = Current Assets / Current Liabilities  (healthy: >1.5)
+   Quick Ratio   = (Current Assets - Inventory) / Current Liabilities  (healthy: >1.0)
+   Cash Ratio    = Cash / Current Liabilities
+   Interpret the company's ability to meet short-term obligations.
+
+5. PROFITABILITY ANALYSIS
+   Gross Margin     = Gross Profit / Revenue
+   EBITDA Margin    = EBITDA / Revenue
+   EBIT Margin      = EBIT / Revenue
+   Net Profit Margin = Net Profit / Revenue
+   Return on Equity (ROE) = Net Profit / Total Equity
+   Return on Assets (ROA) = Net Profit / Total Assets
+
+6. EFFICIENCY ANALYSIS
+   Asset Turnover    = Revenue / Total Assets
+   Inventory Turnover = Revenue / Inventory
+   OCF-to-Current-Liabilities = OCF / Current Liabilities
+   Assess how effectively the company converts assets into revenue.
+
+7. CASH FLOW ANALYSIS
+   Is Operating Cash Flow positive and growing?
+   FCF = OCF - CapEx. Is FCF sufficient to fund dividends and growth?
+   Is the company funding operations through debt or its own cash flows?
+   Cash quality: Is PAT backed by strong OCF (OCF/PAT ratio)?
+
+8. RATES OF RETURN & VALUATION SIGNALS
+   ROE, ROA, ROIC (if data allows).
+   EPS trend (Basic and Diluted). Is EPS growing?
+   Note if valuation multiples (P/E, P/B) are mentioned.
+
+━━━━━━━━━━━━━━━━━━
+HEALTH SCORE CRITERIA
+━━━━━━━━━━━━━━━━━━
+
+Score the company 0–100 based on:
+- Revenue growth trend (+10 points if growing YoY)
+- Net profit margin (>10% = 15pts, 5–10% = 10pts, 0–5% = 5pts, negative = 0pts)
+- EBITDA margin (>20% = 15pts, 10–20% = 10pts, <10% = 5pts)
+- Debt-to-Equity (0–0.5 = 15pts, 0.5–1.5 = 10pts, 1.5–2.5 = 5pts, >2.5 = 0pts)
+- Current Ratio (>2 = 10pts, 1–2 = 7pts, <1 = 0pts)
+- OCF positive = 10pts
+- ROE >15% = 10pts, 10–15% = 7pts, <10% = 3pts
+- EPS growth = 5pts
+
+Labels: 0–40 = "Caution", 41–60 = "Fair", 61–75 = "Good", 76–90 = "Strong", 91–100 = "Exceptional"
+
+━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT — RETURN ONLY VALID JSON
+━━━━━━━━━━━━━━━━━━
 
 {{
-"company_name": "",
-"statement_type": "",
-"period": "",
+  "company_name": "",
+  "statement_type": "",
+  "period": "",
 
-"health_score": 0,
-"health_label": "",
+  "health_score": 0,
+  "health_label": "",
 
-"headline": "",
+  "headline": "",
+  "executive_summary": "",
 
-"executive_summary": "",
+  "key_metrics": [
+    {{"metric": "Revenue",            "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "Gross Profit",       "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "EBITDA",             "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "EBIT",               "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "Net Profit (PAT)",   "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "EPS (Basic)",        "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "Total Assets",       "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "Total Equity",       "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "Total Debt",         "current": "", "previous": "", "change": "", "comment": ""}},
+    {{"metric": "Operating Cash Flow","current": "", "previous": "", "change": "", "comment": ""}}
+  ],
 
-"key_metrics": [
-{{"metric":"Revenue","current":"","previous":"","change":"","comment":""}},
-{{"metric":"Net Profit","current":"","previous":"","change":"","comment":""}},
-{{"metric":"EBITDA","current":"","previous":"","change":"","comment":""}},
-{{"metric":"EPS","current":"","previous":"","change":"","comment":""}}
-],
+  "vertical_analysis": {{
+    "gross_margin_pct": "",
+    "ebitda_margin_pct": "",
+    "ebit_margin_pct": "",
+    "net_profit_margin_pct": "",
+    "cost_of_revenue_pct": "",
+    "finance_cost_pct_revenue": "",
+    "commentary": ""
+  }},
 
-"highlights": [],
-"risks": [],
-"what_to_watch": []
+  "horizontal_analysis": {{
+    "revenue_growth_yoy": "",
+    "net_profit_growth_yoy": "",
+    "ebitda_growth_yoy": "",
+    "total_assets_growth_yoy": "",
+    "notable_trends": []
+  }},
+
+  "leverage_analysis": {{
+    "debt_to_equity": "",
+    "debt_to_ebitda": "",
+    "interest_coverage_ratio": "",
+    "total_debt": "",
+    "commentary": ""
+  }},
+
+  "liquidity_analysis": {{
+    "current_ratio": "",
+    "quick_ratio": "",
+    "cash_ratio": "",
+    "net_working_capital": "",
+    "commentary": ""
+  }},
+
+  "profitability_analysis": {{
+    "gross_margin": "",
+    "ebitda_margin": "",
+    "net_profit_margin": "",
+    "roe": "",
+    "roa": "",
+    "commentary": ""
+  }},
+
+  "efficiency_analysis": {{
+    "asset_turnover": "",
+    "inventory_turnover": "",
+    "ocf_to_current_liabilities": "",
+    "commentary": ""
+  }},
+
+  "cash_flow_analysis": {{
+    "operating_cash_flow": "",
+    "free_cash_flow": "",
+    "capex": "",
+    "ocf_to_pat_ratio": "",
+    "cash_quality": "",
+    "commentary": ""
+  }},
+
+  "rates_of_return": {{
+    "roe": "",
+    "roa": "",
+    "roic": "",
+    "eps_basic": "",
+    "eps_diluted": "",
+    "eps_growth_yoy": "",
+    "commentary": ""
+  }},
+
+  "highlights": [],
+  "risks": [],
+  "what_to_watch": [],
+
+  "investor_verdict": ""
 }}
 
 ━━━━━━━━━━━━━━━━━━
@@ -1102,22 +1374,24 @@ async def run_analysis(text: str) -> dict:
             logger.info(f"Trying {provider_name}...")
             tables = extract_tables_from_pdf(text.encode())
             metrics = parse_financial_metrics(tables)
-            
+            ratios  = compute_financial_ratios(metrics)
+
             logger.info(f"Structured metrics extracted: {metrics}")
+            logger.info(f"Computed ratios: {ratios}")
 
-             enhanced_text = f"""
-        Extracted financial metrics:
+            enhanced_text = f"""
+Extracted financial metrics:
 
-        {json.dumps(metrics, indent=2)}
+{json.dumps(metrics, indent=2)}
 
-        Computed financial ratios:
+Computed financial ratios (cross-check your calculations against these):
 
-        {json.dumps(ratios, indent=2)}
+{json.dumps(ratios, indent=2)}
 
-        Financial document:
+Financial document:
 
-        {text}
-        """
+{text}
+"""
             result = await loop.run_in_executor(executor, func, enhanced_text)
             logger.info(f"{provider_name} succeeded!")
             return result
