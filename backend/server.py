@@ -29,6 +29,17 @@ executor = ThreadPoolExecutor(max_workers=4)
 app = FastAPI(title="FinSight API v13")
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
+# Explicit CORSMiddleware (belt) + custom middleware (suspenders)
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
 @app.middleware("http")
 async def cors_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
@@ -36,15 +47,14 @@ async def cors_middleware(request: Request, call_next):
         r.headers.update({
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS,PATCH",
-            "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
+            "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept,X-Requested-With",
+            "Access-Control-Max-Age": "86400",
         })
         return r
     response = await call_next(request)
-    response.headers.update({
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS,PATCH",
-        "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
-    })
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS,PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type,Accept,X-Requested-With"
     return response
 
 # ─── DB ──────────────────────────────────────────────────────────────────────
@@ -752,286 +762,292 @@ def split_into_chunks(text, size=12000, overlap=1200):
     logger.info(f"Split document into {len(chunks)} chunks of ~{size} chars")
     return chunks
 
-
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
-    """Institutional-grade analyst prompt — forces real numbers from document."""
     snippet = text[:max_doc_chars]
     logger.info(f"build_prompt: {len(snippet):,} chars (from {len(text):,} total)")
+    return f"""Analyze the provided financial document and return ONLY one valid JSON object. Do not include markdown, explanations, code fences, or additional commentary. The response must strictly conform to the JSON schema provided below.
 
-    json_schema = """{
-  "company_name": "exact legal name from document",
-  "statement_type": "Annual Report / Quarterly Results / Half-Year Results",
-  "period": "e.g. FY2024-25 / Q3FY25 / H1FY25",
-  "currency": "INR Crores / INR Lakhs / USD Millions",
+ANALYTICAL OBJECTIVE
+Produce an institutional-grade equity research assessment suitable for professional investors. The analysis must interpret financial performance, identify hidden signals, and explain what the data implies for capital allocation decisions. The final output should resemble analysis prepared by a senior equity research analyst at a global investment bank.
+
+CORE PRINCIPLES
+Interpret numbers rather than merely restating them. Always explain what the data implies about the company's underlying business performance.
+Contextualize metrics within the company's business model and industry structure.
+Identify non-obvious signals such as margin trends, working capital shifts, leverage changes, or capital allocation patterns.
+Avoid vague language. Use precise statements supported by extracted numbers.
+Assume the analysis will inform real investment decisions and maintain analytical rigor.
+Highlight risks even when performance appears strong to maintain intellectual honesty.
+
+DATA EXTRACTION PROTOCOL
+Before performing analysis, scan the entire document for financial data.
+Search the entire document for each metric. Only state "Not reported" when the metric cannot be derived from any section.
+
+Recognize alternate metric names:
+Total Assets may appear as Assets or Balance Sheet Total.
+Total Debt may appear as Borrowings, Loans, or Debt Securities.
+Operating Cash Flow may appear as Net Cash from Operating Activities.
+Interest Coverage may need to be calculated using EBIT divided by Finance Costs.
+Free Cash Flow equals Operating Cash Flow minus Capex.
+
+Sector-specific adjustments:
+For NBFC or financial institutions, Total Debt equals Debt Securities plus Borrowings plus Subordinated Liabilities.
+For defense or PSU companies, carefully examine order book disclosures, government contracts, and advances from customers because these determine revenue visibility.
+
+DERIVED METRICS
+Calculate ratios whenever raw inputs are available.
+ROE = Net Profit divided by Total Equity
+ROA = Net Profit divided by Total Assets
+Debt to Equity = Total Debt divided by Total Equity
+Interest Coverage = EBIT divided by Finance Costs
+Current Ratio = Current Assets divided by Current Liabilities
+Free Cash Flow = Operating Cash Flow minus Capex
+Do not leave ratios blank if they can be calculated.
+
+SCORING FRAMEWORK
+
+Profitability (0-20):
+Strong (score 20): ROE >20% AND Net Margin >15%
+Average (score 12): ROE 12-20% OR Net Margin 8-15%
+Weak (score 5): ROE <12% OR Net Margin <8%
+
+Growth (0-15):
+Strong (score 15): Revenue growth >20% AND Profit growth >25%
+Average (score 9): Revenue growth 10-20% AND Profit growth 10-25%
+Weak (score 4): Revenue growth <10% OR Profit growth <10%
+
+Balance Sheet (0-15):
+Strong (score 15): Debt-to-Equity <0.5
+Average (score 9): Debt-to-Equity 0.5-1.5
+Weak (score 3): Debt-to-Equity >1.5
+
+Liquidity (0-10):
+Strong (score 10): Current Ratio >1.5
+Average (score 6): Current Ratio 1.0-1.5
+Weak (score 2): Current Ratio <1.0
+
+Cash Flow (0-15):
+Strong (score 15): Operating cash flow exceeds net profit
+Average (score 9): Operating cash flow approximately equal to net profit
+Weak (score 3): Operating cash flow materially below net profit
+
+Governance & Risk (0-15):
+Strong (score 15): Clean audit opinion, strong ratings, minimal promoter pledging
+Average (score 9): Minor governance concerns
+Weak (score 3): Auditor qualifications or major governance risks
+
+Industry Position (0-10):
+Strong (score 10): Market leadership and durable competitive advantages
+Average (score 6): Comparable to peers
+Weak (score 2): Lagging peers or losing competitive position
+
+Health Label thresholds: score >=80 = Excellent | 60-79 = Good | 40-59 = Fair | 20-39 = Poor | 0-19 = Critical
+investment_label options: Strong Buy / Buy / Hold / Reduce / Avoid
+
+ANALYTICAL EXPECTATIONS
+The analysis must clearly evaluate profitability quality, growth durability, capital allocation efficiency, cash flow integrity, balance sheet resilience, and competitive positioning.
+
+RISK IDENTIFICATION
+Explicitly surface hidden risks such as working capital stress, margin compression, revenue concentration, government dependency, order book volatility, customer concentration, accounting anomalies, or excessive capex intensity. Each risk must include explanation, investor relevance, and a measurable trigger to monitor.
+
+INVESTOR-ORIENTED OUTPUT
+Address both long-term investors and short-term traders.
+Long-term analysis should evaluate moat durability, compounding potential, and permanent capital loss risk.
+Short-term analysis should focus on catalysts, triggers for the next earnings cycle, and operational momentum indicators.
+
+ANALYTICAL STYLE
+Write in the tone of professional sell-side equity research: concise, analytical, and evidence-based. Avoid boilerplate commentary or generic financial explanations.
+
+Return ONLY this exact JSON object with every field populated. Use specific numbers in every commentary field:
+
+{{
+  "company_name": "Full legal name from document",
+  "statement_type": "Annual Report / Half-Year Results / Quarterly Results",
+  "period": "Reporting period e.g. Q3FY26 / FY2024-25",
+  "currency": "INR Lakhs / INR Crores / USD Millions",
   "health_score": 0,
   "health_label": "Excellent / Good / Fair / Poor / Critical",
-  "health_score_breakdown": {
+
+  "health_score_breakdown": {{
     "total": 0,
     "components": [
-      {"category": "Profitability", "weight": 20, "score": 0, "max": 20, "rating": "Strong/Average/Weak",
-       "reasoning": "ROE X.X% (PAT XCr / Equity XCr). Net Margin Y.Y%. [threshold met/missed]. [business driver]. [trend vs prior year]."},
-      {"category": "Growth", "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak",
-       "reasoning": "Revenue grew X.X% to XCr; PAT grew Y.Y% to YCr. [Volume/price/mix driver]. [Acceleration or deceleration vs prior year]."},
-      {"category": "Balance Sheet", "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak",
-       "reasoning": "D/E X.Xx (Debt XCr / NW XCr). [Debt trend YoY]. [Asset quality commentary]."},
-      {"category": "Liquidity", "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak",
-       "reasoning": "Current Ratio X.Xx (CA XCr vs CL XCr). Cash XCr. [Working capital commentary]."},
-      {"category": "Cash Flow", "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak",
-       "reasoning": "OCF XCr vs PAT XCr (ratio X.Xx). FCF XCr = X.X% of revenue. [Earnings quality]."},
-      {"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak",
-       "reasoning": "Audit opinion [Clean/Qualified]. Promoter pledge X%. Credit rating [if stated]. [Key governance observation]."},
-      {"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak",
-       "reasoning": "Market rank/position. Revenue vs named peers. Pricing power evidence. Competitive moat."}
+      {{"category": "Profitability", "weight": 20, "score": 0, "max": 20, "rating": "Strong / Average / Weak", "reasoning": "Explain ROE, margins, and profitability trend with specific numbers."}},
+      {{"category": "Growth",        "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Explain revenue and profit growth drivers with specific numbers."}},
+      {{"category": "Balance Sheet", "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Discuss leverage, debt structure, and asset quality with specific numbers."}},
+      {{"category": "Liquidity",     "weight": 10, "score": 0, "max": 10, "rating": "Strong / Average / Weak", "reasoning": "Evaluate short-term financial strength with specific numbers."}},
+      {{"category": "Cash Flow",     "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Explain OCF vs PAT relationship and cash generation quality."}},
+      {{"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Evaluate governance, audit opinion, and structural risks."}},
+      {{"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "Strong / Average / Weak", "reasoning": "Compare position versus industry peers."}}
     ]
-  },
-  "headline": "Company name + key result with 2+ numbers + forward implication for investors",
-  "executive_summary": "EXACTLY 5-6 sentences each with specific numbers: S1=Revenue+PAT+YoY%; S2=Margin story in bps; S3=Balance sheet/leverage; S4=Cash flow quality; S5=Key risk with number; S6=Investment implication.",
-  "investment_label": "Strong Buy / Buy / Hold / Reduce / Avoid",
-  "investor_verdict": "3-4 sentences: conviction + target return horizon + 3 numbers supporting thesis + key invalidating risk.",
-  "for_long_term_investors": "Moat durability evidence + 3-5yr PAT CAGR estimate based on current trends + dividend/buyback yield% + permanent capital loss scenario.",
-  "for_short_term_traders": "Next quarter catalyst with timeline + QoQ momentum data points + event risk + 52-week high/low context if available.",
-  "bottom_line": "Company name + specific number + clear investment message in one memorable sentence.",
-  "key_metrics": [
-    {"label": "Revenue", "current": "XCr", "previous": "XCr", "change": "+X.X%", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": "1 sentence: growth driver and acceleration/deceleration vs prior year"},
-    {"label": "Net Profit", "current": "XCr", "previous": "XCr", "change": "+X.X%", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": "1 sentence: PAT growth vs revenue growth delta, operating leverage signal"},
-    {"label": "EBITDA Margin", "current": "X.X%", "previous": "X.X%", "change": "+Xbps", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": "1 sentence: key margin driver (employee costs / raw material / pricing)"},
-    {"label": "ROE", "current": "X.X%", "previous": "X.X%", "change": "+/-Xbps", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": "1 sentence: DuPont driver — which of margin/asset turn/leverage changed"},
-    {"label": "Debt to Equity", "current": "X.Xx", "previous": "X.Xx", "change": "-X.Xx", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": "1 sentence: leverage trajectory and comfort level"},
-    {"label": "Operating Cash Flow", "current": "XCr", "previous": "XCr", "change": "+X.X%", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": "1 sentence: OCF/PAT conversion ratio and earnings quality signal"}
-  ],
-  "cash_flow_deep_dive": {
-    "operating_cf": "XCr",
-    "investing_cf": "-XCr",
-    "financing_cf": "-XCr",
-    "free_cash_flow": "XCr (OCF XCr minus Capex XCr)",
-    "capex": "XCr",
-    "cash_conversion_quality": "Strong / Moderate / Weak",
-    "ocf_vs_pat_insight": "OCF XCr vs PAT XCr = X.Xx conversion ratio. [What this implies for earnings quality]. Investing CF -XCr reflects [capex strategy/acquisitions]. Financing CF -XCr driven by [dividends/buybacks/debt repayment with amounts]."
-  },
-  "balance_sheet_deep_dive": {
-    "asset_quality": "Fixed assets XCr (X% of total), current assets XCr (X%). CWIP XCr signals [expansion plans]. Asset turnover ratio X.Xx.",
-    "debt_profile": "Total debt XCr: LT XCr + ST XCr. Debt [reduced/increased] X% YoY. [Maturity profile / interest rate if available].",
-    "working_capital_insight": "Debtor days XX (vs YY prior year). Payable days XX. Inventory days XX. Net working capital XCr. Cash conversion cycle XX days.",
-    "total_debt": "XCr",
-    "net_worth": "XCr",
-    "debt_to_equity": "X.Xx",
-    "interest_coverage": "X.Xx (EBIT XCr / Finance Costs XCr)",
-    "debt_comfort_level": "Comfortable / Elevated / Stressed"
-  },
-  "growth_quality": {
-    "revenue_growth_context": "Revenue XCr (+X.X% YoY). [Organic vs inorganic]. [Segment/geography driver]. Compare to prior year X.X% — [acceleration/deceleration narrative].",
-    "profit_growth_context": "PAT XCr (+X.X%) vs revenue +Y.Y% — [operating leverage evidence]. Employee costs X% of revenue (vs Y% prior) = [interpretation].",
-    "margin_trend": "Gross margin X.X% (+/-Xbps). EBITDA margin X.X% (+/-Xbps). Net margin X.X% (+/-Xbps). [Primary cost driver as % of revenue with comparison to prior year].",
-    "growth_outlook": "Based on [order book size / management guidance / sector data]: [1-2 forward-looking sentences with specific numbers or ranges].",
-    "catalysts": ["Specific catalyst 1 with timeline and estimated impact", "Catalyst 2 with numbers", "Catalyst 3"],
-    "headwinds": ["Headwind 1 with measurable impact estimate", "Headwind 2 with numbers", "Headwind 3"]
-  },
-  "industry_context": {
-    "sector_tailwinds": ["Tailwind 1 with market data/numbers", "Tailwind 2", "Tailwind 3"],
-    "sector_headwinds": ["Headwind 1 with number or impact", "Headwind 2"],
-    "competitive_position": "Market rank / revenue share. Pricing power evidence. Moat assessment with specific numbers vs named peers.",
-    "peer_benchmarks": "vs [Peer A]: Revenue XCr, EBITDA margin Y%. vs [Peer B]: [key ratio comparison]. [Where this company leads or lags].",
-    "regulatory_environment": "Specific regulation or policy with direct investor impact and timeline."
-  },
-  "red_flags": [
-    "RED FLAG: [specific concern with exact metric]. Evidence: [number]. Investor risk: [what happens if it materializes]. Monitor: [trigger threshold].",
-    "RED FLAG: [specific concern]. Evidence: [number]. Investor risk: [impact]. Monitor: [trigger].",
-    "RED FLAG: [specific concern]. Evidence: [number]. Investor risk: [impact]. Monitor: [trigger]."
-  ],
-  "strengths_and_moats": [
-    "MOAT: [specific competitive advantage]. Evidence: [metric with number]. Why durable: [specific reason].",
-    "MOAT: [specific advantage with number].",
-    "MOAT: [specific advantage with number]."
-  ],
-  "investor_faq": [
-    {"question": "Is this company a good investment right now?", "answer": "[Buy/Hold/Avoid]: 3 specific reasons with numbers. Key risk in 1 sentence."},
-    {"question": "What is the biggest risk to monitor?", "answer": "[Specific risk]. Current: [number]. Alert if: [threshold]. Why it matters: [investor impact]."},
-    {"question": "How sustainable is the current growth rate?", "answer": "[X%] growth is [sustainable/unsustainable] because [2+ specific evidence points with numbers]. Key assumption: [what must remain true]."}
-  ],
-  "key_monitorables": [
-    "Revenue growth: watch for slowdown below X% (current X.X% YoY)",
-    "EBITDA margin: alert if drops below X% (current X.X%)",
-    "D/E ratio: flag if rises above X.X (current X.Xx)",
-    "OCF/PAT ratio: concern if falls below X.Xx (current X.Xx)"
-  ],
-  "profitability": {
-    "analysis": "ROE X.X% (PAT XCr / NW XCr) vs X.X% prior year. EBITDA margin X.X% (+/-Xbps YoY) driven by [specific cost driver: employee costs X% of rev / RM costs]. Net margin X.X% — [any one-offs or structural change].",
-    "net_margin_current": "X.X%",
-    "ebitda_margin_current": "X.X%",
-    "roe": "X.X%",
-    "roa": "X.X%"
-  },
-  "liquidity": {
-    "analysis": "Current ratio X.Xx (CA XCr vs CL XCr), [improved/deteriorated] from X.Xx prior year. Cash position XCr [up/down X% YoY]. FCF XCr = X.X% of revenue — [strong/adequate/weak] cash generation.",
-    "current_ratio": "X.Xx",
-    "quick_ratio": "X.Xx",
-    "cash_position": "XCr",
-    "operating_cash_flow": "XCr",
-    "free_cash_flow": "XCr"
-  },
-  "highlights": [
-    "HIGHLIGHT: [specific positive with exact number and why it matters to investors]",
-    "HIGHLIGHT: [specific positive with exact number]",
-    "HIGHLIGHT: [specific positive with exact number]"
-  ],
-  "risks": [
-    "RISK: [specific concern] — Current exposure: [number]. Trigger: [threshold that would change investment view].",
-    "RISK: [specific concern] — Current exposure: [number]. Trigger: [threshold].",
-    "RISK: [specific concern] — Current exposure: [number]. Trigger: [threshold]."
-  ],
-  "what_to_watch": [
-    "Next quarter: [specific metric with threshold number to watch]",
-    "6-month horizon: [specific catalyst or event with expected timeline]",
-    "Annual: [structural trend with metric to track]"
-  ]
-}"""
+  }},
 
-    instruction = (
-        "You are a Managing Director-level Equity Research Analyst at Goldman Sachs covering "
-        "Indian listed companies, writing for sovereign wealth funds and pension funds.\n\n"
-        "CRITICAL RULE: Every text field MUST contain specific numbers with units. "
-        "Sentences like 'strong performance', 'good growth', 'company is well-positioned' "
-        "WITHOUT numbers will be rejected. Compare current vs previous period for every metric.\n\n"
-        "EXAMPLES:\n"
-        "BAD: 'Revenue grew strongly' "
-        "GOOD: 'Revenue grew 6.1% YoY to 1,62,990 Cr, decelerating from 8.1% in FY24 as BFSI spend softened'\n"
-        "BAD: 'margins improved' "
-        "GOOD: 'EBITDA margin expanded 40bps to 21.1%, driven by flat headcount growth while revenue rose 6.1%'\n\n"
-        "SCORING RULES (use exact integers):\n"
-        "Profitability(20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=12 | else=5\n"
-        "Growth(15): Rev>20% AND Profit>25%=15 | Rev 10-20% AND Profit 10-25%=9 | else=4\n"
-        "BalanceSheet(15): D/E<0.5=15 | D/E 0.5-1.5=9 | D/E>1.5=3\n"
-        "Liquidity(10): CR>1.5=10 | CR 1.0-1.5=6 | CR<1.0=2\n"
-        "CashFlow(15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3\n"
-        "Governance(15): Clean audit=15 | Minor=9 | Major=3\n"
-        "Industry(10): Leader=10 | Average=6 | Lagging=2\n"
-        "health_label: >=80=Excellent|60-79=Good|40-59=Fair|20-39=Poor|<20=Critical\n\n"
-        "STEP 1: Extract every number from the document tables.\n"
-        "STEP 2: Calculate YoY% for every line item.\n"
-        "STEP 3: Calculate ROE, ROA, D/E, Current Ratio, FCF, Interest Coverage.\n"
-        "STEP 4: Fill every JSON field with real numbers.\n\n"
-        "Return ONLY the JSON. No markdown, no code fences, no explanation.\n\n"
-        f"FINANCIAL DOCUMENT:\n{snippet}\n\n"
-        "JSON OUTPUT (fill every field with real numbers from the document above):\n"
-    )
-    return instruction + json_schema
+  "headline": "One concise memorable sentence summarizing the result",
+  "executive_summary": "5-6 sentences explaining the most important story behind the numbers. Every sentence must contain specific numbers.",
+  "investment_label": "Strong Buy / Buy / Hold / Reduce / Avoid",
+  "investor_verdict": "Direct institutional recommendation with reasoning and specific numbers",
+  "for_long_term_investors": "Moat durability, compounding potential, long-term risk with specific numbers",
+  "for_short_term_traders": "Near-term catalysts and earnings triggers with specific numbers",
+  "bottom_line": "Single memorable sentence capturing the key investment insight",
+
+  "key_metrics": [
+    {{"label": "Revenue",             "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "Net Profit",          "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "EBITDA Margin",       "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "ROE",                 "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "Debt to Equity",      "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "Operating Cash Flow", "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}}
+  ],
+
+  "cash_flow_deep_dive": {{
+    "operating_cf":          "extracted value with unit",
+    "investing_cf":          "extracted value with unit",
+    "financing_cf":          "extracted value with unit",
+    "free_cash_flow":        "calculated: OCF minus Capex with unit",
+    "capex":                 "extracted value with unit",
+    "cash_conversion_quality": "Strong / Moderate / Weak",
+    "ocf_vs_pat_insight":    "Is OCF greater than PAT? What does this say about earnings quality? Use specific numbers."
+  }},
+
+  "balance_sheet_deep_dive": {{
+    "asset_quality":         "Institutional commentary on fixed vs current asset mix with numbers",
+    "debt_profile":          "ST vs LT split, maturity profile, rates if available",
+    "working_capital_insight": "Receivables, payables, inventory cycle commentary with days",
+    "total_debt":            "extracted value with unit",
+    "net_worth":             "extracted value with unit",
+    "debt_to_equity":        "calculated ratio",
+    "interest_coverage":     "calculated ratio",
+    "debt_comfort_level":    "Comfortable / Elevated / Stressed"
+  }},
+
+  "growth_quality": {{
+    "revenue_growth_context":  "Organic vs inorganic, volume vs price drivers with numbers",
+    "profit_growth_context":   "Operating leverage, margin expansion/compression drivers",
+    "margin_trend":            "Direction and magnitude of margin changes with basis points",
+    "growth_outlook":          "Forward-looking assessment based on order book, guidance, or sector trends",
+    "catalysts":               ["List of specific near-term growth catalysts"],
+    "headwinds":               ["List of specific risks that could impair growth"]
+  }},
+
+  "industry_context": {{
+    "sector_tailwinds":       ["List of structural or cyclical tailwinds"],
+    "sector_headwinds":       ["List of structural or cyclical headwinds"],
+    "competitive_position":   "Market share, pricing power, barriers to entry",
+    "peer_benchmarks":        "How key ratios compare to sector averages or named peers",
+    "regulatory_environment": "Relevant regulations, government policies, or compliance risks"
+  }},
+
+  "red_flags":          ["Each as a specific, evidence-backed concern with numbers"],
+  "strengths_and_moats": ["Each as a specific, defensible competitive advantage"],
+
+  "investor_faq": [
+    {{"question": "Is this company a good investment right now?", "answer": "Direct answer with numbers and reasoning"}},
+    {{"question": "What is the biggest risk to monitor?",         "answer": "Specific risk with measurable trigger"}},
+    {{"question": "How sustainable is the current growth rate?",  "answer": "Evidence-based assessment"}}
+  ],
+
+  "key_monitorables": ["Specific metric or event to track each quarter with threshold"],
+
+  "profitability": {{
+    "analysis":             "2-3 sentence institutional commentary with specific numbers",
+    "net_margin_current":   "",
+    "ebitda_margin_current":"",
+    "roe":                  "",
+    "roa":                  ""
+  }},
+
+  "liquidity": {{
+    "analysis":          "2-3 sentence institutional commentary with specific numbers",
+    "current_ratio":     "",
+    "quick_ratio":       "",
+    "cash_position":     "",
+    "operating_cash_flow":"",
+    "free_cash_flow":    ""
+  }},
+
+  "highlights":    ["Key positive takeaways with specific numbers"],
+  "risks":         ["Key risk factors with specific numbers and triggers"],
+  "what_to_watch": ["Forward-looking items to monitor next quarter"]
+}}
+
+FINAL INSTRUCTIONS:
+- Use only numbers extracted from the document. Do not fabricate data.
+- Calculate all ratios where inputs are available.
+- Ensure scores match the scoring framework exactly.
+- Every commentary field must contain specific numbers, not vague statements.
+- Return only the JSON object, nothing else.
+
+FINANCIAL DOCUMENT:
+{snippet}
+"""
 
 
 def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
-    """Lean institutional prompt for small-context models."""
     snippet = text[:max_doc_chars]
     logger.info(f"build_lean_prompt: {len(snippet):,} chars (from {len(text):,} total)")
+    return f"""Analyze this financial document and return ONLY valid JSON — no markdown, no preamble, no code fences.
 
-    json_schema = """{
-  "company_name": "", "statement_type": "", "period": "", "currency": "",
-  "health_score": 0, "health_label": "",
-  "health_score_breakdown": {"total": 0, "components": [
-    {"category": "Profitability", "weight": 20, "score": 0, "max": 20, "rating": "", "reasoning": "ROE X.X%, Net Margin Y.Y%. [threshold]. [driver]. [trend]."},
-    {"category": "Growth", "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": "Revenue +X.X% to XCr; PAT +Y.Y% to YCr. [quality]."},
-    {"category": "Balance Sheet", "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": "D/E X.Xx (Debt XCr / NW XCr). [trend]."},
-    {"category": "Liquidity", "weight": 10, "score": 0, "max": 10, "rating": "", "reasoning": "CR X.Xx (CA XCr vs CL XCr). Cash XCr."},
-    {"category": "Cash Flow", "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": "OCF XCr vs PAT XCr (ratio X.Xx). FCF XCr."},
-    {"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": "Audit: [clean/qualified]. Pledge: X%. Rating: [if stated]."},
-    {"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "", "reasoning": "Market rank. Revenue vs peers. Moat evidence."}
-  ]},
-  "headline": "Company + key result with 2+ numbers + implication",
-  "executive_summary": "5-6 sentences EACH with numbers: Revenue+PAT+YoY% | Margin bps | Leverage | Cash quality | Key risk | Investment call",
-  "investment_label": "", "investor_verdict": "3-4 sentences with numbers + key risk",
-  "for_long_term_investors": "Moat + 3-5yr CAGR estimate + dividend yield% + downside scenario",
-  "for_short_term_traders": "Next quarter catalyst + QoQ momentum + event risk with numbers",
-  "bottom_line": "Company + specific number + investment message",
-  "key_metrics": [
-    {"label": "Revenue", "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": "1 sentence with growth context"},
-    {"label": "Net Profit", "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": "1 sentence: operating leverage"},
-    {"label": "EBITDA Margin", "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": "1 sentence: margin driver"},
-    {"label": "ROE", "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": "1 sentence: DuPont driver"},
-    {"label": "Debt to Equity", "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": "1 sentence: leverage trajectory"},
-    {"label": "Operating Cash Flow", "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": "1 sentence: OCF/PAT ratio"}
-  ],
-  "cash_flow_deep_dive": {
-    "operating_cf": "XCr", "investing_cf": "-XCr", "financing_cf": "-XCr",
-    "free_cash_flow": "XCr (OCF-Capex)", "capex": "XCr",
-    "cash_conversion_quality": "Strong/Moderate/Weak",
-    "ocf_vs_pat_insight": "OCF XCr vs PAT XCr = X.Xx ratio. [Earnings quality implication]. [Investing and financing CF drivers]."
-  },
-  "balance_sheet_deep_dive": {
-    "asset_quality": "Fixed XCr (X%), Current XCr (X%). Asset turnover X.Xx.",
-    "debt_profile": "Total XCr: LT XCr + ST XCr. [YoY change].",
-    "working_capital_insight": "Debtor days XX, Payable days XX, Inventory days XX. NWC XCr.",
-    "total_debt": "XCr", "net_worth": "XCr", "debt_to_equity": "X.Xx",
-    "interest_coverage": "X.Xx (EBIT XCr / FinCost XCr)", "debt_comfort_level": "Comfortable/Elevated/Stressed"
-  },
-  "growth_quality": {
-    "revenue_growth_context": "Revenue XCr +X.X% YoY. [Segment driver]. [vs prior year X.X% — accel/decel].",
-    "profit_growth_context": "PAT +X.X% vs revenue +Y.Y%. [Operating leverage or lack thereof].",
-    "margin_trend": "EBITDA margin X.X% (+/-Xbps). Net margin X.X% (+/-Xbps). [Primary cost driver].",
-    "growth_outlook": "[Forward-looking with numbers from guidance/order book/sector trends].",
-    "catalysts": ["Catalyst with timeline+impact", "Catalyst 2", "Catalyst 3"],
-    "headwinds": ["Headwind with measurable impact", "Headwind 2", "Headwind 3"]
-  },
-  "industry_context": {
-    "sector_tailwinds": ["Tailwind with data", "Tailwind 2", "Tailwind 3"],
-    "sector_headwinds": ["Headwind with number", "Headwind 2"],
-    "competitive_position": "Market rank, pricing power, moat evidence with numbers.",
-    "peer_benchmarks": "vs [Peer A] key ratio. vs [Peer B] key ratio. [Where leads/lags].",
-    "regulatory_environment": "Specific policy/regulation with investor impact."
-  },
-  "red_flags": [
-    "RED FLAG: [concern] — Evidence: [number]. Monitor: [trigger].",
-    "RED FLAG: [concern] — Evidence: [number]. Monitor: [trigger]."
-  ],
-  "strengths_and_moats": [
-    "MOAT: [advantage]. Evidence: [metric with number].",
-    "MOAT: [advantage]. Evidence: [metric].",
-    "MOAT: [advantage]. Evidence: [metric]."
-  ],
-  "investor_faq": [
-    {"question": "Is this company a good investment right now?", "answer": "[Buy/Hold/Avoid]: 3 reasons with numbers."},
-    {"question": "What is the biggest risk to monitor?", "answer": "[Risk]. Current: [number]. Alert if: [threshold]."},
-    {"question": "How sustainable is the current growth rate?", "answer": "[X%] is [sustainable/not] because [evidence+numbers]."}
-  ],
-  "key_monitorables": [
-    "Revenue growth: watch <X% (current X.X%)",
-    "EBITDA margin: alert if <X% (current X.X%)",
-    "D/E: flag if >X.X (current X.Xx)",
-    "OCF/PAT: concern if <X.Xx (current X.Xx)"
-  ],
-  "profitability": {
-    "analysis": "ROE X.X% (PAT XCr / NW XCr) vs X.X% prior. EBITDA margin X.X% (+/-Xbps) driven by [cost driver]. Net margin X.X%.",
-    "net_margin_current": "X.X%", "ebitda_margin_current": "X.X%", "roe": "X.X%", "roa": "X.X%"
-  },
-  "liquidity": {
-    "analysis": "CR X.Xx (CA XCr vs CL XCr) vs X.Xx prior. Cash XCr. FCF XCr = X.X% revenue.",
-    "current_ratio": "X.Xx", "quick_ratio": "X.Xx", "cash_position": "XCr",
-    "operating_cash_flow": "XCr", "free_cash_flow": "XCr"
-  },
-  "highlights": ["HIGHLIGHT with number and investor implication", "HIGHLIGHT 2 with number", "HIGHLIGHT 3"],
-  "risks": [
-    "RISK: [specific] — exposure: [number]. Trigger: [threshold].",
-    "RISK: [specific] — exposure: [number]. Trigger: [threshold].",
-    "RISK: [specific] — exposure: [number]. Trigger: [threshold]."
-  ],
-  "what_to_watch": [
-    "Next quarter: [specific item with number]",
-    "6-month: [catalyst/event]",
-    "Annual: [structural trend]"
-  ]
-}"""
+You are a senior equity research analyst. Extract all numbers exactly as written. Calculate all derivable ratios. Write institutional-quality commentary with specific numbers in every field.
 
-    instruction = (
-        "You are a Goldman Sachs equity research analyst. Analyze the financial document and return ONLY valid JSON. "
-        "No markdown. No code fences. No preamble.\n\n"
-        "RULES: Every text field needs 2+ specific numbers with units. No vague statements.\n"
-        "SCORING: Profitability(20): ROE>20%+Margin>15%=20|ROE12-20%orMargin8-15%=12|else=5 | "
-        "Growth(15): Rev>20%+Profit>25%=15|10-20%+10-25%=9|else=4 | BS(15): DE<0.5=15|0.5-1.5=9|>1.5=3 | "
-        "Liq(10): CR>1.5=10|1-1.5=6|<1=2 | CF(15): OCF>PAT=15|~PAT=9|<PAT=3 | "
-        "Gov(15): clean=15|minor=9|major=3 | Ind(10): leader=10|avg=6|lag=2\n"
-        "health_label: >=80=Excellent|60-79=Good|40-59=Fair|20-39=Poor|<20=Critical\n\n"
-        f"FINANCIAL DOCUMENT:\n{snippet}\n\n"
-        "JSON OUTPUT:\n"
-    )
-    return instruction + json_schema
+SCORING (use exact scores):
+Profitability(max 20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=12 | else=5
+Growth(max 15): Rev>20% AND Profit>25%=15 | Rev 10-20% AND Profit 10-25%=9 | else=4
+Balance Sheet(max 15): D/E<0.5=15 | D/E 0.5-1.5=9 | D/E>1.5=3
+Liquidity(max 10): CR>1.5=10 | CR 1.0-1.5=6 | CR<1.0=2
+Cash Flow(max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3
+Governance(max 15): Clean audit=15 | Minor issues=9 | Major issues=3
+Industry(max 10): Leader=10 | Average=6 | Lagging=2
+health_label: >=80=Excellent | 60-79=Good | 40-59=Fair | 20-39=Poor | <20=Critical
+investment_label: Strong Buy / Buy / Hold / Reduce / Avoid
 
+Return ONLY this JSON (all fields required, use specific numbers in all commentary):
+{{
+  "company_name":"","statement_type":"","period":"","currency":"","health_score":0,"health_label":"",
+  "health_score_breakdown":{{
+    "total":0,
+    "components":[
+      {{"category":"Profitability","weight":20,"score":0,"max":20,"rating":"","reasoning":""}},
+      {{"category":"Growth","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Balance Sheet","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Liquidity","weight":10,"score":0,"max":10,"rating":"","reasoning":""}},
+      {{"category":"Cash Flow","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Governance & Risk","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Industry Position","weight":10,"score":0,"max":10,"rating":"","reasoning":""}}
+    ]
+  }},
+  "headline":"","executive_summary":"","investment_label":"","investor_verdict":"",
+  "for_long_term_investors":"","for_short_term_traders":"","bottom_line":"",
+  "key_metrics":[
+    {{"label":"Revenue","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"Net Profit","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"EBITDA Margin","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"ROE","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"","signal":"","comment":""}}
+  ],
+  "cash_flow_deep_dive":{{
+    "operating_cf":"","investing_cf":"","financing_cf":"","free_cash_flow":"","capex":"",
+    "cash_conversion_quality":"","ocf_vs_pat_insight":""
+  }},
+  "balance_sheet_deep_dive":{{
+    "asset_quality":"","debt_profile":"","working_capital_insight":"",
+    "total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":""
+  }},
+  "growth_quality":{{"revenue_growth_context":"","profit_growth_context":"","margin_trend":"","growth_outlook":"","catalysts":[],"headwinds":[]}},
+  "industry_context":{{"sector_tailwinds":[],"sector_headwinds":[],"competitive_position":"","peer_benchmarks":"","regulatory_environment":""}},
+  "red_flags":[],"strengths_and_moats":[],
+  "investor_faq":[
+    {{"question":"Is this company a good investment right now?","answer":""}},
+    {{"question":"What is the biggest risk to monitor?","answer":""}},
+    {{"question":"How sustainable is the current growth rate?","answer":""}}
+  ],
+  "key_monitorables":[],
+  "profitability":{{"analysis":"","net_margin_current":"","ebitda_margin_current":"","roe":"","roa":""}},
+  "liquidity":{{"analysis":"","current_ratio":"","quick_ratio":"","cash_position":"","operating_cash_flow":"","free_cash_flow":""}},
+  "highlights":[],"risks":[],"what_to_watch":[]
+}}
+
+FINANCIAL DOCUMENT:
+{snippet}
+"""
 
 
 def _extract_metrics_from_text(text: str) -> dict:
@@ -1100,10 +1116,10 @@ def _sync_gemini(text: str) -> dict:
         raise Exception("GEMINI_API_KEY not configured")
 
     models = [
-        ("gemini-2.0-flash",        44000, False),
-        ("gemini-1.5-flash",        44000, False),
-        ("gemini-1.5-pro",          44000, False),
-        ("gemini-1.5-flash-8b",     20000, True),
+        ("gemini-2.0-flash",             44000, False),  # Primary — best speed/quality
+        ("gemini-2.0-flash-lite",        44000, False),  # Faster fallback
+        ("gemini-2.5-flash-preview-04-17", 44000, False), # Most capable
+        ("gemini-2.0-flash-exp",         20000, True),   # Experimental lean fallback
     ]
 
     last_error = "unknown"
@@ -1168,10 +1184,10 @@ def _sync_groq(text: str) -> dict:
         raise Exception("GROQ_API_KEY not configured")
 
     models = [
-        ("llama-3.3-70b-versatile",   44000, False),
-        ("llama-3.1-70b-versatile",   44000, False),
-        ("llama-3.1-8b-instant",      20000, True),
-        ("mixtral-8x7b-32768",        20000, True),
+        ("llama-3.3-70b-versatile",        20000, False),  # Working — reduced size to avoid 413
+        ("llama-3.1-8b-instant",           14000, True),   # Working lean
+        ("llama3-groq-70b-8192-tool-use-preview", 14000, True),  # Working
+        ("llama3-groq-8b-8192-tool-use-preview",  14000, True),  # Working lean
     ]
 
     last_error = "unknown"
@@ -1340,12 +1356,9 @@ def _sync_cloudflare(text: str) -> dict:
         raise Exception("CF_ACCOUNT_ID or CF_API_TOKEN not configured")
 
     models = [
-        ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 44000, False),
-        ("@cf/meta/llama-3.1-70b-instruct",           44000, False),
-        ("@cf/meta/llama-3.1-8b-instruct-fast",       20000, True),
-        ("@cf/qwen/qwen2.5-72b-instruct",             44000, False),
-        ("@cf/google/gemma-3-12b-it",                 20000, True),
-        ("@cf/mistral/mistral-7b-instruct-v0.2-lora", 20000, True),
+        ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 12000, False),  # 24k ctx, 13k input safe
+        ("@cf/meta/llama-3.1-8b-instruct-fast",       10000, True),   # 24k ctx, lean only
+        ("@cf/mistral/mistral-7b-instruct-v0.2-lora",  8000, True),   # 15k ctx, small only
     ]
 
     headers = {
@@ -1401,6 +1414,181 @@ def _sync_cloudflare(text: str) -> dict:
 
 
 # ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
+# ─── FMP ANALYSIS ENRICHMENT ─────────────────────────────────────────────────
+
+def _detect_ticker_from_text(text: str) -> str | None:
+    """Detect NSE ticker from financial document text. Strict to avoid false positives."""
+    import re
+
+    # Common false positives to ignore
+    BLOCKLIST = {
+        "THE", "AND", "FOR", "ITS", "ALL", "NEW", "OLD", "HUT", "MR", "DR",
+        "MD", "CEO", "CFO", "CIO", "CTO", "COO", "BSE", "NSE", "SEC", "RBI",
+        "GOI", "INR", "USD", "PDF", "FY", "QR", "AGM", "EGM", "ROE", "ROA",
+        "PAT", "PBT", "EPS", "NAV", "NPA", "EMI", "GST", "TDS", "CIN", "DIN",
+        "PAN", "TAN", "KYC", "MCA", "SEBI", "IRDAI", "RBI", "NCLT", "NCLAT",
+    }
+
+    t = text[:6000]
+
+    # Strict patterns — only match explicit symbol declarations
+    patterns = [
+        r"NSE\s*(?:Symbol|Code|Scrip)?\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})(?:\s|$|,|;)",
+        r"BSE\s*(?:Symbol|Code|Scrip)?\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})(?:\s|$|,|;)",
+        r"(?:Stock|Trading|Scrip)\s*Symbol\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})",
+        r"Symbol\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})(?:\s|$|,|\])",
+    ]
+    for p in patterns:
+        m = re.search(p, t)
+        if m:
+            sym = m.group(1).strip().upper()
+            if sym not in BLOCKLIST and 2 <= len(sym) <= 12:
+                logger.info(f"Ticker from pattern: {sym}")
+                return sym
+
+    # Company name → known ticker mapping (curated, not broad regex)
+    KNOWN = {
+        "infosys limited": "INFY", "infosys ltd": "INFY", "infosys": "INFY",
+        "tata consultancy services": "TCS", "tcs limited": "TCS",
+        "wipro limited": "WIPRO", "wipro ltd": "WIPRO",
+        "hcl technologies": "HCLTECH", "hcl tech": "HCLTECH",
+        "reliance industries": "RELIANCE",
+        "hdfc bank limited": "HDFCBANK", "hdfc bank": "HDFCBANK",
+        "icici bank limited": "ICICIBANK", "icici bank": "ICICIBANK",
+        "axis bank limited": "AXISBANK", "axis bank": "AXISBANK",
+        "kotak mahindra bank": "KOTAKBANK",
+        "state bank of india": "SBIN",
+        "maruti suzuki": "MARUTI",
+        "bajaj finance limited": "BAJFINANCE",
+        "bajaj finserv": "BAJAJFINSV",
+        "asian paints limited": "ASIANPAINT",
+        "hindustan unilever": "HINDUNILVR",
+        "itc limited": "ITC",
+        "larsen & toubro": "LT", "l&t limited": "LT",
+        "tech mahindra": "TECHM",
+        "sun pharmaceutical": "SUNPHARMA",
+        "dr. reddy's": "DRREDDY", "dr reddys": "DRREDDY",
+        "cipla limited": "CIPLA",
+        "titan company": "TITAN",
+        "tata motors limited": "TATAMOTORS",
+        "tata steel limited": "TATASTEEL",
+        "ultratech cement": "ULTRACEMCO",
+        "nestle india": "NESTLEIND",
+        "power grid corporation": "POWERGRID",
+        "ntpc limited": "NTPC",
+        "oil and natural gas": "ONGC",
+        "coal india limited": "COALINDIA",
+        "bharat petroleum": "BPCL",
+        "indian oil corporation": "IOC",
+        "hindalco industries": "HINDALCO",
+        "jsw steel": "JSWSTEEL",
+        "grasim industries": "GRASIM",
+        "avenue supermarts": "DMART",
+        "apollo hospitals": "APOLLOHOSP",
+        "divi's laboratories": "DIVISLAB",
+        "divis laboratories": "DIVISLAB",
+        "adani enterprises": "ADANIENT",
+        "adani ports": "ADANIPORTS",
+        "tata consumer": "TATACONSUM",
+        "bajaj auto": "BAJAJ-AUTO",
+        "hero motocorp": "HEROMOTOCO",
+        "eicher motors": "EICHERMOT",
+        "mahindra & mahindra": "M&M",
+        "britannia industries": "BRITANNIA",
+        "pidilite industries": "PIDILITIND",
+        "havells india": "HAVELLS",
+        "voltas limited": "VOLTAS",
+        "muthoot finance": "MUTHOOTFIN",
+        "shree cement": "SHREECEM",
+        "dlf limited": "DLF",
+        "godrej consumer": "GODREJCP",
+        "marico limited": "MARICO",
+        "dabur india": "DABUR",
+        "emami limited": "EMAMILTD",
+        "page industries": "PAGEIND",
+    }
+    t_lower = text[:4000].lower()
+    for name, ticker in KNOWN.items():
+        if name in t_lower:
+            logger.info(f"Ticker from company name '{name}': {ticker}")
+            return ticker
+
+    return None
+
+
+def _fmp_data_to_text(d: dict) -> str:
+    """Format FMP data into clean text for AI prompt enrichment."""
+    lines = []
+    if d.get("quote"):
+        q = d["quote"]
+        lines += [
+            "LIVE MARKET DATA (Financial Modeling Prep — use for valuation context):",
+            f"  Current Price:    {q.get('price', 'N/A')}  |  Market Cap: {q.get('marketCap', 'N/A')}",
+            f"  52w High/Low:     {q.get('yearHigh', 'N/A')} / {q.get('yearLow', 'N/A')}",
+            f"  P/E Ratio (TTM):  {q.get('pe', 'N/A')}x  |  EPS: {q.get('eps', 'N/A')}",
+            f"  Beta:             {q.get('beta', 'N/A')}  |  Div Yield: {q.get('dividendYield', 'N/A')}%",
+            "",
+        ]
+    if d.get("profile"):
+        p = d["profile"]
+        lines += [
+            "COMPANY PROFILE:",
+            f"  Sector: {p.get('sector', 'N/A')}  |  Industry: {p.get('industry', 'N/A')}",
+            f"  Employees: {p.get('fullTimeEmployees', 'N/A')}  |  CEO: {p.get('ceo', 'N/A')}",
+            "",
+        ]
+    if d.get("ratios"):
+        r = d["ratios"]
+        lines += [
+            "KEY RATIOS TTM (cross-validate with document figures):",
+            f"  P/E: {r.get('peRatioTTM', 'N/A')}x  |  P/B: {r.get('priceToBookRatioTTM', 'N/A')}x  |  EV/EBITDA: {r.get('enterpriseValueMultipleTTM', 'N/A')}x",
+            f"  ROE: {r.get('returnOnEquityTTM', 'N/A')}  |  ROA: {r.get('returnOnAssetsTTM', 'N/A')}  |  Net Margin: {r.get('netProfitMarginTTM', 'N/A')}",
+            f"  D/E: {r.get('debtEquityRatioTTM', 'N/A')}  |  Current Ratio: {r.get('currentRatioTTM', 'N/A')}  |  Div Yield: {r.get('dividendYieldTTM', 'N/A')}%",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+async def _fmp_fetch_for_analysis(ticker: str) -> dict | None:
+    """Fetch live FMP data for AI prompt enrichment. Tries plain, .NS, .BO variants."""
+    try:
+        sym = ticker.upper()
+        candidates = [sym, f"{sym}.NS", f"{sym}.BO"]
+
+        def safe_j(r):
+            try:
+                if isinstance(r, Exception): return None
+                if r.status_code == 403:
+                    logger.warning("FMP 403 — plan may not include this endpoint")
+                    return None
+                if r.status_code != 200: return None
+                data = r.json()
+                if isinstance(data, dict) and "Error Message" in data: return None
+                return data[0] if isinstance(data, list) and data else (data if data else None)
+            except Exception:
+                return None
+
+        for fmp_sym in candidates:
+            async with httpx.AsyncClient(timeout=12) as c:
+                results = await asyncio.gather(
+                    c.get(f"{FMP_BASE}/v3/quote/{fmp_sym}", params={"apikey": FMP_API_KEY}),
+                    c.get(f"{FMP_BASE}/v3/profile/{fmp_sym}", params={"apikey": FMP_API_KEY}),
+                    c.get(f"{FMP_BASE}/v3/ratios-ttm/{fmp_sym}", params={"apikey": FMP_API_KEY}),
+                    return_exceptions=True,
+                )
+            q, p, r = safe_j(results[0]), safe_j(results[1]), safe_j(results[2])
+            if q or p:
+                logger.info(f"FMP OK: {fmp_sym} — quote={bool(q)}, profile={bool(p)}, ratios={bool(r)}")
+                return {"quote": q, "profile": p, "ratios": r}
+
+        logger.warning(f"FMP: no data found for any variant of {sym}")
+        return None
+
+    except Exception as e:
+        logger.warning(f"FMP enrichment error (non-fatal): {e}")
+        return None
+
+
 async def run_analysis(text: str) -> dict:
 
     if not text or len(text.strip()) < 100:
@@ -1429,27 +1617,6 @@ async def run_analysis(text: str) -> dict:
     logger.info(f"Text-based metrics: {metrics}")
     logger.info(f"Computed ratios: {ratios}")
 
-    # ── FMP live data enrichment ─────────────────────────────────────────────
-    fmp_block = ""
-    if FMP_API_KEY:
-        try:
-            ticker = _detect_ticker_from_text(full_text)
-            if ticker:
-                fmp_data = await _fmp_fetch_for_analysis(ticker)
-                if fmp_data:
-                    fmp_block = (
-                        "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        "LIVE MARKET DATA FROM FINANCIAL MODELING PREP (FMP)\n"
-                        "Use this data to enrich peer context, valuation commentary,\n"
-                        "and validate extracted ratios against market consensus.\n"
-                        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                        + _fmp_data_to_text(fmp_data)
-                        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    )
-                    logger.info(f"FMP enrichment injected: {len(fmp_block)} chars for {ticker}")
-        except Exception as fmp_err:
-            logger.warning(f"FMP enrichment skipped (non-fatal): {fmp_err}")
-
     metrics_block = ""
     if any(metrics.values()):
         metrics_block = f"""
@@ -1466,6 +1633,23 @@ IMPORTANT: If the document tables show different numbers, ALWAYS use the documen
 The regex hints above are frequently wrong on Indian quarterly filings due to mixed units.
 
 """
+
+    # ── FMP live enrichment ──────────────────────────────────────────────────
+    fmp_block = ""
+    if FMP_API_KEY:
+        try:
+            ticker = _detect_ticker_from_text(full_text)
+            if ticker:
+                fmp_data = await _fmp_fetch_for_analysis(ticker)
+                if fmp_data:
+                    fmp_block = (
+                        "\n\n━━━ LIVE MARKET DATA (Financial Modeling Prep) ━━━\n"
+                        + _fmp_data_to_text(fmp_data)
+                        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    )
+                    logger.info(f"FMP enrichment injected ({len(fmp_block)} chars) for {ticker}")
+        except Exception as fmp_err:
+            logger.warning(f"FMP enrichment skipped (non-fatal): {fmp_err}")
 
     enhanced_text = fmp_block + metrics_block + full_text
 
@@ -1493,136 +1677,6 @@ The regex hints above are frequently wrong on Indian quarterly filings due to mi
 
     error_summary = " | ".join(errors) if errors else "No API keys configured"
     raise Exception(f"All AI providers failed. {error_summary}")
-
-
-# ─── FMP ANALYSIS ENRICHMENT ─────────────────────────────────────────────────
-
-def _detect_ticker_from_text(text: str) -> str | None:
-    """Detect NSE/BSE ticker from document text for FMP enrichment."""
-    import re
-    t = text[:8000]
-
-    patterns = [
-        r'NSE[:\s]+([A-Z]{2,12})\b',
-        r'BSE[:\s]+([A-Z]{2,12})\b',
-        r'NSE Symbol[:\s]+([A-Z]{2,12})',
-        r'Stock Symbol[:\s]+([A-Z]{2,12})',
-        r'Ticker[:\s]+([A-Z]{2,12})',
-    ]
-    for p in patterns:
-        m = re.search(p, t, re.IGNORECASE)
-        if m:
-            sym = m.group(1).strip()
-            logger.info(f"Ticker detected via pattern: {sym}")
-            return sym
-
-    KNOWN = {
-        "infosys": "INFY", "tata consultancy": "TCS", "tcs limited": "TCS",
-        "wipro": "WIPRO", "hcl technologies": "HCLTECH", "hcl tech": "HCLTECH",
-        "reliance industries": "RELIANCE", "hdfc bank": "HDFCBANK",
-        "icici bank": "ICICIBANK", "axis bank": "AXISBANK",
-        "kotak mahindra": "KOTAKBANK", "state bank of india": "SBIN", "sbi": "SBIN",
-        "maruti suzuki": "MARUTI", "bajaj finance": "BAJFINANCE",
-        "bajaj finserv": "BAJAJFINSV", "asian paints": "ASIANPAINT",
-        "hindustan unilever": "HINDUNILVR", "itc limited": "ITC",
-        "larsen & toubro": "LT", "l&t": "LT", "tech mahindra": "TECHM",
-        "sun pharmaceutical": "SUNPHARMA", "dr. reddy": "DRREDDY",
-        "cipla": "CIPLA", "titan company": "TITAN",
-        "tata motors": "TATAMOTORS", "tata steel": "TATASTEEL",
-        "ultratech cement": "ULTRACEMCO", "nestle india": "NESTLEIND",
-        "power grid": "POWERGRID", "ntpc": "NTPC",
-        "oil and natural gas": "ONGC", "coal india": "COALINDIA",
-        "bharat petroleum": "BPCL", "indian oil": "IOC",
-        "hindalco": "HINDALCO", "jsw steel": "JSWSTEEL",
-        "avenue supermarts": "DMART", "apollo hospitals": "APOLLOHOSP",
-        "divis laboratories": "DIVISLAB", "adani enterprises": "ADANIENT",
-        "adani ports": "ADANIPORTS", "grasim": "GRASIM",
-    }
-    t_lower = text[:3000].lower()
-    for name, ticker in KNOWN.items():
-        if name in t_lower:
-            logger.info(f"Ticker matched via company name: {ticker}")
-            return ticker
-    return None
-
-
-def _fmp_data_to_text(d: dict) -> str:
-    """Format FMP data dict into clean text block for AI prompt."""
-    lines = []
-    if d.get("quote"):
-        q = d["quote"]
-        lines += [
-            "LIVE MARKET DATA (Financial Modeling Prep):",
-            f"  Price: {q.get('price','N/A')}  |  Market Cap: {q.get('marketCap','N/A')}",
-            f"  52w High/Low: {q.get('yearHigh','N/A')} / {q.get('yearLow','N/A')}",
-            f"  P/E (TTM): {q.get('pe','N/A')}x  |  EPS: {q.get('eps','N/A')}",
-            f"  Beta: {q.get('beta','N/A')}  |  Dividend Yield: {q.get('dividendYield','N/A')}%",
-            "",
-        ]
-    if d.get("profile"):
-        p = d["profile"]
-        lines += [
-            "COMPANY PROFILE:",
-            f"  Sector: {p.get('sector','N/A')}  |  Industry: {p.get('industry','N/A')}",
-            f"  Employees: {p.get('fullTimeEmployees','N/A')}  |  CEO: {p.get('ceo','N/A')}",
-            "",
-        ]
-    if d.get("ratios"):
-        r = d["ratios"]
-        lines += [
-            "KEY RATIOS TTM (use for peer context and validation):",
-            f"  P/E: {r.get('peRatioTTM','N/A')}x  |  P/B: {r.get('priceToBookRatioTTM','N/A')}x  |  EV/EBITDA: {r.get('enterpriseValueMultipleTTM','N/A')}x",
-            f"  ROE: {r.get('returnOnEquityTTM','N/A')}  |  ROA: {r.get('returnOnAssetsTTM','N/A')}",
-            f"  Net Margin: {r.get('netProfitMarginTTM','N/A')}  |  D/E: {r.get('debtEquityRatioTTM','N/A')}",
-            f"  Current Ratio: {r.get('currentRatioTTM','N/A')}  |  Dividend Yield: {r.get('dividendYieldTTM','N/A')}%",
-            f"  FCF/Share: {r.get('freeCashFlowPerShareTTM','N/A')}  |  Payout Ratio: {r.get('payoutRatioTTM','N/A')}",
-            "",
-        ]
-    return "\n".join(lines)
-
-
-async def _fmp_fetch_for_analysis(ticker: str) -> dict | None:
-    """Fetch live market + ratio data from FMP for AI enrichment."""
-    try:
-        sym = ticker.upper()
-        fmp_sym = f"{sym}.NS" if not sym.endswith(".NS") else sym
-
-        async with httpx.AsyncClient(timeout=12) as c:
-            results = await asyncio.gather(
-                c.get(f"{FMP_BASE}/v3/quote/{fmp_sym}", params={"apikey": FMP_API_KEY}),
-                c.get(f"{FMP_BASE}/v3/profile/{fmp_sym}", params={"apikey": FMP_API_KEY}),
-                c.get(f"{FMP_BASE}/v3/ratios-ttm/{fmp_sym}", params={"apikey": FMP_API_KEY}),
-                return_exceptions=True,
-            )
-
-        def safe_j(r):
-            try:
-                if isinstance(r, Exception): return None
-                if r.status_code != 200: return None
-                data = r.json()
-                if isinstance(data, dict) and "Error Message" in data: return None
-                return data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
-            except Exception:
-                return None
-
-        quote, profile, ratios = safe_j(results[0]), safe_j(results[1]), safe_j(results[2])
-
-        # Retry without .NS if failed
-        if not quote:
-            async with httpx.AsyncClient(timeout=12) as c:
-                r = await c.get(f"{FMP_BASE}/v3/quote/{sym}", params={"apikey": FMP_API_KEY})
-                quote = safe_j(r)
-
-        if not any([quote, profile, ratios]):
-            logger.warning(f"FMP returned no data for {fmp_sym}")
-            return None
-
-        logger.info(f"FMP enrichment OK for {fmp_sym}: quote={bool(quote)}, profile={bool(profile)}, ratios={bool(ratios)}")
-        return {"quote": quote, "profile": profile, "ratios": ratios}
-
-    except Exception as e:
-        logger.warning(f"FMP fetch error (non-fatal): {e}")
-        return None
 
 
 # ─── FMP HELPERS ─────────────────────────────────────────────────────────────
