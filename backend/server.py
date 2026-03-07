@@ -1475,14 +1475,12 @@ def _sync_gemini(text: str) -> dict:
 
 GROQ_MODELS_ACTIVE = [
     # (model_id, max_doc_chars, use_lean_prompt)
-    # llama-3.3-70b-versatile: 128k ctx → full prompt, 44k doc
-    ("llama-3.3-70b-versatile",     44000, False),
-    # mixtral-8x7b-32768: 32k ctx → full prompt, 16k doc
-    ("mixtral-8x7b-32768",          16000, False),
-    # llama3-70b-8192: 8k ctx → lean prompt, 14k doc
-    ("llama3-70b-8192",             14000, True),
-    # llama3-8b-8192: 8k ctx → lean prompt, 14k doc
-    ("llama3-8b-8192",              14000, True),
+    ("llama-3.3-70b-versatile",       44000, False),
+    ("llama-3.1-70b-versatile",       44000, False),
+    ("mixtral-8x7b-32768",            16000, False),
+    ("llama3-70b-8192",               14000, True),
+    ("llama3-8b-8192",                14000, True),
+    ("gemma2-9b-it",                  14000, True),
 ]
 
 def _sync_groq(text: str) -> dict:
@@ -1495,6 +1493,7 @@ def _sync_groq(text: str) -> dict:
         "Content-Type": "application/json",
     }
 
+    last_error = "unknown"
     for model, max_doc, lean in GROQ_MODELS_ACTIVE:
         try:
             prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
@@ -1510,22 +1509,34 @@ def _sync_groq(text: str) -> dict:
                 },
                 timeout=90,
             )
+            logger.info(f"Groq {model}: HTTP {resp.status_code}")
             if resp.status_code == 429:
-                logger.warning(f"Groq {model}: rate limited, trying next model")
+                logger.warning(f"Groq {model}: rate limited — {resp.text[:200]}")
                 continue
             if resp.status_code in (400, 404, 422):
-                logger.warning(f"Groq {model}: HTTP {resp.status_code} — skipping")
+                logger.warning(f"Groq {model}: HTTP {resp.status_code} — {resp.text[:200]}")
+                last_error = f"HTTP {resp.status_code}: {resp.text[:100]}"
                 continue
             if resp.status_code == 200:
                 raw = resp.json()["choices"][0]["message"]["content"]
                 logger.info(f"Groq {model}: ✅ received {len(raw)} chars")
                 return safe_parse_json(raw)
-            logger.warning(f"Groq {model}: unexpected HTTP {resp.status_code}: {resp.text[:100]}")
+            last_error = f"HTTP {resp.status_code}: {resp.text[:100]}"
+            logger.warning(f"Groq {model}: unexpected {last_error}")
+        except requests.exceptions.ConnectionError as ex:
+            last_error = f"ConnectionError: {str(ex)[:150]}"
+            logger.warning(f"Groq {model} connection failed: {last_error}")
+            continue
+        except requests.exceptions.Timeout:
+            last_error = "Timeout after 90s"
+            logger.warning(f"Groq {model} timed out")
+            continue
         except Exception as ex:
-            logger.warning(f"Groq {model} error: {str(ex)[:200]}")
+            last_error = str(ex)[:200]
+            logger.warning(f"Groq {model} error: {last_error}")
             continue
 
-    raise Exception("All Groq models failed or unavailable")
+    raise Exception(f"All Groq models failed. Last error: {last_error}")
 
 def _sync_together(text: str) -> dict:
     key = os.getenv("TOGETHER_API_KEY", "")
@@ -1568,18 +1579,23 @@ def _sync_openrouter(text: str) -> dict:
 
     import time
 
+    # EXACT model slugs from openrouter.ai/models?q=free - verified March 7, 2026
+    # Sorted by weekly usage (most popular/reliable first)
     # (model_id, max_doc_chars, use_lean_prompt)
     models = [
-        ("mistralai/mistral-small-3.1-24b-instruct:free",  20000, True),
-        ("google/gemini-2.0-flash-exp:free",               44000, False),
-        ("deepseek/deepseek-r1-zero:free",                 44000, False),
-        ("meta-llama/llama-3.3-70b-instruct:free",         44000, False),
-        ("qwen/qwen3-8b:free",                             20000, True),
-        ("qwen/qwen3-14b:free",                            44000, False),
-        ("qwen/qwen3-30b-a3b:free",                        44000, False),
-        ("microsoft/mai-ds-r1:free",                       44000, False),
-        ("tngtech/deepseek-r1t-chimera:free",              44000, False),
-        ("nvidia/llama-3.1-nemotron-ultra-253b-v1:free",   44000, False),
+        ("stepfun-ai/step-3-5-flash:free",                  44000, False),  # 679B tokens/wk, 256k ctx
+        ("arcee-ai/arcee-blitz:free",                       44000, False),  # 587B tokens/wk, 131k ctx
+        ("z-ai/glm-4-5-air:free",                           44000, False),  # 61.7B tokens/wk, 131k ctx
+        ("meta-llama/llama-3.3-70b-instruct:free",          44000, False),  # 2.22B tokens/wk, 128k ctx
+        ("openai/gpt-4o-mini-search-preview:free",          44000, False),  # 3.51B tokens/wk, 131k ctx
+        ("openai/gpt-4o:free",                              44000, False),  # 1.1B tokens/wk, 131k ctx
+        ("qwen/qwen3-coder-480b-a35b-instruct:free",        44000, False),  # 1.07B tokens/wk, 262k ctx
+        ("qwen/qwen3-235b-a22b:free",                       44000, False),  # 810M tokens/wk, 262k ctx
+        ("google/gemma-3-27b-it:free",                      44000, False),  # 693M tokens/wk, 131k ctx
+        ("mistralai/mistral-small-3.1-24b-instruct:free",   20000, True),   # 299M tokens/wk, 128k ctx
+        ("nous/hermes-3-llama-3.1-405b:free",               44000, False),  # 101M tokens/wk, 131k ctx
+        ("meta-llama/llama-3.2-3b-instruct:free",           14000, True),   # 88.1M tokens/wk, 131k ctx
+        ("google/gemma-3-12b-it:free",                      20000, True),   # 48.7M tokens/wk, 32k ctx
     ]
 
     headers = {
@@ -1602,6 +1618,7 @@ def _sync_openrouter(text: str) -> dict:
                           "temperature": 0.1, "max_tokens": 8192},
                     timeout=120,
                 )
+                logger.info(f"OpenRouter {model}: HTTP {resp.status_code}")
 
                 if resp.status_code == 429:
                     if attempt == 0:
@@ -1611,7 +1628,7 @@ def _sync_openrouter(text: str) -> dict:
                     break
 
                 if resp.status_code in (404, 400, 422):
-                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code} — skipping")
+                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}: {resp.text[:150]}")
                     break
 
                 if resp.status_code == 200:
@@ -1626,7 +1643,7 @@ def _sync_openrouter(text: str) -> dict:
                 logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}: {resp.text[:100]}")
                 break
 
-            except requests.Timeout:
+            except requests.exceptions.Timeout:
                 logger.warning(f"OpenRouter {model} timed out attempt {attempt+1}")
                 if attempt == 0:
                     continue
