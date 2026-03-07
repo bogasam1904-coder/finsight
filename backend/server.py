@@ -1201,16 +1201,18 @@ def _sync_gemini(text: str) -> dict:
 
         client = genai.Client(api_key=GEMINI_API_KEY)
 
+        # (model_id, max_prompt_chars) — Gemini has huge context windows
         models_to_try = [
-            "gemini-2.0-flash-exp",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro-002"
+            ("gemini-2.0-flash",          180000),
+            ("gemini-2.0-flash-exp",      180000),
+            ("gemini-1.5-flash",          180000),
+            ("gemini-1.5-pro-002",        180000),
         ]
 
-        for model_name in models_to_try:
+        for model_name, max_chars in models_to_try:
             try:
-                prompt = compress_prompt(build_prompt(text))
-
+                prompt = compress_prompt(build_prompt(text), max_chars=max_chars)
+                logger.info(f"Gemini {model_name}: sending {len(prompt):,} chars")
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt,
@@ -1219,71 +1221,60 @@ def _sync_gemini(text: str) -> dict:
                         max_output_tokens=8192,
                     )
                 )
-
                 raw_text = response.text
-                logger.info(f"Gemini {model_name}: {len(raw_text)} chars")
+                logger.info(f"Gemini {model_name}: received {len(raw_text)} chars")
                 return safe_parse_json(raw_text)
 
             except Exception as e:
                 err_str = str(e)
                 logger.warning(f"Gemini {model_name} failed: {err_str[:150]}")
-                if "429" in err_str or "quota" in err_str.lower():
-                    continue
-                if "404" in err_str or "not found" in err_str.lower():
-                    continue
+                continue  # always try next model
 
         raise Exception("All Gemini models failed")
 
     except ImportError:
         logger.warning("New google-genai package not found, using old API")
-
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
-
         model = genai.GenerativeModel("gemini-1.5-flash-latest")
-        resp = model.generate_content(build_prompt(text))
-
+        prompt = compress_prompt(build_prompt(text), max_chars=180000)
+        resp = model.generate_content(prompt)
         return safe_parse_json(resp.text)
 
 
 GROQ_MODELS_ACTIVE = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "deepseek-r1-distill-llama-70b",
+    # model_id, max_prompt_chars (conservative — Groq measures tokens not chars, ~4 chars/token)
+    ("llama-3.3-70b-versatile",        80000),   # 128k context
+    ("llama3-70b-8192",                28000),   # 8k context
+    ("llama3-8b-8192",                 24000),   # 8k context — fastest fallback
+    ("mixtral-8x7b-32768",             100000),  # 32k context
 ]
 
 def _sync_groq(text: str) -> dict:
     from groq import Groq
-
     gc = Groq(api_key=GROQ_API_KEY)
 
-    prompt = compress_prompt(build_prompt(text))
-
-    for model in GROQ_MODELS_ACTIVE:
+    for model, max_chars in GROQ_MODELS_ACTIVE:
         try:
+            prompt = compress_prompt(build_prompt(text), max_chars=max_chars)
+            logger.info(f"Groq {model}: sending {len(prompt):,} chars")
             resp = gc.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=8192
+                max_tokens=8192,
             )
-
             raw = resp.choices[0].message.content
-            logger.info(f"Groq {model}: {len(raw)} chars")
+            logger.info(f"Groq {model}: received {len(raw)} chars")
             return safe_parse_json(raw)
 
         except Exception as ex:
             err_str = str(ex)
-            logger.warning(f"Groq {model} failed: {err_str[:150]}")
+            logger.warning(f"Groq {model} failed: {err_str[:200]}")
+            # Always continue to next model regardless of error type
+            continue
 
-            if "429" in err_str or "rate limit" in err_str.lower():
-                continue
-            if "400" in err_str or "decommissioned" in err_str.lower():
-                continue
-            if "413" in err_str or "too large" in err_str.lower():
-                continue
-
-    raise Exception("All Groq models failed or unavailable")    
+    raise Exception("All Groq models failed or unavailable")
 
 def _sync_together(text: str) -> dict:
     key = os.getenv("TOGETHER_API_KEY", "")
@@ -1336,55 +1327,76 @@ def _sync_openrouter(text: str) -> dict:
 
     import time
 
+    # (model_id, max_prompt_chars)  — updated March 2026
+    # Free models confirmed active on OpenRouter
     models = [
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.1-8b-instruct:free",
-        "qwen/qwen-2.5-7b-instruct:free",
+        ("google/gemini-2.0-flash-thinking-exp:free",  180000),  # 1M ctx
+        ("google/gemini-2.5-pro-exp-03-25:free",       180000),  # 1M ctx  
+        ("deepseek/deepseek-chat-v3-0324:free",         60000),  # 64k ctx
+        ("deepseek/deepseek-r1:free",                   60000),  # 64k ctx
+        ("meta-llama/llama-4-maverick:free",            60000),  # large ctx
+        ("qwen/qwen2.5-vl-72b-instruct:free",           60000),
+        ("mistralai/mistral-small-3.1-24b-instruct:free", 60000),
     ]
 
-    prompt = compress_prompt(build_prompt(text))
-
-    for model in models:
+    for model, max_chars in models:
+        prompt = compress_prompt(build_prompt(text), max_chars=max_chars)
         for attempt in range(2):
             try:
+                logger.info(f"OpenRouter {model}: sending {len(prompt):,} chars (attempt {attempt+1})")
                 resp = httpx.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
                         "Authorization": f"Bearer {key}",
                         "HTTP-Referer": "https://finsight-vert.vercel.app",
                         "X-Title": "FinSight",
-                        "Content-Type": "application/json"
+                        "Content-Type": "application/json",
                     },
                     json={
                         "model": model,
-                        "messages": [
-                            {"role": "user", "content": prompt}
-                        ],
+                        "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.1,
-                        "max_tokens": 8192
+                        "max_tokens": 8192,
                     },
-                    timeout=90
+                    timeout=120,
                 )
 
-                if resp.status_code == 429 and attempt == 0:
-                    logger.warning(f"OpenRouter {model} rate limited, waiting 15s...")
-                    time.sleep(15)
-                    continue
+                if resp.status_code == 429:
+                    wait = 20 if attempt == 0 else 0
+                    logger.warning(f"OpenRouter {model} rate-limited — waiting {wait}s")
+                    if attempt == 0:
+                        time.sleep(wait)
+                        continue
+                    break  # give up on this model after 2nd rate limit
+
+                if resp.status_code in (404, 400, 422):
+                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code} — model unavailable, skipping")
+                    break  # try next model immediately
 
                 if resp.status_code == 200:
-                    raw = resp.json()["choices"][0]["message"]["content"]
-                    logger.info(f"OpenRouter {model}: {len(raw)} chars")
+                    body = resp.json()
+                    # OpenRouter sometimes returns an error inside a 200
+                    if "error" in body:
+                        err_msg = body["error"].get("message", str(body["error"]))
+                        logger.warning(f"OpenRouter {model} error in body: {err_msg[:150]}")
+                        break
+                    raw = body["choices"][0]["message"]["content"]
+                    logger.info(f"OpenRouter {model}: received {len(raw)} chars")
                     return safe_parse_json(raw)
 
-                else:
-                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
-                    break
+                logger.warning(f"OpenRouter {model}: unexpected HTTP {resp.status_code}")
+                break
 
+            except httpx.TimeoutException:
+                logger.warning(f"OpenRouter {model} timed out (attempt {attempt+1})")
+                if attempt == 0:
+                    continue
+                break
             except Exception as e:
                 logger.warning(f"OpenRouter {model} error: {str(e)[:150]}")
                 break
 
-    raise Exception("All OpenRouter models failed")
+    raise Exception("All OpenRouter models failed or unavailable")
 
 
 def _extract_metrics_from_text(text: str) -> dict:
