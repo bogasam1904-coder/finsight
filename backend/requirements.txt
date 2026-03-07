@@ -15,8 +15,9 @@ bcrypt==4.2.0
 
 # AI Providers
 google-genai>=1.7.0
-# groq SDK removed — calling Groq API directly via httpx to avoid proxies conflict
+# groq SDK removed — calling Groq API directly via requests
 httpx>=0.28.1,<1.0.0
+requests>=2.31.0
 
 # PDF Processing
 pypdf==4.3.1

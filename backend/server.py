@@ -1,4 +1,4 @@
-import os, uuid, logging, json, io, asyncio, httpx, re
+import os, uuid, logging, json, io, asyncio, httpx, re, requests
 from collections import defaultdict
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -1486,20 +1486,22 @@ GROQ_MODELS_ACTIVE = [
 ]
 
 def _sync_groq(text: str) -> dict:
-    """Call Groq API directly via httpx — avoids Groq SDK proxies incompatibility."""
+    """Call Groq API directly via requests — reliable in ThreadPoolExecutor."""
     if not GROQ_API_KEY:
         raise Exception("No GROQ_API_KEY configured")
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
     for model, max_doc, lean in GROQ_MODELS_ACTIVE:
         try:
             prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
             logger.info(f"Groq {model}: sending {len(prompt):,} chars ({'lean' if lean else 'full'})")
-            resp = httpx.post(
+            resp = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json={
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
@@ -1509,7 +1511,7 @@ def _sync_groq(text: str) -> dict:
                 timeout=90,
             )
             if resp.status_code == 429:
-                logger.warning(f"Groq {model}: rate limited, trying next")
+                logger.warning(f"Groq {model}: rate limited, trying next model")
                 continue
             if resp.status_code in (400, 404, 422):
                 logger.warning(f"Groq {model}: HTTP {resp.status_code} — skipping")
@@ -1518,9 +1520,9 @@ def _sync_groq(text: str) -> dict:
                 raw = resp.json()["choices"][0]["message"]["content"]
                 logger.info(f"Groq {model}: ✅ received {len(raw)} chars")
                 return safe_parse_json(raw)
-            logger.warning(f"Groq {model}: HTTP {resp.status_code}")
+            logger.warning(f"Groq {model}: unexpected HTTP {resp.status_code}: {resp.text[:100]}")
         except Exception as ex:
-            logger.warning(f"Groq {model} failed: {str(ex)[:200]}")
+            logger.warning(f"Groq {model} error: {str(ex)[:200]}")
             continue
 
     raise Exception("All Groq models failed or unavailable")
@@ -1559,14 +1561,14 @@ def _sync_together(text: str) -> dict:
 
 
 def _sync_openrouter(text: str) -> dict:
+    """Call OpenRouter API via requests — reliable in ThreadPoolExecutor."""
     key = os.getenv("OPENROUTER_API_KEY", "")
     if not key:
         raise Exception("No OPENROUTER_API_KEY")
 
     import time
 
-    # CONFIRMED WORKING free models on OpenRouter - March 2026
-    # Prioritise models with large context first
+    # (model_id, max_doc_chars, use_lean_prompt)
     models = [
         ("mistralai/mistral-small-3.1-24b-instruct:free",  20000, True),
         ("google/gemini-2.0-flash-exp:free",               44000, False),
@@ -1580,19 +1582,21 @@ def _sync_openrouter(text: str) -> dict:
         ("nvidia/llama-3.1-nemotron-ultra-253b-v1:free",   44000, False),
     ]
 
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "HTTP-Referer": "https://finsight-vert.vercel.app",
+        "X-Title": "FinSight",
+        "Content-Type": "application/json",
+    }
+
     for model, max_doc, lean in models:
         prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
         for attempt in range(2):
             try:
                 logger.info(f"OpenRouter {model}: sending {len(prompt):,} chars attempt {attempt+1}")
-                resp = httpx.post(
+                resp = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "HTTP-Referer": "https://finsight-vert.vercel.app",
-                        "X-Title": "FinSight",
-                        "Content-Type": "application/json",
-                    },
+                    headers=headers,
                     json={"model": model,
                           "messages": [{"role": "user", "content": prompt}],
                           "temperature": 0.1, "max_tokens": 8192},
@@ -1619,63 +1623,10 @@ def _sync_openrouter(text: str) -> dict:
                     logger.info(f"OpenRouter {model}: ✅ received {len(raw)} chars")
                     return safe_parse_json(raw)
 
-                logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
+                logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}: {resp.text[:100]}")
                 break
 
-            except httpx.TimeoutException:
-                logger.warning(f"OpenRouter {model} timed out attempt {attempt+1}")
-                if attempt == 0:
-                    continue
-                break
-            except Exception as e:
-                logger.warning(f"OpenRouter {model} error: {str(e)[:150]}")
-                break
-
-    raise Exception("All OpenRouter models failed or unavailable")
-
-    for model, max_doc, lean in models:
-        prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
-        for attempt in range(2):
-            try:
-                logger.info(f"OpenRouter {model}: sending {len(prompt):,} chars attempt {attempt+1}")
-                resp = httpx.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "HTTP-Referer": "https://finsight-vert.vercel.app",
-                        "X-Title": "FinSight",
-                        "Content-Type": "application/json",
-                    },
-                    json={"model": model,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "temperature": 0.1, "max_tokens": 8192},
-                    timeout=120,
-                )
-
-                if resp.status_code == 429:
-                    if attempt == 0:
-                        logger.warning(f"OpenRouter {model} rate-limited — waiting 20s")
-                        time.sleep(20)
-                        continue
-                    break  # second rate-limit → skip model
-
-                if resp.status_code in (404, 400, 422):
-                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code} — skipping")
-                    break
-
-                if resp.status_code == 200:
-                    body = resp.json()
-                    if "error" in body:
-                        logger.warning(f"OpenRouter {model} body error: {str(body['error'])[:150]}")
-                        break
-                    raw = body["choices"][0]["message"]["content"]
-                    logger.info(f"OpenRouter {model}: received {len(raw)} chars")
-                    return safe_parse_json(raw)
-
-                logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
-                break
-
-            except httpx.TimeoutException:
+            except requests.Timeout:
                 logger.warning(f"OpenRouter {model} timed out attempt {attempt+1}")
                 if attempt == 0:
                     continue
