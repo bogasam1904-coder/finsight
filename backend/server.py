@@ -385,9 +385,7 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
     return []
 
 
-# ─── PDF EXTRACTION (FIXED) ──────────────────────────────────────────────────
-
-# ─── ADVANCED TABLE + METRIC EXTRACTION ─────────────────────────────
+# ─── PDF EXTRACTION ──────────────────────────────────────────────────────────
 
 def extract_tables_from_pdf(raw_bytes: bytes):
     """
@@ -395,52 +393,31 @@ def extract_tables_from_pdf(raw_bytes: bytes):
     Returns list of tables with rows preserved.
     """
     tables = []
-
     try:
         import pdfplumber
-
         with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
             for page_num, page in enumerate(pdf.pages):
                 extracted = page.extract_tables()
-
                 for table in extracted:
                     clean_table = []
-
                     for row in table:
-                        cleaned = [
-                            str(cell).strip() if cell else ""
-                            for cell in row
-                        ]
-
+                        cleaned = [str(cell).strip() if cell else "" for cell in row]
                         if any(cleaned):
                             clean_table.append(cleaned)
-
                     if clean_table:
-                        tables.append({
-                            "page": page_num + 1,
-                            "rows": clean_table
-                        })
-
+                        tables.append({"page": page_num + 1, "rows": clean_table})
         logger.info(f"Extracted {len(tables)} tables")
-
     except Exception as e:
         logger.warning(f"Table extraction failed: {e}")
-
     return tables
 
 
 def parse_financial_metrics(tables):
     """
     Extract key financial metrics from tables.
-    Covers all major financial analysis types:
-    Vertical, Horizontal, Leverage, Liquidity, Profitability,
-    Efficiency, Cash Flow, Rates of Return, Valuation, Variance.
     """
-
     metrics = defaultdict(str)
-
     keywords = {
-        # ── Income Statement ──────────────────────────────────────────
         "revenue": ["revenue", "total income", "income from operations", "net sales", "revenue from operations"],
         "revenue_previous": ["previous revenue", "prior year revenue"],
         "gross_profit": ["gross profit", "gross income"],
@@ -454,8 +431,6 @@ def parse_financial_metrics(tables):
         "tax_expense": ["tax expense", "income tax", "provision for tax"],
         "eps_basic": ["basic eps", "basic earnings per share"],
         "eps_diluted": ["diluted eps", "diluted earnings per share", "earnings per share", "eps"],
-
-        # ── Balance Sheet ─────────────────────────────────────────────
         "total_assets": ["total assets"],
         "current_assets": ["current assets", "total current assets"],
         "non_current_assets": ["non-current assets", "non current assets", "fixed assets"],
@@ -469,15 +444,11 @@ def parse_financial_metrics(tables):
         "total_equity": ["total equity", "shareholders equity", "net worth", "stockholders equity"],
         "reserves_surplus": ["reserves and surplus", "reserves & surplus"],
         "share_capital": ["share capital", "equity capital"],
-
-        # ── Cash Flow ────────────────────────────────────────────────
         "operating_cash_flow": ["cash flow from operating", "net cash from operations", "operating cash flow", "ocf"],
         "investing_cash_flow": ["cash flow from investing", "investing activities"],
         "financing_cash_flow": ["cash flow from financing", "financing activities"],
         "free_cash_flow": ["free cash flow", "fcf"],
         "capex": ["capital expenditure", "capex", "purchase of fixed assets", "additions to property"],
-
-        # ── Ratios (if directly stated in the document) ───────────────
         "current_ratio": ["current ratio"],
         "quick_ratio": ["quick ratio", "acid test ratio", "acid-test ratio"],
         "debt_equity_ratio": ["debt to equity", "debt/equity", "d/e ratio"],
@@ -497,38 +468,24 @@ def parse_financial_metrics(tables):
     }
 
     for table in tables:
-
         for row in table["rows"]:
-
             row_text = " ".join(row).lower()
-
             for metric, keys in keywords.items():
-
-                if metrics.get(metric):   # already found — skip
+                if metrics.get(metric):
                     continue
-
                 if any(k in row_text for k in keys):
-
-                    numbers = re.findall(
-                        r'-?\d[\d,\.]*',
-                        row_text
-                    )
-
+                    numbers = re.findall(r'-?\d[\d,\.]*', row_text)
                     if numbers:
                         metrics[metric] = numbers[0]
 
     logger.info(f"Extracted metrics: {dict(metrics)}")
-
     return dict(metrics)
 
 
 def compute_financial_ratios(metrics: dict) -> dict:
     """
     Compute derived financial ratios from raw extracted metrics.
-    Covers Vertical, Leverage, Liquidity, Profitability, Efficiency, and Cash Flow analysis.
-    Returns only ratios that can be computed from available data.
     """
-
     def _to_float(val: str) -> Optional[float]:
         if not val:
             return None
@@ -551,80 +508,58 @@ def compute_financial_ratios(metrics: dict) -> dict:
 
     ratios: dict = {}
 
-    rev  = metrics.get("revenue")
-    pat  = metrics.get("net_profit")
-    ebitda = metrics.get("ebitda")
-    ebit = metrics.get("ebit")
-    gross  = metrics.get("gross_profit")
-    debt   = metrics.get("borrowings")
-    equity = metrics.get("total_equity")
-    curr_a = metrics.get("current_assets")
-    curr_l = metrics.get("current_liabilities")
-    cash   = metrics.get("cash_equivalents")
-    inv    = metrics.get("inventory")
-    recv   = metrics.get("accounts_receivable")
-    assets = metrics.get("total_assets")
-    ocf    = metrics.get("operating_cash_flow")
+    rev      = metrics.get("revenue")
+    pat      = metrics.get("net_profit")
+    ebitda   = metrics.get("ebitda")
+    ebit     = metrics.get("ebit")
+    gross    = metrics.get("gross_profit")
+    debt     = metrics.get("borrowings")
+    equity   = metrics.get("total_equity")
+    curr_a   = metrics.get("current_assets")
+    curr_l   = metrics.get("current_liabilities")
+    cash     = metrics.get("cash_equivalents")
+    inv      = metrics.get("inventory")
+    assets   = metrics.get("total_assets")
+    ocf      = metrics.get("operating_cash_flow")
     fin_cost = metrics.get("finance_cost")
     rev_prev = metrics.get("revenue_previous")
 
-    # ── Profitability Ratios ─────────────────────────────────────────
     r = _pct(gross, rev)
     if r: ratios["gross_margin_pct"] = r
-
     r = _pct(ebitda, rev)
     if r: ratios["ebitda_margin_pct"] = r
-
     r = _pct(ebit, rev)
     if r: ratios["ebit_margin_pct"] = r
-
     r = _pct(pat, rev)
     if r: ratios["net_profit_margin_pct"] = r
-
     r = _pct(pat, equity)
     if r: ratios["return_on_equity_pct"] = r
-
     r = _pct(pat, assets)
     if r: ratios["return_on_assets_pct"] = r
-
-    # ── Leverage Ratios ──────────────────────────────────────────────
     r = _ratio(debt, equity)
     if r: ratios["debt_to_equity"] = r
-
     r = _ratio(debt, ebitda)
     if r: ratios["debt_to_ebitda"] = r
-
-    # Interest coverage = EBIT / Finance Cost
     r = _ratio(ebit or ebitda, fin_cost)
     if r: ratios["interest_coverage_ratio"] = r
-
-    # ── Liquidity Ratios ─────────────────────────────────────────────
     r = _ratio(curr_a, curr_l)
     if r: ratios["current_ratio"] = r
 
-    # Quick ratio = (Current Assets - Inventory) / Current Liabilities
-    ca_f = _to_float(curr_a)
+    ca_f  = _to_float(curr_a)
     inv_f = _to_float(inv) or 0.0
     cl_f  = _to_float(curr_l)
     if ca_f is not None and cl_f and cl_f != 0:
         ratios["quick_ratio"] = str(round((ca_f - inv_f) / cl_f, 2))
 
-    # Cash ratio
     r = _ratio(cash, curr_l)
     if r: ratios["cash_ratio"] = r
-
-    # ── Efficiency Ratios ────────────────────────────────────────────
     r = _ratio(rev, assets)
     if r: ratios["asset_turnover"] = r
-
     r = _ratio(rev, inv)
     if r: ratios["inventory_turnover"] = r
-
-    # Operating cash flow to current liabilities
     r = _ratio(ocf, curr_l)
     if r: ratios["ocf_to_current_liabilities"] = r
 
-    # ── Horizontal Analysis (YoY Revenue Growth) ─────────────────────
     if rev and rev_prev:
         rev_f  = _to_float(rev)
         prev_f = _to_float(rev_prev)
@@ -635,10 +570,10 @@ def compute_financial_ratios(metrics: dict) -> dict:
     logger.info(f"Computed ratios: {ratios}")
     return ratios
 
+
 def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
     """
-    Use pdfplumber for superior table extraction — preserves column alignment
-    and prevents the decimal/digit-dropping bug that affects pypdf on tabular data.
+    Use pdfplumber for superior table extraction.
     """
     try:
         import pdfplumber
@@ -649,23 +584,17 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
                     continue
                 page = pdf.pages[i]
                 page_text = ""
-
-                # Extract tables first — preserves numbers correctly
                 tables = page.extract_tables()
                 for table in tables:
                     for row in table:
                         cleaned = [str(cell).strip() if cell else "" for cell in row]
                         if any(cleaned):
                             page_text += " | ".join(cleaned) + "\n"
-
-                # Then extract remaining text
                 raw_text = page.extract_text() or ""
                 if raw_text.strip():
                     page_text += raw_text
-
                 if page_text.strip():
                     result += f"\n--- PAGE {i+1} ---\n{page_text}\n"
-
         logger.info(f"pdfplumber extracted {len(result):,} chars")
         return result
     except ImportError:
@@ -679,8 +608,6 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
 def _select_financial_pages(raw_bytes: bytes) -> list:
     """
     Score every page by financial keyword density.
-    Returns sorted list of page indices that contain financial data.
-    Always includes first 5 pages.
     """
     reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
     total  = len(reader.pages)
@@ -700,46 +627,20 @@ def _select_financial_pages(raw_bytes: bytes) -> list:
     for i, page in enumerate(reader.pages):
         t = (page.extract_text() or "").lower()
         score = sum(1 for kw in KEYWORDS if kw in t)
-        if score >= 2:  # lowered from 3 — capture more pages with financial data
+        if score >= 2:
             core_pages.add(i)
 
     logger.info(f"PDF: {total} pages total, {len(core_pages)} financial pages selected: {sorted(core_pages)}")
     return sorted(core_pages)
 
 
-def _validate_extracted_numbers(text: str, source_text: str) -> bool:
-    """
-    Basic sanity check: verify key numbers from the extracted text
-    actually appear in the raw source. Logs a warning if mismatch found.
-    """
-    # Find all number patterns in extracted text
-    numbers = re.findall(r'\b\d{2,}(?:,\d{3})*(?:\.\d+)?\b', text)
-    mismatches = 0
-    for num in numbers[:20]:  # check first 20 numbers
-        num_clean = num.replace(",", "")
-        if num_clean not in source_text.replace(",", ""):
-            mismatches += 1
-    if mismatches > 5:
-        logger.warning(f"Number validation: {mismatches}/20 numbers not found in source — possible extraction issue")
-        return False
-    return True
-
-
 def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
     """
-    FIXED extraction pipeline:
-    1. Select financial pages using keyword scoring
-    2. Use pdfplumber (primary) for table-aware extraction — fixes digit-dropping bug
-    3. Fall back to pypdf if pdfplumber unavailable
-    4. Validate extracted numbers against raw bytes
-    5. Add data integrity note for partial documents (newspaper extracts etc.)
+    Full extraction pipeline with pdfplumber primary, pypdf fallback.
     """
     page_indices = _select_financial_pages(raw_bytes)
-
-    # PRIMARY: pdfplumber — preserves table column alignment and numbers correctly
     result = _extract_with_pdfplumber(raw_bytes, page_indices)
 
-    # FALLBACK: pypdf
     if not result.strip():
         logger.info("Falling back to pypdf extraction")
         reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
@@ -750,7 +651,6 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
                 result += f"\n--- PAGE {i+1} ---\n{pt}\n"
         logger.info(f"pypdf extracted {len(result):,} chars")
 
-    # Detect if this is a partial/newspaper extract — flag it for the model
     doc_type_hint = ""
     lower_result = result.lower()
     is_partial = (
@@ -778,7 +678,6 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
 def extract_pdf_text(raw_bytes: bytes) -> str:
     """
     Entry point for PDF processing.
-    Validates the PDF, checks it has selectable text, then extracts financial pages.
     """
     try:
         reader    = pypdf.PdfReader(io.BytesIO(raw_bytes))
@@ -841,15 +740,9 @@ def _repair_json(s: str) -> str:
     return s
 
 
-# ─── AI PROMPT (UPGRADED) ────────────────────────────────────────────────────
-
-# ─── TEXT CHUNKING FOR LARGE FILINGS ───────────────────────────────
+# ─── AI PROMPTS ──────────────────────────────────────────────────────────────
 
 def split_into_chunks(text, size=12000, overlap=1200):
-    """
-    Split text into overlapping chunks.
-    Larger size ensures more context per chunk; overlap prevents boundary cut-offs.
-    """
     chunks = []
     start = 0
     while start < len(text):
@@ -860,7 +753,6 @@ def split_into_chunks(text, size=12000, overlap=1200):
     return chunks
 
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
-    """Full-context institutional prompt matching exact JSON schema."""
     snippet = text[:max_doc_chars]
     logger.info(f"build_prompt: {len(snippet):,} chars (from {len(text):,} total)")
     return f"""Analyze the provided financial document and return ONLY one valid JSON object. Do not include markdown, explanations, code fences, or additional commentary. The response must strictly conform to the JSON schema provided below.
@@ -1079,7 +971,6 @@ FINANCIAL DOCUMENT:
 
 
 def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
-    """Lean prompt for small-context models — same schema, compact template."""
     snippet = text[:max_doc_chars]
     logger.info(f"build_lean_prompt: {len(snippet):,} chars (from {len(text):,} total)")
     return f"""Analyze this financial document and return ONLY valid JSON — no markdown, no preamble, no code fences.
@@ -1152,13 +1043,8 @@ FINANCIAL DOCUMENT:
 def _extract_metrics_from_text(text: str) -> dict:
     """
     Regex-based metric extraction directly from extracted text.
-    Works on the plain text string (not PDF bytes), so it always runs.
-    Captures the most common label patterns in Indian financial filings.
     """
     metrics = defaultdict(str)
-    t = text  # preserve original case for number extraction
-
-    # Pattern: label ... number (handles both "Label  1,234.56" and "Label: 1,234.56")
     NUM = r'[-]?\d{1,3}(?:,\d{2,3})*(?:\.\d+)?'
 
     patterns = {
@@ -1198,7 +1084,7 @@ def _extract_metrics_from_text(text: str) -> dict:
         "roce":               [r'return on capital employed[^\n]{0,30}?(' + NUM + r')', r'\broce\b[^\n]{0,30}?(' + NUM + r')'],
     }
 
-    t_lower = t.lower()
+    t_lower = text.lower()
     for metric, pats in patterns.items():
         for pat in pats:
             m = re.search(pat, t_lower)
@@ -1209,19 +1095,256 @@ def _extract_metrics_from_text(text: str) -> dict:
     return dict(metrics)
 
 
+# ─── AI PROVIDER FUNCTIONS ───────────────────────────────────────────────────
+
+def _sync_gemini(text: str) -> dict:
+    """
+    Google Gemini — primary AI provider.
+    Uses gemini-2.0-flash first, falls back through flash and pro variants.
+    """
+    if not GEMINI_API_KEY:
+        raise Exception("GEMINI_API_KEY not configured")
+
+    models = [
+        ("gemini-2.0-flash",        44000, False),
+        ("gemini-1.5-flash",        44000, False),
+        ("gemini-1.5-pro",          44000, False),
+        ("gemini-1.5-flash-8b",     20000, True),
+    ]
+
+    last_error = "unknown"
+    for model, max_doc, lean in models:
+        try:
+            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            logger.info("Gemini %s: sending %d chars", model, len(prompt))
+            resp = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.1,
+                        "maxOutputTokens": 8192,
+                    },
+                },
+                timeout=120,
+            )
+            logger.info("Gemini %s: HTTP %d", model, resp.status_code)
+
+            if resp.status_code == 200:
+                body = resp.json()
+                candidates = body.get("candidates", [])
+                if candidates:
+                    raw = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    if raw:
+                        logger.info("Gemini %s: received %d chars", model, len(raw))
+                        return safe_parse_json(raw)
+                    logger.warning("Gemini %s: empty response", model)
+                else:
+                    last_error = f"No candidates: {body.get('promptFeedback', '')}"
+                    logger.warning("Gemini %s: %s", model, last_error)
+                continue
+
+            if resp.status_code == 429:
+                last_error = "Rate limited (429)"
+                logger.warning("Gemini %s rate limited, trying next model", model)
+                continue
+
+            last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            logger.warning("Gemini %s: %s", model, last_error)
+
+        except requests.exceptions.Timeout:
+            last_error = "Timeout after 120s"
+            logger.warning("Gemini %s timed out", model)
+            continue
+        except Exception as e:
+            last_error = str(e)[:200]
+            logger.warning("Gemini %s error: %s", model, last_error)
+            continue
+
+    raise Exception(f"All Gemini models failed. Last: {last_error}")
+
+
+def _sync_groq(text: str) -> dict:
+    """
+    Groq — ultra-fast inference, free tier.
+    """
+    if not GROQ_API_KEY:
+        raise Exception("GROQ_API_KEY not configured")
+
+    models = [
+        ("llama-3.3-70b-versatile",   44000, False),
+        ("llama-3.1-70b-versatile",   44000, False),
+        ("llama-3.1-8b-instant",      20000, True),
+        ("mixtral-8x7b-32768",        20000, True),
+    ]
+
+    last_error = "unknown"
+    for model, max_doc, lean in models:
+        try:
+            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+            logger.info("Groq %s: sending %d chars", model, len(prompt))
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 8192,
+                    "temperature": 0.1,
+                },
+                timeout=120,
+            )
+            logger.info("Groq %s: HTTP %d", model, resp.status_code)
+
+            if resp.status_code == 200:
+                raw = resp.json()["choices"][0]["message"]["content"]
+                if raw:
+                    logger.info("Groq %s: received %d chars", model, len(raw))
+                    return safe_parse_json(raw)
+                logger.warning("Groq %s: empty response", model)
+                continue
+
+            if resp.status_code == 429:
+                last_error = "Rate limited (429)"
+                logger.warning("Groq %s rate limited, trying next model", model)
+                continue
+
+            last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            logger.warning("Groq %s: %s", model, last_error)
+
+        except requests.exceptions.Timeout:
+            last_error = "Timeout after 120s"
+            logger.warning("Groq %s timed out", model)
+        except Exception as e:
+            last_error = str(e)[:200]
+            logger.warning("Groq %s error: %s", model, last_error)
+
+    raise Exception(f"All Groq models failed. Last: {last_error}")
+
+
+def _sync_together(text: str) -> dict:
+    """
+    Together AI — strong open models with generous free tier.
+    """
+    api_key = os.getenv("TOGETHER_API_KEY", "")
+    if not api_key:
+        raise Exception("TOGETHER_API_KEY not configured")
+
+    models = [
+        ("meta-llama/Llama-3.3-70B-Instruct-Turbo",      44000, False),
+        ("meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", 44000, False),
+        ("meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",  20000, True),
+    ]
+
+    last_error = "unknown"
+    for model, max_doc, lean in models:
+        try:
+            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+            logger.info("Together %s: sending %d chars", model, len(prompt))
+            resp = requests.post(
+                "https://api.together.xyz/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 8192,
+                    "temperature": 0.1,
+                },
+                timeout=120,
+            )
+            logger.info("Together %s: HTTP %d", model, resp.status_code)
+
+            if resp.status_code == 200:
+                raw = resp.json()["choices"][0]["message"]["content"]
+                if raw:
+                    logger.info("Together %s: received %d chars", model, len(raw))
+                    return safe_parse_json(raw)
+                logger.warning("Together %s: empty response", model)
+                continue
+
+            last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            logger.warning("Together %s: %s", model, last_error)
+
+        except requests.exceptions.Timeout:
+            last_error = "Timeout after 120s"
+            logger.warning("Together %s timed out", model)
+        except Exception as e:
+            last_error = str(e)[:200]
+            logger.warning("Together %s error: %s", model, last_error)
+
+    raise Exception(f"All Together models failed. Last: {last_error}")
+
+
+def _sync_openrouter(text: str) -> dict:
+    """
+    OpenRouter — routes to multiple providers with generous free tier.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise Exception("OPENROUTER_API_KEY not configured")
+
+    models = [
+        ("meta-llama/llama-3.3-70b-instruct", 44000, False),
+        ("meta-llama/llama-3.1-70b-instruct", 44000, False),
+        ("google/gemma-2-27b-it",             20000, True),
+        ("mistralai/mistral-7b-instruct",     20000, True),
+    ]
+
+    last_error = "unknown"
+    for model, max_doc, lean in models:
+        try:
+            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+            logger.info("OpenRouter %s: sending %d chars", model, len(prompt))
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://finsight-vert.vercel.app",
+                    "X-Title": "FinSight",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 8192,
+                    "temperature": 0.1,
+                },
+                timeout=120,
+            )
+            logger.info("OpenRouter %s: HTTP %d", model, resp.status_code)
+
+            if resp.status_code == 200:
+                raw = resp.json()["choices"][0]["message"]["content"]
+                if raw:
+                    logger.info("OpenRouter %s: received %d chars", model, len(raw))
+                    return safe_parse_json(raw)
+                logger.warning("OpenRouter %s: empty response", model)
+                continue
+
+            last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            logger.warning("OpenRouter %s: %s", model, last_error)
+
+        except requests.exceptions.Timeout:
+            last_error = "Timeout after 120s"
+            logger.warning("OpenRouter %s timed out", model)
+        except Exception as e:
+            last_error = str(e)[:200]
+            logger.warning("OpenRouter %s error: %s", model, last_error)
+
+    raise Exception(f"All OpenRouter models failed. Last: {last_error}")
+
+
 def _sync_cloudflare(text: str) -> dict:
     """
     Cloudflare Workers AI — free 10,000 requests/day, no rate limiting issues.
-    Uses @cf/meta/llama-3.3-70b-instruct-fp8-fast as primary model.
-    Requires CF_ACCOUNT_ID and CF_API_TOKEN in environment.
     """
     cf_account = os.getenv("CF_ACCOUNT_ID", "")
     cf_token   = os.getenv("CF_API_TOKEN", "")
     if not cf_account or not cf_token:
         raise Exception("CF_ACCOUNT_ID or CF_API_TOKEN not configured")
 
-    # (model_id, max_doc_chars, use_lean)
-    # Cloudflare free tier models — all have generous context windows
     models = [
         ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 44000, False),
         ("@cf/meta/llama-3.1-70b-instruct",           44000, False),
@@ -1256,7 +1379,6 @@ def _sync_cloudflare(text: str) -> dict:
 
             if resp.status_code == 200:
                 body = resp.json()
-                # CF returns {"result": {"response": "..."}, "success": true}
                 if body.get("success"):
                     raw = body.get("result", {}).get("response", "")
                     if raw:
@@ -1284,21 +1406,14 @@ def _sync_cloudflare(text: str) -> dict:
     raise Exception(f"All Cloudflare models failed. Last: {last_error}")
 
 
-
-
-
 # ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
 async def run_analysis(text: str) -> dict:
 
     if not text or len(text.strip()) < 100:
         raise Exception("PDF extraction returned insufficient text.")
 
-    # Use as much of the document as possible — do NOT truncate aggressively here.
-    # build_prompt will take up to 55,000 chars; compress_prompt caps at 65,000.
-    # We pass the full extracted text and let the prompt builder slice it.
     full_text = text.strip()
 
-    # Guard: reject if text lacks any financial content
     financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh",
                           "eps", "ebitda", "loss", "balance sheet", "borrowing", "equity"]
     found_kw = [kw for kw in financial_keywords if kw.lower() in full_text.lower()]
@@ -1315,17 +1430,11 @@ async def run_analysis(text: str) -> dict:
     loop   = asyncio.get_event_loop()
     errors = []
 
-    # Pre-extract structured metrics from the raw PDF bytes stored in text
-    # Note: extract_tables_from_pdf requires actual PDF bytes, not text.
-    # metrics/ratios are computed from raw bytes upstream in extract_pdf_text.
-    # Here we pass the already-extracted text string directly to the AI.
-    # The structured metrics block below is a best-effort regex pass on the text.
     metrics = _extract_metrics_from_text(full_text)
     ratios  = compute_financial_ratios(metrics)
     logger.info(f"Text-based metrics: {metrics}")
     logger.info(f"Computed ratios: {ratios}")
 
-    # Build the enriched text block handed to every AI provider
     metrics_block = ""
     if any(metrics.values()):
         metrics_block = f"""
@@ -1342,7 +1451,6 @@ IMPORTANT: If the document tables show different numbers, ALWAYS use the documen
 The regex hints above are frequently wrong on Indian quarterly filings due to mixed units.
 
 """
-
 
     enhanced_text = metrics_block + full_text
 
@@ -1372,9 +1480,8 @@ The regex hints above are frequently wrong on Indian quarterly filings due to mi
     raise Exception(f"All AI providers failed. {error_summary}")
 
 
-# ─── FMP (Financial Modeling Prep) HELPERS ───────────────────────────────────
+# ─── FMP HELPERS ─────────────────────────────────────────────────────────────
 
-# Simple in-memory TTL cache  { key: (timestamp, data) }
 _fmp_cache: dict = {}
 _FMP_CACHE_TTL   = 300  # 5 minutes
 
@@ -1391,7 +1498,6 @@ def _fmp_store(key: str, data):
     return data
 
 def _fmp_symbol(symbol: str) -> str:
-    """Convert NSE symbol to FMP format — FMP uses NSE suffix for Indian stocks."""
     sym = symbol.upper().strip()
     if sym.startswith("BSE_"):
         return sym.replace("BSE_", "") + ".BO"
@@ -1403,7 +1509,6 @@ def _safe(val, decimals=2):
     except: return None
 
 def _fmt_cr(val) -> str:
-    """Format a number (assumed INR) into crores string."""
     try:
         v = float(val)
         return f"₹{v/1e7:,.2f} Cr" if abs(v) >= 1e7 else f"₹{v:,.0f}"
@@ -1411,7 +1516,6 @@ def _fmt_cr(val) -> str:
 
 
 async def _fmp_get(endpoint: str, params: dict = None) -> dict:
-    """Async FMP API call with error handling."""
     if not FMP_API_KEY:
         raise Exception("FMP_API_KEY not configured")
     p = {"apikey": FMP_API_KEY, **(params or {})}
@@ -1426,11 +1530,6 @@ async def _fmp_get(endpoint: str, params: dict = None) -> dict:
 
 
 async def get_fmp_quote(symbol: str) -> dict:
-    """
-    Full quote for an NSE/BSE symbol using FMP.
-    Combines /quote, /profile, and /ratios endpoints.
-    Cached 5 minutes.
-    """
     sym = symbol.upper().strip()
     cached = _fmp_cached(f"quote:{sym}")
     if cached:
@@ -1440,7 +1539,6 @@ async def get_fmp_quote(symbol: str) -> dict:
     fmp_sym = _fmp_symbol(sym)
     logger.info(f"FMP fetching quote for {fmp_sym}")
 
-    # Fetch quote + profile in parallel
     try:
         quote_data, profile_data, ratio_data = await asyncio.gather(
             _fmp_get(f"/v3/quote/{fmp_sym}"),
@@ -1459,7 +1557,6 @@ async def get_fmp_quote(symbol: str) -> dict:
         change_pct = _safe(q.get("changesPercentage"))
         market_cap = q.get("marketCap")
 
-        # 52-week position
         w52h = _safe(q.get("yearHigh"))
         w52l = _safe(q.get("yearLow"))
         w52pos = None
@@ -1475,8 +1572,6 @@ async def get_fmp_quote(symbol: str) -> dict:
             "industry":      p.get("industry"),
             "currency":      p.get("currency", "INR"),
             "description":   p.get("description", "")[:300] if p.get("description") else None,
-
-            # Price
             "price":          price,
             "prev_close":     prev_close,
             "open":           _safe(q.get("open")),
@@ -1489,8 +1584,6 @@ async def get_fmp_quote(symbol: str) -> dict:
             "week_52_position_pct": w52pos,
             "volume":         q.get("volume"),
             "avg_volume":     q.get("avgVolume"),
-
-            # Valuation
             "market_cap":     market_cap,
             "market_cap_fmt": _fmt_cr(market_cap),
             "pe_ratio":       _safe(q.get("pe")),
@@ -1500,27 +1593,20 @@ async def get_fmp_quote(symbol: str) -> dict:
             "ev_ebitda":      _safe(r.get("enterpriseValueMultipleTTM")),
             "beta":           _safe(p.get("beta")),
             "shares_outstanding": p.get("sharesOutstanding"),
-
-            # Dividend
             "dividend_yield_pct": _safe(r.get("dividendYieldPercentageTTM")),
             "dividend_per_share": _safe(r.get("dividendPerShareTTM")),
-
-            # Profitability (TTM ratios)
             "gross_margin_pct":     _safe(r.get("grossProfitMarginTTM") and r["grossProfitMarginTTM"] * 100),
             "operating_margin_pct": _safe(r.get("operatingProfitMarginTTM") and r["operatingProfitMarginTTM"] * 100),
             "net_margin_pct":       _safe(r.get("netProfitMarginTTM") and r["netProfitMarginTTM"] * 100),
             "roe_pct":              _safe(r.get("returnOnEquityTTM") and r["returnOnEquityTTM"] * 100),
             "roa_pct":              _safe(r.get("returnOnAssetsTTM") and r["returnOnAssetsTTM"] * 100),
             "roic_pct":             _safe(r.get("returnOnCapitalEmployedTTM") and r["returnOnCapitalEmployedTTM"] * 100),
-
-            # Financial health
             "debt_to_equity":   _safe(r.get("debtEquityRatioTTM")),
             "current_ratio":    _safe(r.get("currentRatioTTM")),
             "quick_ratio":      _safe(r.get("quickRatioTTM")),
             "interest_coverage":_safe(r.get("interestCoverageTTM")),
             "asset_turnover":   _safe(r.get("assetTurnoverTTM")),
             "inventory_turnover":_safe(r.get("inventoryTurnoverTTM")),
-
             "data_source": "Financial Modeling Prep (FMP)",
             "fetched_at":  datetime.utcnow().isoformat() + "Z",
         }
@@ -1544,16 +1630,8 @@ async def health():
             "companies_in_db": company_count}
 
 
-# ─── FMP MARKET DATA ROUTES ───────────────────────────────────────────────────
-
 @app.get("/api/quote/{symbol}")
 async def get_quote(symbol: str):
-    """
-    Live market quote for NSE/BSE symbol via FMP.
-    Returns price, valuation, margins, ratios, 52-week range.
-    Cached 5 minutes.
-    Example: GET /api/quote/RELIANCE
-    """
     sym = symbol.upper().strip()
     if not sym:
         raise HTTPException(400, "Symbol is required")
@@ -1567,11 +1645,6 @@ async def get_quote(symbol: str):
 
 @app.get("/api/quote/{symbol}/history")
 async def get_quote_history(symbol: str, period: str = "1y"):
-    """
-    Historical daily OHLCV data for charting via FMP.
-    period: 1m, 3m, 6m, 1y, 3y, 5y
-    Example: GET /api/quote/TCS/history?period=6m
-    """
     if not FMP_API_KEY:
         raise HTTPException(503, "FMP_API_KEY not configured on server")
 
@@ -1613,10 +1686,6 @@ async def get_quote_history(symbol: str, period: str = "1y"):
 
 @app.get("/api/quote/{symbol}/financials")
 async def get_financials(symbol: str):
-    """
-    Annual Income Statement, Balance Sheet, Cash Flow (last 4 years) via FMP.
-    Example: GET /api/quote/INFY/financials
-    """
     if not FMP_API_KEY:
         raise HTTPException(503, "FMP_API_KEY not configured on server")
 
@@ -1630,9 +1699,9 @@ async def get_financials(symbol: str):
 
     try:
         income, balance, cashflow = await asyncio.gather(
-            _fmp_get(f"/v3/income-statement/{fmp_sym}",   {"limit": 4}),
+            _fmp_get(f"/v3/income-statement/{fmp_sym}",        {"limit": 4}),
             _fmp_get(f"/v3/balance-sheet-statement/{fmp_sym}", {"limit": 4}),
-            _fmp_get(f"/v3/cash-flow-statement/{fmp_sym}", {"limit": 4}),
+            _fmp_get(f"/v3/cash-flow-statement/{fmp_sym}",     {"limit": 4}),
         )
         result = {
             "symbol": sym, "fmp_symbol": fmp_sym,
@@ -1649,11 +1718,6 @@ async def get_financials(symbol: str):
 
 @app.post("/api/quotes/batch")
 async def get_batch_quotes(body: dict):
-    """
-    Fetch live quotes for up to 20 symbols in one call.
-    Body: { "symbols": ["RELIANCE", "TCS", "INFY"] }
-    Example: POST /api/quotes/batch
-    """
     symbols: list = body.get("symbols", [])
     if not symbols or not isinstance(symbols, list):
         raise HTTPException(400, 'Body must be { "symbols": ["SYM1", ...] }')
@@ -1676,10 +1740,6 @@ async def get_batch_quotes(body: dict):
 
 @app.get("/api/market/movers")
 async def get_market_movers():
-    """
-    Top 5 gainers and losers among Nifty 50 stocks via FMP.
-    Cached 5 minutes.
-    """
     if not FMP_API_KEY:
         raise HTTPException(503, "FMP_API_KEY not configured on server")
 
@@ -1717,40 +1777,7 @@ async def get_market_movers():
     result = {"gainers": gainers, "losers": losers, "universe": "Nifty 50",
               "fetched_at": datetime.utcnow().isoformat() + "Z"}
     return _fmp_store("market:movers", result)
-    """
-    Convert an NSE symbol to Yahoo Finance ticker.
-    NSE symbols use .NS suffix; BSE use .BO suffix.
-    BSE-only symbols are prefixed BSE_ in our DB.
-    """
-    sym = symbol.upper().strip()
-    if sym.startswith("BSE_"):
-        # BSE-only — use .BO suffix with the numeric code
-        return sym.replace("BSE_", "") + ".BO"
-    return sym + ".NS"
 
-
-def _safe_val(info: dict, *keys):
-    """Return first non-None value from info dict for given keys."""
-    for k in keys:
-        v = info.get(k)
-        if v is not None and v != "":
-            return v
-    return None
-
-
-def _fmt_large(val) -> str:
-    """Format large numbers into readable crore / lakh strings."""
-    try:
-        v = float(val)
-        if abs(v) >= 1e11:
-            return f"₹{v/1e7:,.2f} Cr"
-        if abs(v) >= 1e7:
-            return f"₹{v/1e7:,.2f} Cr"
-        if abs(v) >= 1e5:
-            return f"₹{v/1e5:,.2f} L"
-        return str(round(v, 2))
-    except (TypeError, ValueError):
-        return str(val) if val is not None else "N/A"
 
 @app.post("/api/admin/sync-companies")
 async def trigger_sync():
