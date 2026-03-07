@@ -863,10 +863,238 @@ def split_into_chunks(text, size=12000, overlap=1200):
     logger.info(f"Split document into {len(chunks)} chunks of ~{size} chars")
     return chunks
 
-def build_prompt(text: str) -> str:
-    # Use up to 55,000 chars — most annual reports / quarterly results fit within this
-    snippet = text[:55000]
-    logger.info(f"Prompt snippet: {len(snippet)} chars from {len(text)} total")
+def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
+    """
+    Full institutional-grade prompt. Use for large-context models (Gemini, DeepSeek, GPT-4).
+    Template overhead ~15k chars. Total prompt = ~15k + max_doc_chars.
+    Default max_doc_chars=44000 → total ~59k chars, safe for 64k-context models.
+    Pass max_doc_chars=160000 for Gemini 1M-context models.
+    """
+    snippet = text[:max_doc_chars]
+    logger.info(f"Full prompt: {len(snippet):,} doc chars (from {len(text):,} total)")
+
+    return f"""You are FinSight — a senior institutional equity research analyst at a top-tier investment bank.
+Your job: extract EVERY number from this financial document and produce the most detailed, accurate, investor-grade analysis possible.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 1 — EXHAUSTIVE EXTRACTION (MOST IMPORTANT RULE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Before writing a single output field, you MUST perform a complete scan:
+
+STEP 1: Read the entire document from top to bottom.
+STEP 2: Find and note EVERY table. Tables contain the most data. Look for:
+  - Standalone financial statements (P&L, Balance Sheet, Cash Flow)
+  - "Key Financial Data" / "Financial Highlights" / "Financial Summary" tables
+  - "Key Financial Ratios" sections — these often contain Current Ratio, D/E, ROE, ROCE already calculated
+  - Notes to Accounts — contain breakdowns of Borrowings, Receivables, Inventory, Capex
+  - Segment reporting tables — contain Revenue, EBIT per segment
+STEP 3: For EVERY number you find, record it with its label and period.
+STEP 4: Only AFTER completing the full scan, fill in the JSON output.
+
+FORBIDDEN: Writing "Not available in this filing" for ANY field unless you have
+read the COMPLETE document and confirmed the data is genuinely absent.
+FORBIDDEN: Skipping tables or footnotes.
+FORBIDDEN: Rounding or approximating numbers. Copy them exactly.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 2 — NUMBER ACCURACY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Copy numbers EXACTLY. Preserve ALL digits, commas, decimals.
+Always state the unit next to the number e.g. "20,078.39 Cr".
+If the document says "(₹ in Crores)", ALL numbers in that table are in Crores.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 3 — ALWAYS CALCULATE THESE RATIOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+When base numbers are available, ALWAYS compute (do not leave blank):
+  Gross/EBITDA/EBIT/Net Margin % | Revenue & PAT Growth YoY %
+  D/E | Debt/EBITDA | Interest Coverage | Current Ratio | Quick Ratio
+  Asset Turnover | Inventory Turnover | ROE | ROA | OCF/PAT | FCF
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 4 — COMMENTARY MUST BE SPECIFIC & NUMERIC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BAD:  "Revenue grew well."
+GOOD: "Revenue grew 18.4% YoY from ₹8,234 Cr to ₹9,750 Cr driven by 22% domestic surge."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HEALTH SCORE (0–100) — FILL BREAKDOWN FULLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Calculate each component and fill health_score_breakdown with:
+  - "pts": points awarded for this component
+  - "max": maximum possible points for this component
+  - "value": the actual metric value from the document (e.g. "18.4% YoY", "₹1,234 Cr", "1.8x")
+  - "reason": one sentence explaining why this score was awarded
+
+Scoring rules:
+  revenue_growth  (max 10): Revenue growing YoY = 10pts | declining = 0pts
+  net_margin      (max 20): >15%=20 | 10-15%=15 | 5-10%=10 | 0-5%=5 | negative=0
+  ebitda_margin   (max 15): >25%=15 | 15-25%=10 | 8-15%=6  | <8%=2
+  debt_to_equity  (max 15): <0.3=15 | 0.3-1.0=10 | 1.0-2.0=5 | >2.0=0
+  current_ratio   (max 10): >2.0=10 | 1.5-2.0=8 | 1.0-1.5=5 | <1.0=0
+  ocf_quality     (max 10): OCF > PAT = 10 | OCF positive = 7 | OCF negative = 0
+  roe             (max 10): >20%=10 | 15-20%=7 | 10-15%=4 | <10%=1
+  eps_growth      (max 10): EPS growing YoY = 10pts | declining = 0pts
+
+Labels: 0-40=Caution | 41-60=Fair | 61-75=Good | 76-88=Strong | 89-100=Exceptional
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — RETURN ONLY VALID JSON, NO MARKDOWN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{{
+  "company_name": "", "statement_type": "", "period": "",
+  "reporting_currency": "", "unit": "",
+  "health_score": 0, "health_label": "",
+  "health_score_breakdown": {{"revenue_growth_pts":0,"net_margin_pts":0,"ebitda_margin_pts":0,"debt_equity_pts":0,"current_ratio_pts":0,"ocf_quality_pts":0,"roe_pts":0,"eps_growth_pts":0,"total":0}},
+  "headline": "",
+  "executive_summary": "",
+  "income_statement": {{
+    "revenue":{{"current":"","previous":"","unit":""}},
+    "other_income":{{"current":"","previous":"","unit":""}},
+    "total_income":{{"current":"","previous":"","unit":""}},
+    "cost_of_goods_sold":{{"current":"","previous":"","unit":""}},
+    "gross_profit":{{"current":"","previous":"","unit":""}},
+    "employee_costs":{{"current":"","previous":"","unit":""}},
+    "other_expenses":{{"current":"","previous":"","unit":""}},
+    "ebitda":{{"current":"","previous":"","unit":""}},
+    "depreciation":{{"current":"","previous":"","unit":""}},
+    "ebit":{{"current":"","previous":"","unit":""}},
+    "finance_cost":{{"current":"","previous":"","unit":""}},
+    "pbt":{{"current":"","previous":"","unit":""}},
+    "tax_expense":{{"current":"","previous":"","unit":""}},
+    "pat":{{"current":"","previous":"","unit":""}},
+    "eps_basic":{{"current":"","previous":"","unit":"₹"}},
+    "eps_diluted":{{"current":"","previous":"","unit":"₹"}}
+  }},
+  "balance_sheet": {{
+    "total_assets":{{"current":"","previous":"","unit":""}},
+    "non_current_assets":{{"current":"","previous":"","unit":""}},
+    "fixed_assets_net":{{"current":"","previous":"","unit":""}},
+    "current_assets":{{"current":"","previous":"","unit":""}},
+    "inventories":{{"current":"","previous":"","unit":""}},
+    "trade_receivables":{{"current":"","previous":"","unit":""}},
+    "cash_equivalents":{{"current":"","previous":"","unit":""}},
+    "total_equity":{{"current":"","previous":"","unit":""}},
+    "share_capital":{{"current":"","previous":"","unit":""}},
+    "reserves_surplus":{{"current":"","previous":"","unit":""}},
+    "total_borrowings":{{"current":"","previous":"","unit":""}},
+    "long_term_borrowings":{{"current":"","previous":"","unit":""}},
+    "short_term_borrowings":{{"current":"","previous":"","unit":""}},
+    "trade_payables":{{"current":"","previous":"","unit":""}},
+    "current_liabilities":{{"current":"","previous":"","unit":""}}
+  }},
+  "cash_flow_statement": {{
+    "operating_cash_flow":{{"current":"","previous":"","unit":""}},
+    "investing_cash_flow":{{"current":"","previous":"","unit":""}},
+    "financing_cash_flow":{{"current":"","previous":"","unit":""}},
+    "capex":{{"current":"","previous":"","unit":""}},
+    "free_cash_flow":{{"current":"","previous":"","unit":""}}
+  }},
+  "key_metrics": [
+    {{"metric":"Revenue","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"Gross Profit","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"EBITDA","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"EBIT","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"PAT","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"EPS (Basic) ₹","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"Total Assets","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"Total Equity","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"Total Borrowings","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"Operating Cash Flow","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"Free Cash Flow","current":"","previous":"","change_pct":"","comment":""}},
+    {{"metric":"Cash & Equivalents","current":"","previous":"","change_pct":"","comment":""}}
+  ],
+  "vertical_analysis": {{
+    "gross_margin_pct":{{"current":"","previous":"","comment":""}},
+    "ebitda_margin_pct":{{"current":"","previous":"","comment":""}},
+    "ebit_margin_pct":{{"current":"","previous":"","comment":""}},
+    "net_profit_margin_pct":{{"current":"","previous":"","comment":""}},
+    "cogs_pct_revenue":{{"current":"","previous":"","comment":""}},
+    "employee_cost_pct":{{"current":"","previous":"","comment":""}},
+    "finance_cost_pct":{{"current":"","previous":"","comment":""}},
+    "commentary":""
+  }},
+  "horizontal_analysis": {{
+    "revenue_growth_yoy_pct":"","gross_profit_growth_yoy_pct":"",
+    "ebitda_growth_yoy_pct":"","pat_growth_yoy_pct":"","eps_growth_yoy_pct":"",
+    "total_assets_growth_yoy_pct":"","borrowings_growth_yoy_pct":"",
+    "notable_trends":[]
+  }},
+  "leverage_analysis": {{
+    "total_borrowings":"","long_term_borrowings":"","short_term_borrowings":"",
+    "debt_to_equity":"","debt_to_ebitda":"","interest_coverage_ratio":"",
+    "net_debt":"","net_debt_to_ebitda":"","commentary":""
+  }},
+  "liquidity_analysis": {{
+    "current_ratio":"","quick_ratio":"","cash_ratio":"",
+    "net_working_capital":"","cash_and_equivalents":"","commentary":""
+  }},
+  "profitability_analysis": {{
+    "gross_margin_pct":"","ebitda_margin_pct":"","ebit_margin_pct":"",
+    "net_profit_margin_pct":"","roe_pct":"","roa_pct":"","roic_pct":"","roce_pct":"",
+    "commentary":""
+  }},
+  "efficiency_analysis": {{
+    "asset_turnover":"","inventory_turnover_days":"","receivables_turnover_days":"",
+    "payables_turnover_days":"","cash_conversion_cycle_days":"","commentary":""
+  }},
+  "cash_flow_analysis": {{
+    "operating_cash_flow":"","investing_cash_flow":"","financing_cash_flow":"",
+    "capex":"","free_cash_flow":"","ocf_to_pat_ratio":"","fcf_margin_pct":"",
+    "cash_quality":"","commentary":""
+  }},
+  "rates_of_return": {{
+    "roe_pct":"","roa_pct":"","roic_pct":"","roce_pct":"",
+    "eps_basic":"","eps_diluted":"","eps_growth_pct":"",
+    "dividend_per_share":"","dividend_payout_ratio":"","commentary":""
+  }},
+  "highlights":[],
+  "risks":[],
+  "what_to_watch":[],
+  "investor_verdict":""
+}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINANCIAL DOCUMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{snippet}
+"""
+
+
+def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
+    """
+    Lean prompt for small-context models (8k–32k tokens).
+    Strips verbose instructions to absolute minimum so the document fits.
+    Template overhead ~2k chars. Total = ~2k + max_doc_chars.
+    """
+    snippet = text[:max_doc_chars]
+    logger.info(f"Lean prompt: {len(snippet):,} doc chars (from {len(text):,} total)")
+
+    return f"""You are a financial analyst. Analyse this document and return ONLY valid JSON (no markdown).
+
+Rules:
+- Extract every number exactly as written. Unit: state Cr/Lakh/₹ alongside each value.
+- Calculate all ratios from available data. Never leave calculable fields blank.
+- Commentary must contain specific numbers, not vague statements.
+- Only write "Not available" if the data is genuinely absent after reading the full document.
+
+Health score 0-100 — for each component fill: pts (awarded), max (max possible), value (actual metric), reason (one sentence why).
+Scoring: revenue_growth(max 10: growing=10,declining=0) + net_margin(max 20: >15%=20,10-15%=15,5-10%=10,0-5%=5,neg=0) + ebitda_margin(max 15: >25%=15,15-25%=10,8-15%=6,<8%=2) + DE(max 15: <0.3=15,0.3-1=10,1-2=5,>2=0) + current_ratio(max 10: >2=10,1.5-2=8,1-1.5=5,<1=0) + ocf(max 10: >PAT=10,pos=7,neg=0) + roe(max 10: >20%=10,15-20%=7,10-15%=4,<10%=1) + eps_growth(max 10: growing=10,declining=0)
+Labels: 0-40=Caution,41-60=Fair,61-75=Good,76-88=Strong,89-100=Exceptional
+
+Return this exact JSON structure filled with real data:
+{{"company_name":"","statement_type":"","period":"","reporting_currency":"","unit":"","health_score":0,"health_label":"","health_score_breakdown":{{"revenue_growth":{{"pts":0,"max":10,"value":"","reason":""}},"net_margin":{{"pts":0,"max":20,"value":"","reason":""}},"ebitda_margin":{{"pts":0,"max":15,"value":"","reason":""}},"debt_to_equity":{{"pts":0,"max":15,"value":"","reason":""}},"current_ratio":{{"pts":0,"max":10,"value":"","reason":""}},"ocf_quality":{{"pts":0,"max":10,"value":"","reason":""}},"roe":{{"pts":0,"max":10,"value":"","reason":""}},"eps_growth":{{"pts":0,"max":10,"value":"","reason":""}},"total":0}},"headline":"","executive_summary":"","income_statement":{{"revenue":{{"current":"","previous":"","unit":""}},"other_income":{{"current":"","previous":"","unit":""}},"total_income":{{"current":"","previous":"","unit":""}},"cost_of_goods_sold":{{"current":"","previous":"","unit":""}},"gross_profit":{{"current":"","previous":"","unit":""}},"employee_costs":{{"current":"","previous":"","unit":""}},"ebitda":{{"current":"","previous":"","unit":""}},"depreciation":{{"current":"","previous":"","unit":""}},"ebit":{{"current":"","previous":"","unit":""}},"finance_cost":{{"current":"","previous":"","unit":""}},"pbt":{{"current":"","previous":"","unit":""}},"tax_expense":{{"current":"","previous":"","unit":""}},"pat":{{"current":"","previous":"","unit":""}},"eps_basic":{{"current":"","previous":"","unit":"₹"}},"eps_diluted":{{"current":"","previous":"","unit":"₹"}}}},"balance_sheet":{{"total_assets":{{"current":"","previous":"","unit":""}},"current_assets":{{"current":"","previous":"","unit":""}},"inventories":{{"current":"","previous":"","unit":""}},"trade_receivables":{{"current":"","previous":"","unit":""}},"cash_equivalents":{{"current":"","previous":"","unit":""}},"total_equity":{{"current":"","previous":"","unit":""}},"total_borrowings":{{"current":"","previous":"","unit":""}},"long_term_borrowings":{{"current":"","previous":"","unit":""}},"short_term_borrowings":{{"current":"","previous":"","unit":""}},"trade_payables":{{"current":"","previous":"","unit":""}},"current_liabilities":{{"current":"","previous":"","unit":""}}}},"cash_flow_statement":{{"operating_cash_flow":{{"current":"","previous":"","unit":""}},"investing_cash_flow":{{"current":"","previous":"","unit":""}},"financing_cash_flow":{{"current":"","previous":"","unit":""}},"capex":{{"current":"","previous":"","unit":""}},"free_cash_flow":{{"current":"","previous":"","unit":""}}}},"key_metrics":[{{"metric":"Revenue","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"EBITDA","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"PAT","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"EPS (Basic)","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"Total Borrowings","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"Operating Cash Flow","current":"","previous":"","change_pct":"","comment":""}}],"vertical_analysis":{{"gross_margin_pct":{{"current":"","previous":""}},"ebitda_margin_pct":{{"current":"","previous":""}},"net_profit_margin_pct":{{"current":"","previous":""}},"commentary":""}},"horizontal_analysis":{{"revenue_growth_yoy_pct":"","pat_growth_yoy_pct":"","eps_growth_yoy_pct":"","notable_trends":[]}},"leverage_analysis":{{"debt_to_equity":"","debt_to_ebitda":"","interest_coverage_ratio":"","commentary":""}},"liquidity_analysis":{{"current_ratio":"","quick_ratio":"","cash_ratio":"","commentary":""}},"profitability_analysis":{{"gross_margin_pct":"","ebitda_margin_pct":"","net_profit_margin_pct":"","roe_pct":"","roa_pct":"","commentary":""}},"cash_flow_analysis":{{"operating_cash_flow":"","capex":"","free_cash_flow":"","ocf_to_pat_ratio":"","cash_quality":"","commentary":""}},"rates_of_return":{{"roe_pct":"","roa_pct":"","eps_basic":"","eps_diluted":"","commentary":""}},"highlights":[],"risks":[],"what_to_watch":[],"investor_verdict":""}}
+
+DOCUMENT:
+{snippet}
+"""
 
     financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh", "eps", "ebitda", "loss",
                           "balance sheet", "cash flow", "borrowing", "equity", "liabilities"]
@@ -985,14 +1213,14 @@ OUTPUT — RETURN ONLY VALID JSON, NO MARKDOWN, NO PREAMBLE
   "health_score": 0,
   "health_label": "",
   "health_score_breakdown": {{
-    "revenue_growth_pts": 0,
-    "net_margin_pts": 0,
-    "ebitda_margin_pts": 0,
-    "debt_equity_pts": 0,
-    "current_ratio_pts": 0,
-    "ocf_quality_pts": 0,
-    "roe_pts": 0,
-    "eps_growth_pts": 0,
+    "revenue_growth":  {{"pts": 0, "max": 10, "value": "e.g. +18.4% YoY", "reason": "e.g. Revenue grew from ₹8,234 Cr to ₹9,750 Cr — awarded full 10 pts"}},
+    "net_margin":      {{"pts": 0, "max": 20, "value": "e.g. 12.3%",       "reason": "e.g. PAT margin of 12.3% falls in 10–15% band — awarded 15/20 pts"}},
+    "ebitda_margin":   {{"pts": 0, "max": 15, "value": "e.g. 22.1%",       "reason": "e.g. EBITDA margin of 22.1% falls in 15–25% band — awarded 10/15 pts"}},
+    "debt_to_equity":  {{"pts": 0, "max": 15, "value": "e.g. 0.42x",       "reason": "e.g. D/E of 0.42x is in 0.3–1.0 band — awarded 10/15 pts"}},
+    "current_ratio":   {{"pts": 0, "max": 10, "value": "e.g. 1.8x",        "reason": "e.g. Current ratio 1.8x is in 1.5–2.0 band — awarded 8/10 pts"}},
+    "ocf_quality":     {{"pts": 0, "max": 10, "value": "e.g. OCF ₹1,200 Cr vs PAT ₹980 Cr", "reason": "e.g. OCF exceeds PAT (OCF/PAT = 1.22x), strong cash conversion — awarded full 10 pts"}},
+    "roe":             {{"pts": 0, "max": 10, "value": "e.g. 17.4%",        "reason": "e.g. ROE of 17.4% falls in 15–20% band — awarded 7/10 pts"}},
+    "eps_growth":      {{"pts": 0, "max": 10, "value": "e.g. +22.5% YoY",  "reason": "e.g. Basic EPS grew from ₹24.10 to ₹29.52 — awarded full 10 pts"}},
     "total": 0
   }},
 
@@ -1195,69 +1423,80 @@ def compress_prompt(prompt: str, max_chars: int = 65000) -> str:
 # ─── AI RUNNERS ──────────────────────────────────────────────────────────────
 
 def _sync_gemini(text: str) -> dict:
-    try:
-        from google import genai
-        from google.genai import types
+    if not GEMINI_API_KEY:
+        raise Exception("No GEMINI_API_KEY configured")
 
-        client = genai.Client(api_key=GEMINI_API_KEY)
+    from google import genai
+    from google.genai import types
 
-        # (model_id, max_prompt_chars) — Gemini has huge context windows
-        models_to_try = [
-            ("gemini-2.0-flash",          180000),
-            ("gemini-2.0-flash-exp",      180000),
-            ("gemini-1.5-flash",          180000),
-            ("gemini-1.5-pro-002",        180000),
-        ]
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
-        for model_name, max_chars in models_to_try:
-            try:
-                prompt = compress_prompt(build_prompt(text), max_chars=max_chars)
-                logger.info(f"Gemini {model_name}: sending {len(prompt):,} chars")
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=8192,
-                    )
+    # (model_id, max_doc_chars)
+    # Gemini 1M context — send full document
+    models_to_try = [
+        ("gemini-2.0-flash",      160000),
+        ("gemini-2.0-flash-exp",  160000),
+        ("gemini-1.5-flash",      160000),
+        ("gemini-1.5-pro-002",    160000),
+    ]
+
+    last_error = ""
+    for model_name, max_doc in models_to_try:
+        try:
+            prompt = build_prompt(text, max_doc_chars=max_doc)
+            logger.info(f"Gemini {model_name}: sending {len(prompt):,} chars")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=8192,
                 )
-                raw_text = response.text
-                logger.info(f"Gemini {model_name}: received {len(raw_text)} chars")
-                return safe_parse_json(raw_text)
+            )
+            raw_text = response.text
+            logger.info(f"Gemini {model_name}: ✅ received {len(raw_text):,} chars")
+            return safe_parse_json(raw_text)
 
-            except Exception as e:
-                err_str = str(e)
-                logger.warning(f"Gemini {model_name} failed: {err_str[:150]}")
-                continue  # always try next model
+        except Exception as e:
+            err_str = str(e)
+            last_error = err_str
+            logger.warning(f"Gemini {model_name} failed: {err_str[:300]}")
 
-        raise Exception("All Gemini models failed")
+            # Quota exhausted for today — no point trying other Gemini models
+            if "429" in err_str or "quota" in err_str.lower() or "resource_exhausted" in err_str.lower():
+                logger.warning("Gemini quota exhausted — skipping remaining Gemini models")
+                raise Exception(f"Gemini quota exhausted: {err_str[:200]}")
 
-    except ImportError:
-        logger.warning("New google-genai package not found, using old API")
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
-        prompt = compress_prompt(build_prompt(text), max_chars=180000)
-        resp = model.generate_content(prompt)
-        return safe_parse_json(resp.text)
+            # Model not found / deprecated — try next
+            if "404" in err_str or "not found" in err_str.lower() or "deprecated" in err_str.lower():
+                continue
+
+            # Any other error — try next model
+            continue
+
+    raise Exception(f"All Gemini models failed. Last error: {last_error[:200]}")
 
 
 GROQ_MODELS_ACTIVE = [
-    # model_id, max_prompt_chars (conservative — Groq measures tokens not chars, ~4 chars/token)
-    ("llama-3.3-70b-versatile",        80000),   # 128k context
-    ("llama3-70b-8192",                28000),   # 8k context
-    ("llama3-8b-8192",                 24000),   # 8k context — fastest fallback
-    ("mixtral-8x7b-32768",             100000),  # 32k context
+    # (model_id, max_doc_chars, use_lean_prompt)
+    # llama-3.3-70b-versatile: 128k ctx → full prompt, 44k doc
+    ("llama-3.3-70b-versatile",     44000, False),
+    # mixtral-8x7b-32768: 32k ctx → full prompt, 16k doc
+    ("mixtral-8x7b-32768",          16000, False),
+    # llama3-70b-8192: 8k ctx → lean prompt, 14k doc
+    ("llama3-70b-8192",             14000, True),
+    # llama3-8b-8192: 8k ctx → lean prompt, 14k doc
+    ("llama3-8b-8192",              14000, True),
 ]
 
 def _sync_groq(text: str) -> dict:
     from groq import Groq
     gc = Groq(api_key=GROQ_API_KEY)
 
-    for model, max_chars in GROQ_MODELS_ACTIVE:
+    for model, max_doc, lean in GROQ_MODELS_ACTIVE:
         try:
-            prompt = compress_prompt(build_prompt(text), max_chars=max_chars)
-            logger.info(f"Groq {model}: sending {len(prompt):,} chars")
+            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+            logger.info(f"Groq {model}: sending {len(prompt):,} chars ({'lean' if lean else 'full'})")
             resp = gc.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
@@ -1267,11 +1506,8 @@ def _sync_groq(text: str) -> dict:
             raw = resp.choices[0].message.content
             logger.info(f"Groq {model}: received {len(raw)} chars")
             return safe_parse_json(raw)
-
         except Exception as ex:
-            err_str = str(ex)
-            logger.warning(f"Groq {model} failed: {err_str[:200]}")
-            # Always continue to next model regardless of error type
+            logger.warning(f"Groq {model} failed: {str(ex)[:200]}")
             continue
 
     raise Exception("All Groq models failed or unavailable")
@@ -1281,39 +1517,28 @@ def _sync_together(text: str) -> dict:
     if not key:
         raise Exception("No TOGETHER_API_KEY")
 
+    # (model_id, max_doc_chars, use_lean)
     models = [
-        "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
-        "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        ("meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", 44000, False),
+        ("meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",  14000, True),
     ]
 
-    prompt = compress_prompt(build_prompt(text))
-
-    for model in models:
+    for model, max_doc, lean in models:
         try:
+            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+            logger.info(f"Together {model}: sending {len(prompt):,} chars")
             resp = httpx.post(
                 "https://api.together.xyz/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 8192
-                },
-                timeout=90
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": 0.1, "max_tokens": 8192},
+                timeout=90,
             )
-
             if resp.status_code == 200:
                 raw = resp.json()["choices"][0]["message"]["content"]
-                logger.info(f"Together {model}: {len(raw)} chars")
+                logger.info(f"Together {model}: received {len(raw)} chars")
                 return safe_parse_json(raw)
-            else:
-                logger.warning(f"Together {model} failed: {resp.status_code}")
-
+            logger.warning(f"Together {model} failed: HTTP {resp.status_code}")
         except Exception as e:
             logger.warning(f"Together {model} error: {str(e)[:150]}")
 
@@ -1327,23 +1552,23 @@ def _sync_openrouter(text: str) -> dict:
 
     import time
 
-    # (model_id, max_prompt_chars)  — updated March 2026
-    # Free models confirmed active on OpenRouter
+    # (model_id, max_doc_chars, use_lean_prompt)
+    # Large-context free models get the full prompt; small ones get lean
     models = [
-        ("google/gemini-2.0-flash-thinking-exp:free",  180000),  # 1M ctx
-        ("google/gemini-2.5-pro-exp-03-25:free",       180000),  # 1M ctx  
-        ("deepseek/deepseek-chat-v3-0324:free",         60000),  # 64k ctx
-        ("deepseek/deepseek-r1:free",                   60000),  # 64k ctx
-        ("meta-llama/llama-4-maverick:free",            60000),  # large ctx
-        ("qwen/qwen2.5-vl-72b-instruct:free",           60000),
-        ("mistralai/mistral-small-3.1-24b-instruct:free", 60000),
+        ("google/gemini-2.5-pro-exp-03-25:free",          160000, False),
+        ("google/gemini-2.0-flash-thinking-exp:free",     160000, False),
+        ("deepseek/deepseek-r1:free",                      44000, False),
+        ("deepseek/deepseek-chat-v3-0324:free",            44000, False),
+        ("meta-llama/llama-4-maverick:free",               44000, False),
+        ("mistralai/mistral-small-3.1-24b-instruct:free",  20000, True),
+        ("qwen/qwen2.5-vl-72b-instruct:free",              20000, True),
     ]
 
-    for model, max_chars in models:
-        prompt = compress_prompt(build_prompt(text), max_chars=max_chars)
+    for model, max_doc, lean in models:
+        prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
         for attempt in range(2):
             try:
-                logger.info(f"OpenRouter {model}: sending {len(prompt):,} chars (attempt {attempt+1})")
+                logger.info(f"OpenRouter {model}: sending {len(prompt):,} chars attempt {attempt+1}")
                 resp = httpx.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers={
@@ -1352,43 +1577,37 @@ def _sync_openrouter(text: str) -> dict:
                         "X-Title": "FinSight",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": 8192,
-                    },
+                    json={"model": model,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0.1, "max_tokens": 8192},
                     timeout=120,
                 )
 
                 if resp.status_code == 429:
-                    wait = 20 if attempt == 0 else 0
-                    logger.warning(f"OpenRouter {model} rate-limited — waiting {wait}s")
                     if attempt == 0:
-                        time.sleep(wait)
+                        logger.warning(f"OpenRouter {model} rate-limited — waiting 20s")
+                        time.sleep(20)
                         continue
-                    break  # give up on this model after 2nd rate limit
+                    break  # second rate-limit → skip model
 
                 if resp.status_code in (404, 400, 422):
-                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code} — model unavailable, skipping")
-                    break  # try next model immediately
+                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code} — skipping")
+                    break
 
                 if resp.status_code == 200:
                     body = resp.json()
-                    # OpenRouter sometimes returns an error inside a 200
                     if "error" in body:
-                        err_msg = body["error"].get("message", str(body["error"]))
-                        logger.warning(f"OpenRouter {model} error in body: {err_msg[:150]}")
+                        logger.warning(f"OpenRouter {model} body error: {str(body['error'])[:150]}")
                         break
                     raw = body["choices"][0]["message"]["content"]
                     logger.info(f"OpenRouter {model}: received {len(raw)} chars")
                     return safe_parse_json(raw)
 
-                logger.warning(f"OpenRouter {model}: unexpected HTTP {resp.status_code}")
+                logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
                 break
 
             except httpx.TimeoutException:
-                logger.warning(f"OpenRouter {model} timed out (attempt {attempt+1})")
+                logger.warning(f"OpenRouter {model} timed out attempt {attempt+1}")
                 if attempt == 0:
                     continue
                 break
