@@ -25,4 +25,4 @@ beautifulsoup4==4.12.3
 fpdf2==2.7.9
 
 # Market Data
-yfinance==0.2.54
+# yfinance replaced by Financial Modeling Prep (FMP) API - no package needed
