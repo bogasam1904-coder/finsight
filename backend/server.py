@@ -1758,11 +1758,87 @@ PRE-COMPUTED RATIOS (verify against document figures):
 
 """
 
+def _sync_cloudflare(text: str) -> dict:
+    """
+    Cloudflare Workers AI — free 10,000 requests/day, no rate limiting issues.
+    Uses @cf/meta/llama-3.3-70b-instruct-fp8-fast as primary model.
+    Requires CF_ACCOUNT_ID and CF_API_TOKEN in environment.
+    """
+    cf_account = os.getenv("CF_ACCOUNT_ID", "")
+    cf_token   = os.getenv("CF_API_TOKEN", "")
+    if not cf_account or not cf_token:
+        raise Exception("CF_ACCOUNT_ID or CF_API_TOKEN not configured")
+
+    # (model_id, max_doc_chars, use_lean)
+    # Cloudflare free tier models — all have generous context windows
+    models = [
+        ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 44000, False),
+        ("@cf/meta/llama-3.1-70b-instruct",           44000, False),
+        ("@cf/meta/llama-3.1-8b-instruct-fast",       20000, True),
+        ("@cf/qwen/qwen2.5-72b-instruct",             44000, False),
+        ("@cf/google/gemma-3-12b-it",                 20000, True),
+        ("@cf/mistral/mistral-7b-instruct-v0.2-lora", 20000, True),
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {cf_token}",
+        "Content-Type": "application/json",
+    }
+
+    last_error = "unknown"
+    for model, max_doc, lean in models:
+        try:
+            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+            url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/run/{model}"
+            logger.info("Cloudflare %s: sending %d chars", model, len(prompt))
+            resp = requests.post(
+                url,
+                headers=headers,
+                json={
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 8192,
+                    "temperature": 0.1,
+                },
+                timeout=120,
+            )
+            logger.info("Cloudflare %s: HTTP %d", model, resp.status_code)
+
+            if resp.status_code == 200:
+                body = resp.json()
+                # CF returns {"result": {"response": "..."}, "success": true}
+                if body.get("success"):
+                    raw = body.get("result", {}).get("response", "")
+                    if raw:
+                        logger.info("Cloudflare %s: received %d chars", model, len(raw))
+                        return safe_parse_json(raw)
+                    logger.warning("Cloudflare %s: empty response", model)
+                else:
+                    errors = body.get("errors", [])
+                    last_error = str(errors)[:200]
+                    logger.warning("Cloudflare %s: API error: %s", model, last_error)
+                continue
+
+            last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
+            logger.warning("Cloudflare %s: %s", model, last_error)
+
+        except requests.exceptions.Timeout:
+            last_error = "Timeout after 120s"
+            logger.warning("Cloudflare %s timed out", model)
+            continue
+        except Exception as e:
+            last_error = str(e)[:200]
+            logger.warning("Cloudflare %s error: %s", model, last_error)
+            continue
+
+    raise Exception(f"All Cloudflare models failed. Last: {last_error}")
+
+
     enhanced_text = metrics_block + full_text
 
     providers = [
         ("Gemini",      _sync_gemini,      GEMINI_API_KEY),
         ("Groq",        _sync_groq,        GROQ_API_KEY),
+        ("Cloudflare",  _sync_cloudflare,  os.getenv("CF_API_TOKEN", "")),
         ("Together",    _sync_together,    os.getenv("TOGETHER_API_KEY", "")),
         ("OpenRouter",  _sync_openrouter,  os.getenv("OPENROUTER_API_KEY", "")),
     ]
@@ -1951,6 +2027,7 @@ async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat(),
             "gemini":      bool(GEMINI_API_KEY),
             "groq":        bool(GROQ_API_KEY),
+            "cloudflare":  bool(os.getenv("CF_API_TOKEN")),
             "openrouter":  bool(os.getenv("OPENROUTER_API_KEY")),
             "fmp":         bool(FMP_API_KEY),
             "companies_in_db": company_count}
