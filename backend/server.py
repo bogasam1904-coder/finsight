@@ -1446,58 +1446,6 @@ def _extract_metrics_from_text(text: str) -> dict:
                 break
 
     return dict(metrics)
-
-
-# ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
-async def run_analysis(text: str) -> dict:
-
-    if not text or len(text.strip()) < 100:
-        raise Exception("PDF extraction returned insufficient text.")
-
-    # Use as much of the document as possible — do NOT truncate aggressively here.
-    # build_prompt will take up to 55,000 chars; compress_prompt caps at 65,000.
-    # We pass the full extracted text and let the prompt builder slice it.
-    full_text = text.strip()
-
-    # Guard: reject if text lacks any financial content
-    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh",
-                          "eps", "ebitda", "loss", "balance sheet", "borrowing", "equity"]
-    found_kw = [kw for kw in financial_keywords if kw.lower() in full_text.lower()]
-    if len(found_kw) < 2:
-        raise Exception(
-            f"Extracted text does not appear to contain financial data "
-            f"(found only: {found_kw}). "
-            f"Please verify the PDF is a financial results document. "
-            f"Text preview: {full_text[:200]}"
-        )
-
-    logger.info(f"Analysis starting — text: {len(full_text):,} chars, keywords found: {found_kw}")
-
-    loop   = asyncio.get_event_loop()
-    errors = []
-
-    # Pre-extract structured metrics from the raw PDF bytes stored in text
-    # Note: extract_tables_from_pdf requires actual PDF bytes, not text.
-    # metrics/ratios are computed from raw bytes upstream in extract_pdf_text.
-    # Here we pass the already-extracted text string directly to the AI.
-    # The structured metrics block below is a best-effort regex pass on the text.
-    metrics = _extract_metrics_from_text(full_text)
-    ratios  = compute_financial_ratios(metrics)
-    logger.info(f"Text-based metrics: {metrics}")
-    logger.info(f"Computed ratios: {ratios}")
-
-    # Build the enriched text block handed to every AI provider
-    metrics_block = ""
-    if any(metrics.values()):
-        metrics_block = f"""
-PRE-EXTRACTED METRICS (use as cross-reference, not as substitute for reading the document):
-{json.dumps(metrics, indent=2)}
-
-PRE-COMPUTED RATIOS (verify against document figures):
-{json.dumps(ratios, indent=2)}
-
-"""
-
 def _sync_cloudflare(text: str) -> dict:
     """
     Cloudflare Workers AI — free 10,000 requests/day, no rate limiting issues.
@@ -1571,6 +1519,60 @@ def _sync_cloudflare(text: str) -> dict:
             continue
 
     raise Exception(f"All Cloudflare models failed. Last: {last_error}")
+
+
+
+
+
+# ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
+async def run_analysis(text: str) -> dict:
+
+    if not text or len(text.strip()) < 100:
+        raise Exception("PDF extraction returned insufficient text.")
+
+    # Use as much of the document as possible — do NOT truncate aggressively here.
+    # build_prompt will take up to 55,000 chars; compress_prompt caps at 65,000.
+    # We pass the full extracted text and let the prompt builder slice it.
+    full_text = text.strip()
+
+    # Guard: reject if text lacks any financial content
+    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh",
+                          "eps", "ebitda", "loss", "balance sheet", "borrowing", "equity"]
+    found_kw = [kw for kw in financial_keywords if kw.lower() in full_text.lower()]
+    if len(found_kw) < 2:
+        raise Exception(
+            f"Extracted text does not appear to contain financial data "
+            f"(found only: {found_kw}). "
+            f"Please verify the PDF is a financial results document. "
+            f"Text preview: {full_text[:200]}"
+        )
+
+    logger.info(f"Analysis starting — text: {len(full_text):,} chars, keywords found: {found_kw}")
+
+    loop   = asyncio.get_event_loop()
+    errors = []
+
+    # Pre-extract structured metrics from the raw PDF bytes stored in text
+    # Note: extract_tables_from_pdf requires actual PDF bytes, not text.
+    # metrics/ratios are computed from raw bytes upstream in extract_pdf_text.
+    # Here we pass the already-extracted text string directly to the AI.
+    # The structured metrics block below is a best-effort regex pass on the text.
+    metrics = _extract_metrics_from_text(full_text)
+    ratios  = compute_financial_ratios(metrics)
+    logger.info(f"Text-based metrics: {metrics}")
+    logger.info(f"Computed ratios: {ratios}")
+
+    # Build the enriched text block handed to every AI provider
+    metrics_block = ""
+    if any(metrics.values()):
+        metrics_block = f"""
+PRE-EXTRACTED METRICS (use as cross-reference, not as substitute for reading the document):
+{json.dumps(metrics, indent=2)}
+
+PRE-COMPUTED RATIOS (verify against document figures):
+{json.dumps(ratios, indent=2)}
+
+"""
 
 
     enhanced_text = metrics_block + full_text
