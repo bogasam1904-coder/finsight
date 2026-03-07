@@ -16,7 +16,7 @@ bcrypt==4.2.0
 # AI Providers
 google-genai>=1.7.0
 groq==0.11.0
-httpx==0.27.2
+httpx>=0.28.1,<1.0.0
 
 # PDF Processing
 pypdf==4.3.1
