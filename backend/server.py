@@ -1552,17 +1552,71 @@ def _sync_openrouter(text: str) -> dict:
 
     import time
 
+    # CONFIRMED WORKING free models on OpenRouter as of March 2026
     # (model_id, max_doc_chars, use_lean_prompt)
-    # Large-context free models get the full prompt; small ones get lean
     models = [
-        ("google/gemini-2.5-pro-exp-03-25:free",          160000, False),
-        ("google/gemini-2.0-flash-thinking-exp:free",     160000, False),
-        ("deepseek/deepseek-r1:free",                      44000, False),
-        ("deepseek/deepseek-chat-v3-0324:free",            44000, False),
-        ("meta-llama/llama-4-maverick:free",               44000, False),
         ("mistralai/mistral-small-3.1-24b-instruct:free",  20000, True),
-        ("qwen/qwen2.5-vl-72b-instruct:free",              20000, True),
+        ("google/gemini-2.0-flash-exp:free",               44000, False),
+        ("deepseek/deepseek-r1-zero:free",                 44000, False),
+        ("qwen/qwen3-8b:free",                             20000, True),
+        ("qwen/qwen3-14b:free",                            44000, False),
+        ("qwen/qwen3-30b-a3b:free",                        44000, False),
+        ("microsoft/mai-ds-r1:free",                       44000, False),
+        ("tngtech/deepseek-r1t-chimera:free",              44000, False),
     ]
+
+    for model, max_doc, lean in models:
+        prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
+        for attempt in range(2):
+            try:
+                logger.info(f"OpenRouter {model}: sending {len(prompt):,} chars attempt {attempt+1}")
+                resp = httpx.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "HTTP-Referer": "https://finsight-vert.vercel.app",
+                        "X-Title": "FinSight",
+                        "Content-Type": "application/json",
+                    },
+                    json={"model": model,
+                          "messages": [{"role": "user", "content": prompt}],
+                          "temperature": 0.1, "max_tokens": 8192},
+                    timeout=120,
+                )
+
+                if resp.status_code == 429:
+                    if attempt == 0:
+                        logger.warning(f"OpenRouter {model} rate-limited — waiting 20s")
+                        time.sleep(20)
+                        continue
+                    break
+
+                if resp.status_code in (404, 400, 422):
+                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code} — skipping")
+                    break
+
+                if resp.status_code == 200:
+                    body = resp.json()
+                    if "error" in body:
+                        logger.warning(f"OpenRouter {model} body error: {str(body['error'])[:150]}")
+                        break
+                    raw = body["choices"][0]["message"]["content"]
+                    logger.info(f"OpenRouter {model}: ✅ received {len(raw)} chars")
+                    return safe_parse_json(raw)
+
+                logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}")
+                break
+
+            except httpx.TimeoutException:
+                logger.warning(f"OpenRouter {model} timed out attempt {attempt+1}")
+                if attempt == 0:
+                    continue
+                break
+            except Exception as e:
+                logger.warning(f"OpenRouter {model} error: {str(e)[:150]}")
+                break
+
+    raise Exception("All OpenRouter models failed or unavailable")
 
     for model, max_doc, lean in models:
         prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
