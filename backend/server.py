@@ -1486,22 +1486,39 @@ GROQ_MODELS_ACTIVE = [
 ]
 
 def _sync_groq(text: str) -> dict:
-    from groq import Groq
-    gc = Groq(api_key=GROQ_API_KEY)
+    """Call Groq API directly via httpx — avoids Groq SDK proxies incompatibility."""
+    if not GROQ_API_KEY:
+        raise Exception("No GROQ_API_KEY configured")
 
     for model, max_doc, lean in GROQ_MODELS_ACTIVE:
         try:
             prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
             logger.info(f"Groq {model}: sending {len(prompt):,} chars ({'lean' if lean else 'full'})")
-            resp = gc.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=8192,
+            resp = httpx.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 8192,
+                },
+                timeout=90,
             )
-            raw = resp.choices[0].message.content
-            logger.info(f"Groq {model}: received {len(raw)} chars")
-            return safe_parse_json(raw)
+            if resp.status_code == 429:
+                logger.warning(f"Groq {model}: rate limited, trying next")
+                continue
+            if resp.status_code in (400, 404, 422):
+                logger.warning(f"Groq {model}: HTTP {resp.status_code} — skipping")
+                continue
+            if resp.status_code == 200:
+                raw = resp.json()["choices"][0]["message"]["content"]
+                logger.info(f"Groq {model}: ✅ received {len(raw)} chars")
+                return safe_parse_json(raw)
+            logger.warning(f"Groq {model}: HTTP {resp.status_code}")
         except Exception as ex:
             logger.warning(f"Groq {model} failed: {str(ex)[:200]}")
             continue
@@ -1548,17 +1565,19 @@ def _sync_openrouter(text: str) -> dict:
 
     import time
 
-    # CONFIRMED WORKING free models on OpenRouter as of March 2026
-    # (model_id, max_doc_chars, use_lean_prompt)
+    # CONFIRMED WORKING free models on OpenRouter - March 2026
+    # Prioritise models with large context first
     models = [
         ("mistralai/mistral-small-3.1-24b-instruct:free",  20000, True),
         ("google/gemini-2.0-flash-exp:free",               44000, False),
         ("deepseek/deepseek-r1-zero:free",                 44000, False),
+        ("meta-llama/llama-3.3-70b-instruct:free",         44000, False),
         ("qwen/qwen3-8b:free",                             20000, True),
         ("qwen/qwen3-14b:free",                            44000, False),
         ("qwen/qwen3-30b-a3b:free",                        44000, False),
         ("microsoft/mai-ds-r1:free",                       44000, False),
         ("tngtech/deepseek-r1t-chimera:free",              44000, False),
+        ("nvidia/llama-3.1-nemotron-ultra-253b-v1:free",   44000, False),
     ]
 
     for model, max_doc, lean in models:
