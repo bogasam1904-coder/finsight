@@ -860,532 +860,293 @@ def split_into_chunks(text, size=12000, overlap=1200):
     return chunks
 
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
-    """
-    Institutional-grade equity research prompt — JP Morgan / Barclays / Goldman Sachs style.
-    Full context models (Gemini, DeepSeek). Total ~15k template + max_doc_chars.
-    """
+    """Full-context institutional prompt matching exact JSON schema."""
     snippet = text[:max_doc_chars]
-    logger.info(f"Full prompt: {len(snippet):,} doc chars (from {len(text):,} total)")
+    logger.info(f"build_prompt: {len(snippet):,} chars (from {len(text):,} total)")
+    return f"""Analyze the provided financial document and return ONLY one valid JSON object. Do not include markdown, explanations, code fences, or additional commentary. The response must strictly conform to the JSON schema provided below.
 
-    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh", "eps", "ebitda", "loss",
-                          "balance sheet", "cash flow", "borrowing", "equity", "liabilities"]
-    found_kw = [kw for kw in financial_keywords if kw.lower() in snippet.lower()]
-    if len(found_kw) < 2:
-        logger.warning(f"Low financial keyword count: {found_kw}. Preview: {snippet[:300]}")
+ANALYTICAL OBJECTIVE
+Produce an institutional-grade equity research assessment suitable for professional investors. The analysis must interpret financial performance, identify hidden signals, and explain what the data implies for capital allocation decisions. The final output should resemble analysis prepared by a senior equity research analyst at a global investment bank.
 
-    return f"""You are a Managing Director-level Equity Research Analyst at a Tier-1 investment bank (JP Morgan, Barclays, Goldman Sachs). You have 20 years of experience writing institutional research on Indian listed companies for buy-side clients including sovereign wealth funds, pension funds, and hedge funds.
+CORE PRINCIPLES
+Interpret numbers rather than merely restating them. Always explain what the data implies about the company's underlying business performance.
+Contextualize metrics within the company's business model and industry structure.
+Identify non-obvious signals such as margin trends, working capital shifts, leverage changes, or capital allocation patterns.
+Avoid vague language. Use precise statements supported by extracted numbers.
+Assume the analysis will inform real investment decisions and maintain analytical rigor.
+Highlight risks even when performance appears strong to maintain intellectual honesty.
 
-Your task: produce a publication-quality equity research analysis from this financial filing. Your output will be consumed directly by portfolio managers making investment decisions. Accuracy, precision, and insight are non-negotiable.
+DATA EXTRACTION PROTOCOL
+Before performing analysis, scan the entire document for financial data.
+Search the entire document for each metric. Only state "Not reported" when the metric cannot be derived from any section.
 
-ANALYST STANDARDS
-=================
+Recognize alternate metric names:
+Total Assets may appear as Assets or Balance Sheet Total.
+Total Debt may appear as Borrowings, Loans, or Debt Securities.
+Operating Cash Flow may appear as Net Cash from Operating Activities.
+Interest Coverage may need to be calculated using EBIT divided by Finance Costs.
+Free Cash Flow equals Operating Cash Flow minus Capex.
 
-STANDARD 1 — COMPLETE DOCUMENT SCAN (MANDATORY)
-Before filling a single JSON field, perform a full document scan:
-1. Scan every table: P&L, Balance Sheet, Cash Flow, Segment, Ratios, Notes to Accounts
-2. Record EVERY number with its exact label, period, and unit
-3. Cross-reference numbers across sections for consistency
-4. Only then populate the JSON output
-FORBIDDEN: "Not available" unless you have scanned the ENTIRE document and confirmed the data is genuinely absent.
-FORBIDDEN: Skipping tables, footnotes, or notes to accounts.
-FORBIDDEN: Rounding or approximating. Copy numbers exactly.
+Sector-specific adjustments:
+For NBFC or financial institutions, Total Debt equals Debt Securities plus Borrowings plus Subordinated Liabilities.
+For defense or PSU companies, carefully examine order book disclosures, government contracts, and advances from customers because these determine revenue visibility.
 
-STANDARD 2 — NUMBER PRECISION
-- Copy numbers EXACTLY as stated. Always include units: "20,078.39 Cr" not "20078"
-- If document states "(Rs. in Lakhs)", every number in that table is in Lakhs
-- Preserve negative signs
+DERIVED METRICS
+Calculate ratios whenever raw inputs are available.
+ROE = Net Profit divided by Total Equity
+ROA = Net Profit divided by Total Assets
+Debt to Equity = Total Debt divided by Total Equity
+Interest Coverage = EBIT divided by Finance Costs
+Current Ratio = Current Assets divided by Current Liabilities
+Free Cash Flow = Operating Cash Flow minus Capex
+Do not leave ratios blank if they can be calculated.
 
-STANDARD 3 — CALCULATE ALL DERIVABLE METRICS
-If base numbers are present, ALWAYS compute:
-Margins: Gross/EBITDA/EBIT/Net (as % of Revenue)
-Growth: Revenue YoY% / PAT YoY% / EPS YoY%
-Leverage: D/E / Debt-EBITDA / Interest Coverage / Net Debt
-Liquidity: Current / Quick / Cash ratios
-Returns: ROE / ROA / ROIC / ROCE
-Efficiency: Asset Turnover / Inventory Days / Receivable Days / Payable Days / CCC
-Cash: OCF/PAT ratio / FCF Margin
+SCORING FRAMEWORK
 
-STANDARD 4 — INSTITUTIONAL COMMENTARY QUALITY
-Every commentary must read like a Bloomberg Intelligence note:
-WEAK:   "Revenue grew well this quarter."
-STRONG: "Revenue grew 18.4% YoY to Rs.9,750 Cr (vs Rs.8,234 Cr in Q3FY24), driven by 22% domestic volume growth and 340bps realisation improvement. Sequential growth of 4.2% reflects sustained demand momentum."
+Profitability (0-20):
+Strong (score 20): ROE >20% AND Net Margin >15%
+Average (score 12): ROE 12-20% OR Net Margin 8-15%
+Weak (score 5): ROE <12% OR Net Margin <8%
 
-HEALTH SCORE (0-100)
-====================
-Score each component. Fill all four fields: pts, max, value (exact metric), reason (one precise sentence with number).
+Growth (0-15):
+Strong (score 15): Revenue growth >20% AND Profit growth >25%
+Average (score 9): Revenue growth 10-20% AND Profit growth 10-25%
+Weak (score 4): Revenue growth <10% OR Profit growth <10%
 
-revenue_growth (max 10): Growing YoY=10 | Flat(+-2%)=5 | Declining=0
-net_margin     (max 20): >20%=20 | 15-20%=17 | 10-15%=13 | 5-10%=8 | 2-5%=4 | <2%=1 | Negative=0
-ebitda_margin  (max 15): >30%=15 | 20-30%=12 | 15-20%=9 | 10-15%=6 | 5-10%=3 | <5%=1
-debt_to_equity (max 15): <0.2=15 | 0.2-0.5=12 | 0.5-1.0=9 | 1.0-2.0=5 | 2.0-3.0=2 | >3.0=0
-current_ratio  (max 10): >2.5=10 | 2.0-2.5=9 | 1.5-2.0=7 | 1.0-1.5=4 | <1.0=0
-ocf_quality    (max 10): OCF/PAT>1.2=10 | 0.8-1.2=8 | 0-0.8=5 | OCF negative=0
-roe            (max 10): >25%=10 | 20-25%=8 | 15-20%=6 | 10-15%=4 | 5-10%=2 | <5%=0
-eps_growth     (max 10): >20%=10 | 10-20%=8 | 0-10%=5 | Flat=3 | Declining=0
-Labels: 0-40=Caution | 41-55=Fair | 56-70=Good | 71-85=Strong | 86-100=Exceptional
+Balance Sheet (0-15):
+Strong (score 15): Debt-to-Equity <0.5
+Average (score 9): Debt-to-Equity 0.5-1.5
+Weak (score 3): Debt-to-Equity >1.5
 
-OUTPUT: RETURN ONLY VALID JSON, ZERO MARKDOWN
-=============================================
+Liquidity (0-10):
+Strong (score 10): Current Ratio >1.5
+Average (score 6): Current Ratio 1.0-1.5
+Weak (score 2): Current Ratio <1.0
+
+Cash Flow (0-15):
+Strong (score 15): Operating cash flow exceeds net profit
+Average (score 9): Operating cash flow approximately equal to net profit
+Weak (score 3): Operating cash flow materially below net profit
+
+Governance & Risk (0-15):
+Strong (score 15): Clean audit opinion, strong ratings, minimal promoter pledging
+Average (score 9): Minor governance concerns
+Weak (score 3): Auditor qualifications or major governance risks
+
+Industry Position (0-10):
+Strong (score 10): Market leadership and durable competitive advantages
+Average (score 6): Comparable to peers
+Weak (score 2): Lagging peers or losing competitive position
+
+Health Label thresholds: score >=80 = Excellent | 60-79 = Good | 40-59 = Fair | 20-39 = Poor | 0-19 = Critical
+investment_label options: Strong Buy / Buy / Hold / Reduce / Avoid
+
+ANALYTICAL EXPECTATIONS
+The analysis must clearly evaluate profitability quality, growth durability, capital allocation efficiency, cash flow integrity, balance sheet resilience, and competitive positioning.
+
+RISK IDENTIFICATION
+Explicitly surface hidden risks such as working capital stress, margin compression, revenue concentration, government dependency, order book volatility, customer concentration, accounting anomalies, or excessive capex intensity. Each risk must include explanation, investor relevance, and a measurable trigger to monitor.
+
+INVESTOR-ORIENTED OUTPUT
+Address both long-term investors and short-term traders.
+Long-term analysis should evaluate moat durability, compounding potential, and permanent capital loss risk.
+Short-term analysis should focus on catalysts, triggers for the next earnings cycle, and operational momentum indicators.
+
+ANALYTICAL STYLE
+Write in the tone of professional sell-side equity research: concise, analytical, and evidence-based. Avoid boilerplate commentary or generic financial explanations.
+
+Return ONLY this exact JSON object with every field populated. Use specific numbers in every commentary field:
 
 {{
-  "company_name": "", "ticker": "", "exchange": "NSE/BSE",
-  "statement_type": "Standalone/Consolidated/Both",
-  "period": "", "period_end_date": "",
-  "reporting_currency": "INR", "unit": "",
-  "analyst_rating": "BUY/HOLD/SELL/UNDER REVIEW",
-  "analyst_rating_rationale": "2-3 sentence investment thesis",
+  "company_name": "Full legal name from document",
+  "statement_type": "Annual Report / Half-Year Results / Quarterly Results",
+  "period": "Reporting period e.g. Q3FY26 / FY2024-25",
+  "currency": "INR Lakhs / INR Crores / USD Millions",
+  "health_score": 0,
+  "health_label": "Excellent / Good / Fair / Poor / Critical",
 
-  "health_score": 0, "health_label": "",
   "health_score_breakdown": {{
-    "revenue_growth": {{"pts":0,"max":10,"value":"","reason":""}},
-    "net_margin":     {{"pts":0,"max":20,"value":"","reason":""}},
-    "ebitda_margin":  {{"pts":0,"max":15,"value":"","reason":""}},
-    "debt_to_equity": {{"pts":0,"max":15,"value":"","reason":""}},
-    "current_ratio":  {{"pts":0,"max":10,"value":"","reason":""}},
-    "ocf_quality":    {{"pts":0,"max":10,"value":"","reason":""}},
-    "roe":            {{"pts":0,"max":10,"value":"","reason":""}},
-    "eps_growth":     {{"pts":0,"max":10,"value":"","reason":""}},
-    "total": 0
+    "total": 0,
+    "components": [
+      {{"category": "Profitability", "weight": 20, "score": 0, "max": 20, "rating": "Strong / Average / Weak", "reasoning": "Explain ROE, margins, and profitability trend with specific numbers."}},
+      {{"category": "Growth",        "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Explain revenue and profit growth drivers with specific numbers."}},
+      {{"category": "Balance Sheet", "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Discuss leverage, debt structure, and asset quality with specific numbers."}},
+      {{"category": "Liquidity",     "weight": 10, "score": 0, "max": 10, "rating": "Strong / Average / Weak", "reasoning": "Evaluate short-term financial strength with specific numbers."}},
+      {{"category": "Cash Flow",     "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Explain OCF vs PAT relationship and cash generation quality."}},
+      {{"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Evaluate governance, audit opinion, and structural risks."}},
+      {{"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "Strong / Average / Weak", "reasoning": "Compare position versus industry peers."}}
+    ]
   }},
 
-  "headline": "Bloomberg-style headline e.g. 'HDFC Bank Q3FY25: NIM compression offsets loan growth; maintain HOLD'",
-  "executive_summary": "5-7 sentence institutional summary: (1) performance vs expectations (2) revenue/margin drivers (3) balance sheet (4) cash flow quality (5) risks (6) outlook. Every sentence must have specific numbers.",
-
-  "investment_thesis": {{
-    "bull_case": "2-3 sentence bull case with specific catalysts",
-    "bear_case": "2-3 sentence bear case with specific risks",
-    "key_monitorables": ["item1 with numbers", "item2", "item3"]
-  }},
-
-  "income_statement": {{
-    "revenue":            {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "other_income":       {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "total_income":       {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "cost_of_goods_sold": {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "gross_profit":       {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "employee_costs":     {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "other_expenses":     {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "ebitda":             {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "depreciation":       {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "ebit":               {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "finance_cost":       {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "pbt":                {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "tax_expense":        {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "effective_tax_rate": {{"current":"","previous":"","unit":"%"}},
-    "pat":                {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "minority_interest":  {{"current":"","previous":"","unit":""}},
-    "pat_attributable":   {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "eps_basic":          {{"current":"","previous":"","unit":"Rs.","yoy_chg_pct":""}},
-    "eps_diluted":        {{"current":"","previous":"","unit":"Rs.","yoy_chg_pct":""}}
-  }},
-
-  "balance_sheet": {{
-    "total_assets":        {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "non_current_assets":  {{"current":"","previous":"","unit":""}},
-    "fixed_assets_gross":  {{"current":"","previous":"","unit":""}},
-    "fixed_assets_net":    {{"current":"","previous":"","unit":""}},
-    "capital_wip":         {{"current":"","previous":"","unit":""}},
-    "investments":         {{"current":"","previous":"","unit":""}},
-    "current_assets":      {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "inventories":         {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "trade_receivables":   {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "cash_equivalents":    {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "total_equity":        {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "share_capital":       {{"current":"","previous":"","unit":""}},
-    "reserves_surplus":    {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "total_borrowings":    {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "long_term_borrowings":{{"current":"","previous":"","unit":""}},
-    "short_term_borrowings":{{"current":"","previous":"","unit":""}},
-    "trade_payables":      {{"current":"","previous":"","unit":""}},
-    "current_liabilities": {{"current":"","previous":"","unit":"","yoy_chg_pct":""}}
-  }},
-
-  "cash_flow_statement": {{
-    "operating_cash_flow":{{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "investing_cash_flow":{{"current":"","previous":"","unit":""}},
-    "financing_cash_flow":{{"current":"","previous":"","unit":""}},
-    "capex":              {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "free_cash_flow":     {{"current":"","previous":"","unit":"","yoy_chg_pct":""}},
-    "net_change_in_cash": {{"current":"","previous":"","unit":""}}
-  }},
+  "headline": "One concise memorable sentence summarizing the result",
+  "executive_summary": "5-6 sentences explaining the most important story behind the numbers. Every sentence must contain specific numbers.",
+  "investment_label": "Strong Buy / Buy / Hold / Reduce / Avoid",
+  "investor_verdict": "Direct institutional recommendation with reasoning and specific numbers",
+  "for_long_term_investors": "Moat durability, compounding potential, long-term risk with specific numbers",
+  "for_short_term_traders": "Near-term catalysts and earnings triggers with specific numbers",
+  "bottom_line": "Single memorable sentence capturing the key investment insight",
 
   "key_metrics": [
-    {{"metric":"Revenue",            "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"Gross Profit",       "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"EBITDA",             "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"EBIT",               "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"PAT",                "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"EPS Basic (Rs.)",    "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"Gross Margin %",     "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"EBITDA Margin %",    "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"Net Margin %",       "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"ROE %",              "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"D/E Ratio",          "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"Total Borrowings",   "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"Operating Cash Flow","current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"Free Cash Flow",     "current":"","previous":"","change_pct":"","comment":""}},
-    {{"metric":"Cash & Equivalents", "current":"","previous":"","change_pct":"","comment":""}}
+    {{"label": "Revenue",             "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "Net Profit",          "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "EBITDA Margin",       "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "ROE",                 "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "Debt to Equity",      "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
+    {{"label": "Operating Cash Flow", "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}}
   ],
 
-  "vertical_analysis": {{
-    "gross_margin_pct":      {{"current":"","previous":"","change_bps":"","comment":""}},
-    "ebitda_margin_pct":     {{"current":"","previous":"","change_bps":"","comment":""}},
-    "ebit_margin_pct":       {{"current":"","previous":"","change_bps":"","comment":""}},
-    "net_profit_margin_pct": {{"current":"","previous":"","change_bps":"","comment":""}},
-    "cogs_pct_revenue":      {{"current":"","previous":"","change_bps":"","comment":""}},
-    "employee_cost_pct":     {{"current":"","previous":"","change_bps":"","comment":""}},
-    "finance_cost_pct":      {{"current":"","previous":"","change_bps":"","comment":""}},
-    "commentary": "2-3 sentence margin analysis with basis point changes e.g. EBITDA margin expanded 180bps YoY to 24.3% driven by..."
+  "cash_flow_deep_dive": {{
+    "operating_cf":          "extracted value with unit",
+    "investing_cf":          "extracted value with unit",
+    "financing_cf":          "extracted value with unit",
+    "free_cash_flow":        "calculated: OCF minus Capex with unit",
+    "capex":                 "extracted value with unit",
+    "cash_conversion_quality": "Strong / Moderate / Weak",
+    "ocf_vs_pat_insight":    "Is OCF greater than PAT? What does this say about earnings quality? Use specific numbers."
   }},
 
-  "horizontal_analysis": {{
-    "revenue_growth_yoy_pct": "", "gross_profit_growth_yoy_pct": "",
-    "ebitda_growth_yoy_pct": "", "pat_growth_yoy_pct": "", "eps_growth_yoy_pct": "",
-    "total_assets_growth_yoy_pct": "", "borrowings_growth_yoy_pct": "",
-    "operating_leverage": "Comment on revenue vs cost growth differential",
-    "notable_trends": ["trend1 with specific numbers","trend2","trend3"]
+  "balance_sheet_deep_dive": {{
+    "asset_quality":         "Institutional commentary on fixed vs current asset mix with numbers",
+    "debt_profile":          "ST vs LT split, maturity profile, rates if available",
+    "working_capital_insight": "Receivables, payables, inventory cycle commentary with days",
+    "total_debt":            "extracted value with unit",
+    "net_worth":             "extracted value with unit",
+    "debt_to_equity":        "calculated ratio",
+    "interest_coverage":     "calculated ratio",
+    "debt_comfort_level":    "Comfortable / Elevated / Stressed"
   }},
 
-  "leverage_analysis": {{
-    "gross_debt": "", "cash_and_equivalents": "", "net_debt": "",
-    "debt_to_equity": "", "net_debt_to_equity": "",
-    "debt_to_ebitda": "", "net_debt_to_ebitda": "",
-    "interest_coverage_ratio": "", "debt_service_coverage": "",
-    "commentary": "2-3 sentence leverage assessment with specific numbers"
+  "growth_quality": {{
+    "revenue_growth_context":  "Organic vs inorganic, volume vs price drivers with numbers",
+    "profit_growth_context":   "Operating leverage, margin expansion/compression drivers",
+    "margin_trend":            "Direction and magnitude of margin changes with basis points",
+    "growth_outlook":          "Forward-looking assessment based on order book, guidance, or sector trends",
+    "catalysts":               ["List of specific near-term growth catalysts"],
+    "headwinds":               ["List of specific risks that could impair growth"]
   }},
 
-  "liquidity_analysis": {{
-    "current_ratio": "", "quick_ratio": "", "cash_ratio": "",
-    "net_working_capital": "", "cash_conversion_cycle_days": "",
-    "commentary": "2-3 sentence liquidity assessment with specific numbers"
+  "industry_context": {{
+    "sector_tailwinds":       ["List of structural or cyclical tailwinds"],
+    "sector_headwinds":       ["List of structural or cyclical headwinds"],
+    "competitive_position":   "Market share, pricing power, barriers to entry",
+    "peer_benchmarks":        "How key ratios compare to sector averages or named peers",
+    "regulatory_environment": "Relevant regulations, government policies, or compliance risks"
   }},
 
-  "profitability_analysis": {{
-    "gross_margin_pct": "", "ebitda_margin_pct": "", "ebit_margin_pct": "",
-    "net_profit_margin_pct": "", "roe_pct": "", "roa_pct": "", "roic_pct": "", "roce_pct": "",
-    "dupont_analysis": {{"net_margin_pct":"","asset_turnover":"","equity_multiplier":"","roe_derived":""}},
-    "commentary": "2-3 sentence profitability narrative with peer context where possible"
+  "red_flags":          ["Each as a specific, evidence-backed concern with numbers"],
+  "strengths_and_moats": ["Each as a specific, defensible competitive advantage"],
+
+  "investor_faq": [
+    {{"question": "Is this company a good investment right now?", "answer": "Direct answer with numbers and reasoning"}},
+    {{"question": "What is the biggest risk to monitor?",         "answer": "Specific risk with measurable trigger"}},
+    {{"question": "How sustainable is the current growth rate?",  "answer": "Evidence-based assessment"}}
+  ],
+
+  "key_monitorables": ["Specific metric or event to track each quarter with threshold"],
+
+  "profitability": {{
+    "analysis":             "2-3 sentence institutional commentary with specific numbers",
+    "net_margin_current":   "",
+    "ebitda_margin_current":"",
+    "roe":                  "",
+    "roa":                  ""
   }},
 
-  "efficiency_analysis": {{
-    "asset_turnover": "", "inventory_turnover_days": "", "receivables_turnover_days": "",
-    "payables_turnover_days": "", "cash_conversion_cycle_days": "", "fixed_asset_turnover": "",
-    "commentary": "2-3 sentence working capital efficiency analysis with specific days"
+  "liquidity": {{
+    "analysis":          "2-3 sentence institutional commentary with specific numbers",
+    "current_ratio":     "",
+    "quick_ratio":       "",
+    "cash_position":     "",
+    "operating_cash_flow":"",
+    "free_cash_flow":    ""
   }},
 
-  "cash_flow_analysis": {{
-    "operating_cash_flow": "", "investing_cash_flow": "", "financing_cash_flow": "",
-    "capex": "", "free_cash_flow": "", "ocf_to_pat_ratio": "",
-    "fcf_margin_pct": "", "capex_to_revenue_pct": "",
-    "cash_quality": "Strong/Moderate/Weak",
-    "commentary": "3-4 sentences on cash generation: Is OCF > PAT? Is FCF positive? Capex deployment? Specific numbers throughout."
-  }},
-
-  "rates_of_return": {{
-    "roe_pct": "", "roa_pct": "", "roic_pct": "", "roce_pct": "",
-    "eps_basic": "", "eps_diluted": "", "eps_growth_pct": "",
-    "book_value_per_share": "", "dividend_per_share": "", "dividend_payout_ratio": "",
-    "commentary": "2-3 sentences on capital efficiency and shareholder returns"
-  }},
-
-  "segment_analysis": {{
-    "segments_reported": false,
-    "segments": [],
-    "commentary": "Segment breakdown if available, else state not reported"
-  }},
-
-  "management_commentary": {{
-    "guidance": "Any revenue/margin/capex guidance given by management",
-    "key_developments": [],
-    "conference_call_highlights": ""
-  }},
-
-  "highlights": ["Specific positive with numbers","Specific positive","Specific positive"],
-  "risks": ["Specific risk with context","Specific risk","Specific risk"],
-  "what_to_watch": ["Key monitorable for next quarter","Key monitorable","Key monitorable"],
-  "peer_context": "How these numbers compare to sector peers or historical averages",
-  "investor_verdict": "3-4 sentence institutional verdict: overall assessment, key strengths, key concerns, what would change the view. Must read like a JP Morgan research note conclusion."
+  "highlights":    ["Key positive takeaways with specific numbers"],
+  "risks":         ["Key risk factors with specific numbers and triggers"],
+  "what_to_watch": ["Forward-looking items to monitor next quarter"]
 }}
 
-FINANCIAL FILING
-================
+FINAL INSTRUCTIONS:
+- Use only numbers extracted from the document. Do not fabricate data.
+- Calculate all ratios where inputs are available.
+- Ensure scores match the scoring framework exactly.
+- Every commentary field must contain specific numbers, not vague statements.
+- Return only the JSON object, nothing else.
 
+FINANCIAL DOCUMENT:
 {snippet}
 """
 
 
 def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
-    """
-    Lean institutional prompt for small-context models (8k-32k tokens).
-    Preserves research quality while fitting tight context windows.
-    """
+    """Lean prompt for small-context models — same schema, compact template."""
     snippet = text[:max_doc_chars]
-    logger.info(f"Lean prompt: {len(snippet):,} doc chars (from {len(text):,} total)")
+    logger.info(f"build_lean_prompt: {len(snippet):,} chars (from {len(text):,} total)")
+    return f"""Analyze this financial document and return ONLY valid JSON — no markdown, no preamble, no code fences.
 
-    return f"""You are a senior equity research analyst at a Tier-1 investment bank. Analyse this financial filing and return ONLY valid JSON — no markdown, no preamble.
+You are a senior equity research analyst. Extract all numbers exactly as written. Calculate all derivable ratios. Write institutional-quality commentary with specific numbers in every field.
 
-Rules:
-1. Extract every number EXACTLY as written with units (Cr/Lakh/Rs.).
-2. Calculate ALL derivable ratios — never leave blank if base numbers exist.
-3. Commentary must be institutional quality: specific numbers, basis points, YoY comparisons.
-4. Health score: fill pts, max, value (actual metric), reason (one precise sentence with number).
-5. analyst_rating must be BUY/HOLD/SELL based on the financials.
+SCORING (use exact scores):
+Profitability(max 20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=12 | else=5
+Growth(max 15): Rev>20% AND Profit>25%=15 | Rev 10-20% AND Profit 10-25%=9 | else=4
+Balance Sheet(max 15): D/E<0.5=15 | D/E 0.5-1.5=9 | D/E>1.5=3
+Liquidity(max 10): CR>1.5=10 | CR 1.0-1.5=6 | CR<1.0=2
+Cash Flow(max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3
+Governance(max 15): Clean audit=15 | Minor issues=9 | Major issues=3
+Industry(max 10): Leader=10 | Average=6 | Lagging=2
+health_label: >=80=Excellent | 60-79=Good | 40-59=Fair | 20-39=Poor | <20=Critical
+investment_label: Strong Buy / Buy / Hold / Reduce / Avoid
 
-Health scoring:
-revenue_growth(max 10: growing=10,flat=5,declining=0)
-net_margin(max 20: >20%=20,15-20%=17,10-15%=13,5-10%=8,2-5%=4,<2%=1,neg=0)
-ebitda_margin(max 15: >30%=15,20-30%=12,15-20%=9,10-15%=6,5-10%=3,<5%=1)
-debt_equity(max 15: <0.2=15,0.2-0.5=12,0.5-1=9,1-2=5,2-3=2,>3=0)
-current_ratio(max 10: >2.5=10,2-2.5=9,1.5-2=7,1-1.5=4,<1=0)
-ocf_quality(max 10: OCF/PAT>1.2=10,0.8-1.2=8,0-0.8=5,neg=0)
-roe(max 10: >25%=10,20-25%=8,15-20%=6,10-15%=4,5-10%=2,<5%=0)
-eps_growth(max 10: >20%=10,10-20%=8,0-10%=5,flat=3,declining=0)
-Labels: 0-40=Caution,41-55=Fair,56-70=Good,71-85=Strong,86-100=Exceptional
+Return ONLY this JSON (all fields required, use specific numbers in all commentary):
+{{
+  "company_name":"","statement_type":"","period":"","currency":"","health_score":0,"health_label":"",
+  "health_score_breakdown":{{
+    "total":0,
+    "components":[
+      {{"category":"Profitability","weight":20,"score":0,"max":20,"rating":"","reasoning":""}},
+      {{"category":"Growth","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Balance Sheet","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Liquidity","weight":10,"score":0,"max":10,"rating":"","reasoning":""}},
+      {{"category":"Cash Flow","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Governance & Risk","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+      {{"category":"Industry Position","weight":10,"score":0,"max":10,"rating":"","reasoning":""}}
+    ]
+  }},
+  "headline":"","executive_summary":"","investment_label":"","investor_verdict":"",
+  "for_long_term_investors":"","for_short_term_traders":"","bottom_line":"",
+  "key_metrics":[
+    {{"label":"Revenue","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"Net Profit","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"EBITDA Margin","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"ROE","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
+    {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"","signal":"","comment":""}}
+  ],
+  "cash_flow_deep_dive":{{
+    "operating_cf":"","investing_cf":"","financing_cf":"","free_cash_flow":"","capex":"",
+    "cash_conversion_quality":"","ocf_vs_pat_insight":""
+  }},
+  "balance_sheet_deep_dive":{{
+    "asset_quality":"","debt_profile":"","working_capital_insight":"",
+    "total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":""
+  }},
+  "growth_quality":{{"revenue_growth_context":"","profit_growth_context":"","margin_trend":"","growth_outlook":"","catalysts":[],"headwinds":[]}},
+  "industry_context":{{"sector_tailwinds":[],"sector_headwinds":[],"competitive_position":"","peer_benchmarks":"","regulatory_environment":""}},
+  "red_flags":[],"strengths_and_moats":[],
+  "investor_faq":[
+    {{"question":"Is this company a good investment right now?","answer":""}},
+    {{"question":"What is the biggest risk to monitor?","answer":""}},
+    {{"question":"How sustainable is the current growth rate?","answer":""}}
+  ],
+  "key_monitorables":[],
+  "profitability":{{"analysis":"","net_margin_current":"","ebitda_margin_current":"","roe":"","roa":""}},
+  "liquidity":{{"analysis":"","current_ratio":"","quick_ratio":"","cash_position":"","operating_cash_flow":"","free_cash_flow":""}},
+  "highlights":[],"risks":[],"what_to_watch":[]
+}}
 
-Return this exact JSON:
-{{"company_name":"","ticker":"","exchange":"","statement_type":"","period":"","reporting_currency":"INR","unit":"","analyst_rating":"","analyst_rating_rationale":"","health_score":0,"health_label":"","health_score_breakdown":{{"revenue_growth":{{"pts":0,"max":10,"value":"","reason":""}},"net_margin":{{"pts":0,"max":20,"value":"","reason":""}},"ebitda_margin":{{"pts":0,"max":15,"value":"","reason":""}},"debt_to_equity":{{"pts":0,"max":15,"value":"","reason":""}},"current_ratio":{{"pts":0,"max":10,"value":"","reason":""}},"ocf_quality":{{"pts":0,"max":10,"value":"","reason":""}},"roe":{{"pts":0,"max":10,"value":"","reason":""}},"eps_growth":{{"pts":0,"max":10,"value":"","reason":""}},"total":0}},"headline":"Bloomberg-style headline","executive_summary":"5-7 sentences with specific numbers","investment_thesis":{{"bull_case":"","bear_case":"","key_monitorables":[]}},"income_statement":{{"revenue":{{"current":"","previous":"","unit":"","yoy_chg_pct":""}},"other_income":{{"current":"","previous":"","unit":""}},"total_income":{{"current":"","previous":"","unit":""}},"cost_of_goods_sold":{{"current":"","previous":"","unit":""}},"gross_profit":{{"current":"","previous":"","unit":""}},"employee_costs":{{"current":"","previous":"","unit":""}},"ebitda":{{"current":"","previous":"","unit":"","yoy_chg_pct":""}},"depreciation":{{"current":"","previous":"","unit":""}},"ebit":{{"current":"","previous":"","unit":""}},"finance_cost":{{"current":"","previous":"","unit":""}},"pbt":{{"current":"","previous":"","unit":""}},"tax_expense":{{"current":"","previous":"","unit":""}},"pat":{{"current":"","previous":"","unit":"","yoy_chg_pct":""}},"eps_basic":{{"current":"","previous":"","unit":"Rs.","yoy_chg_pct":""}},"eps_diluted":{{"current":"","previous":"","unit":"Rs."}}}},"balance_sheet":{{"total_assets":{{"current":"","previous":"","unit":""}},"current_assets":{{"current":"","previous":"","unit":""}},"inventories":{{"current":"","previous":"","unit":""}},"trade_receivables":{{"current":"","previous":"","unit":""}},"cash_equivalents":{{"current":"","previous":"","unit":""}},"total_equity":{{"current":"","previous":"","unit":""}},"total_borrowings":{{"current":"","previous":"","unit":"","yoy_chg_pct":""}},"long_term_borrowings":{{"current":"","previous":"","unit":""}},"short_term_borrowings":{{"current":"","previous":"","unit":""}},"trade_payables":{{"current":"","previous":"","unit":""}},"current_liabilities":{{"current":"","previous":"","unit":""}}}},"cash_flow_statement":{{"operating_cash_flow":{{"current":"","previous":"","unit":""}},"investing_cash_flow":{{"current":"","previous":"","unit":""}},"financing_cash_flow":{{"current":"","previous":"","unit":""}},"capex":{{"current":"","previous":"","unit":""}},"free_cash_flow":{{"current":"","previous":"","unit":""}}}},"key_metrics":[{{"metric":"Revenue","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"EBITDA","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"EBITDA Margin %","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"PAT","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"Net Margin %","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"EPS Basic","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"ROE %","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"D/E Ratio","current":"","previous":"","change_pct":"","comment":""}},{{"metric":"Operating Cash Flow","current":"","previous":"","change_pct":"","comment":""}}],"vertical_analysis":{{"gross_margin_pct":{{"current":"","previous":"","change_bps":""}},"ebitda_margin_pct":{{"current":"","previous":"","change_bps":""}},"net_profit_margin_pct":{{"current":"","previous":"","change_bps":""}},"commentary":""}},"horizontal_analysis":{{"revenue_growth_yoy_pct":"","pat_growth_yoy_pct":"","eps_growth_yoy_pct":"","notable_trends":[]}},"leverage_analysis":{{"net_debt":"","debt_to_equity":"","net_debt_to_ebitda":"","interest_coverage_ratio":"","commentary":""}},"liquidity_analysis":{{"current_ratio":"","quick_ratio":"","cash_ratio":"","commentary":""}},"profitability_analysis":{{"gross_margin_pct":"","ebitda_margin_pct":"","net_profit_margin_pct":"","roe_pct":"","roa_pct":"","roic_pct":"","dupont_analysis":{{"net_margin_pct":"","asset_turnover":"","equity_multiplier":"","roe_derived":""}},"commentary":""}},"cash_flow_analysis":{{"operating_cash_flow":"","capex":"","free_cash_flow":"","ocf_to_pat_ratio":"","fcf_margin_pct":"","cash_quality":"","commentary":""}},"rates_of_return":{{"roe_pct":"","roa_pct":"","eps_basic":"","eps_diluted":"","dividend_per_share":"","commentary":""}},"segment_analysis":{{"segments_reported":false,"segments":[],"commentary":""}},"highlights":[],"risks":[],"what_to_watch":[],"peer_context":"","investor_verdict":""}}
-
-FINANCIAL FILING:
+FINANCIAL DOCUMENT:
 {snippet}
 """
-
-
-def compress_prompt(prompt: str, max_chars: int = 65000) -> str:
-    if len(prompt) > max_chars:
-        logger.warning(f"Prompt too large ({len(prompt)} chars) — compressing to {max_chars}")
-        return prompt[:max_chars] + "\n\n[Document truncated due to model context limits]"
-    return prompt
-
-# ─── AI RUNNERS ──────────────────────────────────────────────────────────────
-
-def _sync_gemini(text: str) -> dict:
-    if not GEMINI_API_KEY:
-        raise Exception("No GEMINI_API_KEY configured")
-
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-
-    # (model_id, max_doc_chars)
-    # Gemini 1M context — send full document
-    models_to_try = [
-        ("gemini-2.0-flash",      160000),
-        ("gemini-2.0-flash-exp",  160000),
-        ("gemini-1.5-flash",      160000),
-        ("gemini-1.5-pro-002",    160000),
-    ]
-
-    last_error = ""
-    for model_name, max_doc in models_to_try:
-        try:
-            prompt = build_prompt(text, max_doc_chars=max_doc)
-            logger.info(f"Gemini {model_name}: sending {len(prompt):,} chars")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    max_output_tokens=8192,
-                )
-            )
-            raw_text = response.text
-            logger.info(f"Gemini {model_name}: ✅ received {len(raw_text):,} chars")
-            return safe_parse_json(raw_text)
-
-        except Exception as e:
-            err_str = str(e)
-            last_error = err_str
-            logger.warning(f"Gemini {model_name} failed: {err_str[:300]}")
-
-            # Quota exhausted for today — no point trying other Gemini models
-            if "429" in err_str or "quota" in err_str.lower() or "resource_exhausted" in err_str.lower():
-                logger.warning("Gemini quota exhausted — skipping remaining Gemini models")
-                raise Exception(f"Gemini quota exhausted: {err_str[:200]}")
-
-            # Model not found / deprecated — try next
-            if "404" in err_str or "not found" in err_str.lower() or "deprecated" in err_str.lower():
-                continue
-
-            # Any other error — try next model
-            continue
-
-    raise Exception(f"All Gemini models failed. Last error: {last_error[:200]}")
-
-
-GROQ_MODELS_ACTIVE = [
-    # (model_id, max_doc_chars, use_lean_prompt)
-    # llama-3.3-70b-versatile: 128k ctx — reduce doc to 20k to avoid 413
-    ("llama-3.3-70b-versatile",       20000, True),
-    # llama-3.1-8b-instant: 128k ctx — small but fast
-    ("llama-3.1-8b-instant",          14000, True),
-    # llama3-groq-70b-8192-tool-use-preview
-    ("llama3-groq-70b-8192-tool-use-preview", 14000, True),
-    # llama3-groq-8b-8192-tool-use-preview
-    ("llama3-groq-8b-8192-tool-use-preview",  14000, True),
-]
-
-def _sync_groq(text: str) -> dict:
-    """Call Groq API directly via requests — reliable in ThreadPoolExecutor."""
-    if not GROQ_API_KEY:
-        raise Exception("No GROQ_API_KEY configured")
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    last_error = "unknown"
-    for model, max_doc, lean in GROQ_MODELS_ACTIVE:
-        try:
-            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
-            logger.info(f"Groq {model}: sending {len(prompt):,} chars ({'lean' if lean else 'full'})")
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 8192,
-                },
-                timeout=90,
-            )
-            logger.info(f"Groq {model}: HTTP {resp.status_code}")
-            if resp.status_code == 429:
-                logger.warning(f"Groq {model}: rate limited — {resp.text[:200]}")
-                continue
-            if resp.status_code in (400, 404, 422):
-                logger.warning(f"Groq {model}: HTTP {resp.status_code} — {resp.text[:200]}")
-                last_error = f"HTTP {resp.status_code}: {resp.text[:100]}"
-                continue
-            if resp.status_code == 200:
-                raw = resp.json()["choices"][0]["message"]["content"]
-                logger.info(f"Groq {model}: ✅ received {len(raw)} chars")
-                return safe_parse_json(raw)
-            last_error = f"HTTP {resp.status_code}: {resp.text[:100]}"
-            logger.warning(f"Groq {model}: unexpected {last_error}")
-        except requests.exceptions.ConnectionError as ex:
-            last_error = f"ConnectionError: {str(ex)[:150]}"
-            logger.warning(f"Groq {model} connection failed: {last_error}")
-            continue
-        except requests.exceptions.Timeout:
-            last_error = "Timeout after 90s"
-            logger.warning(f"Groq {model} timed out")
-            continue
-        except Exception as ex:
-            last_error = str(ex)[:200]
-            logger.warning(f"Groq {model} error: {last_error}")
-            continue
-
-    raise Exception(f"All Groq models failed. Last error: {last_error}")
-
-def _sync_together(text: str) -> dict:
-    key = os.getenv("TOGETHER_API_KEY", "")
-    if not key:
-        raise Exception("No TOGETHER_API_KEY")
-
-    # (model_id, max_doc_chars, use_lean)
-    models = [
-        ("meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo", 44000, False),
-        ("meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",  14000, True),
-    ]
-
-    for model, max_doc, lean in models:
-        try:
-            prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
-            logger.info(f"Together {model}: sending {len(prompt):,} chars")
-            resp = httpx.post(
-                "https://api.together.xyz/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": [{"role": "user", "content": prompt}],
-                      "temperature": 0.1, "max_tokens": 8192},
-                timeout=90,
-            )
-            if resp.status_code == 200:
-                raw = resp.json()["choices"][0]["message"]["content"]
-                logger.info(f"Together {model}: received {len(raw)} chars")
-                return safe_parse_json(raw)
-            logger.warning(f"Together {model} failed: HTTP {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"Together {model} error: {str(e)[:150]}")
-def _sync_openrouter(text: str) -> dict:
-    key = os.getenv("OPENROUTER_API_KEY", "")
-    if not key:
-        raise Exception("No OPENROUTER_API_KEY")
-
-    import time
-
-    # VERIFIED from live logs — 429=rate limited=model exists and is valid
-    # All 400/404 models removed
-    models = [
-        ("meta-llama/llama-3.3-70b-instruct:free",        20000, True),
-        ("google/gemma-3-27b-it:free",                    20000, True),
-        ("mistralai/mistral-small-3.1-24b-instruct:free", 20000, True),
-        ("meta-llama/llama-3.2-3b-instruct:free",         14000, True),
-        ("google/gemma-3-12b-it:free",                    14000, True),
-        ("google/gemma-3-4b-it:free",                     14000, True),
-        ("nousresearch/hermes-3-llama-3.1-405b:free",     20000, True),
-        ("qwen/qwen-2.5-72b-instruct:free",               20000, True),
-        ("qwen/qwen-2.5-7b-instruct:free",                14000, True),
-    ]
-
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "HTTP-Referer": "https://finsight-vert.vercel.app",
-        "X-Title": "FinSight",
-        "Content-Type": "application/json",
-    }
-
-    for model, max_doc, lean in models:
-        prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
-        for attempt in range(2):
-            try:
-                logger.info("OpenRouter %s: sending %d chars attempt %d", model, len(prompt), attempt+1)
-                resp = requests.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json={"model": model,
-                          "messages": [{"role": "user", "content": prompt}],
-                          "temperature": 0.1, "max_tokens": 8192},
-                    timeout=120,
-                )
-                logger.info("OpenRouter %s: HTTP %d", model, resp.status_code)
-
-                if resp.status_code == 429:
-                    if attempt == 0:
-                        logger.warning("OpenRouter %s rate-limited — waiting 15s", model)
-                        time.sleep(15)
-                        continue
-                    logger.warning("OpenRouter %s rate-limited twice — skipping", model)
-                    break
-
-                if resp.status_code in (404, 400, 422):
-                    logger.warning("OpenRouter %s: HTTP %d: %s", model, resp.status_code, resp.text[:150])
-                    break
-
-                if resp.status_code == 200:
-                    body = resp.json()
-                    if "error" in body:
-                        logger.warning("OpenRouter %s body error: %s", model, str(body["error"])[:150])
-                        break
-                    raw = body["choices"][0]["message"]["content"]
-                    logger.info("OpenRouter %s: received %d chars", model, len(raw))
-                    return safe_parse_json(raw)
-
-                logger.warning("OpenRouter %s: HTTP %d: %s", model, resp.status_code, resp.text[:100])
-                break
-
-            except requests.exceptions.Timeout:
-                logger.warning("OpenRouter %s timed out attempt %d", model, attempt+1)
-                if attempt == 0:
-                    continue
-                break
-            except Exception as e:
-                logger.warning("OpenRouter %s error: %s", model, str(e)[:150])
-                break
-
-    raise Exception("All OpenRouter models failed or unavailable")
 
 
 def _extract_metrics_from_text(text: str) -> dict:
@@ -1446,6 +1207,8 @@ def _extract_metrics_from_text(text: str) -> dict:
                 break
 
     return dict(metrics)
+
+
 def _sync_cloudflare(text: str) -> dict:
     """
     Cloudflare Workers AI — free 10,000 requests/day, no rate limiting issues.
@@ -1566,11 +1329,17 @@ async def run_analysis(text: str) -> dict:
     metrics_block = ""
     if any(metrics.values()):
         metrics_block = f"""
-PRE-EXTRACTED METRICS (use as cross-reference, not as substitute for reading the document):
+REGEX-EXTRACTED HINTS (TREAT WITH CAUTION — may contain errors from wrong table rows):
+These are regex-extracted numbers. They may be wrong due to unit mismatches or wrong row matches.
+DO NOT trust these blindly. Always verify against the actual tables in the document below.
+Use only as a starting-point cross-reference:
 {json.dumps(metrics, indent=2)}
 
-PRE-COMPUTED RATIOS (verify against document figures):
+COMPUTED RATIOS (derived from above hints — verify independently):
 {json.dumps(ratios, indent=2)}
+
+IMPORTANT: If the document tables show different numbers, ALWAYS use the document tables.
+The regex hints above are frequently wrong on Indian quarterly filings due to mixed units.
 
 """
 
