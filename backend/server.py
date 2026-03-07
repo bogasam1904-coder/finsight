@@ -1475,12 +1475,14 @@ def _sync_gemini(text: str) -> dict:
 
 GROQ_MODELS_ACTIVE = [
     # (model_id, max_doc_chars, use_lean_prompt)
-    ("llama-3.3-70b-versatile",       44000, False),
-    ("llama-3.1-70b-versatile",       44000, False),
-    ("mixtral-8x7b-32768",            16000, False),
-    ("llama3-70b-8192",               14000, True),
-    ("llama3-8b-8192",                14000, True),
-    ("gemma2-9b-it",                  14000, True),
+    # llama-3.3-70b-versatile: 128k ctx — reduce doc to 20k to avoid 413
+    ("llama-3.3-70b-versatile",       20000, True),
+    # llama-3.1-8b-instant: 128k ctx — small but fast
+    ("llama-3.1-8b-instant",          14000, True),
+    # llama3-groq-70b-8192-tool-use-preview
+    ("llama3-groq-70b-8192-tool-use-preview", 14000, True),
+    # llama3-groq-8b-8192-tool-use-preview
+    ("llama3-groq-8b-8192-tool-use-preview",  14000, True),
 ]
 
 def _sync_groq(text: str) -> dict:
@@ -1567,35 +1569,25 @@ def _sync_together(text: str) -> dict:
             logger.warning(f"Together {model} failed: HTTP {resp.status_code}")
         except Exception as e:
             logger.warning(f"Together {model} error: {str(e)[:150]}")
-
-    raise Exception("All Together AI models failed")
-
-
 def _sync_openrouter(text: str) -> dict:
-    """Call OpenRouter API via requests — reliable in ThreadPoolExecutor."""
     key = os.getenv("OPENROUTER_API_KEY", "")
     if not key:
         raise Exception("No OPENROUTER_API_KEY")
 
     import time
 
-    # EXACT model slugs from openrouter.ai/models?q=free - verified March 7, 2026
-    # Sorted by weekly usage (most popular/reliable first)
-    # (model_id, max_doc_chars, use_lean_prompt)
+    # VERIFIED from live logs — 429=rate limited=model exists and is valid
+    # All 400/404 models removed
     models = [
-        ("stepfun-ai/step-3-5-flash:free",                  44000, False),  # 679B tokens/wk, 256k ctx
-        ("arcee-ai/arcee-blitz:free",                       44000, False),  # 587B tokens/wk, 131k ctx
-        ("z-ai/glm-4-5-air:free",                           44000, False),  # 61.7B tokens/wk, 131k ctx
-        ("meta-llama/llama-3.3-70b-instruct:free",          44000, False),  # 2.22B tokens/wk, 128k ctx
-        ("openai/gpt-4o-mini-search-preview:free",          44000, False),  # 3.51B tokens/wk, 131k ctx
-        ("openai/gpt-4o:free",                              44000, False),  # 1.1B tokens/wk, 131k ctx
-        ("qwen/qwen3-coder-480b-a35b-instruct:free",        44000, False),  # 1.07B tokens/wk, 262k ctx
-        ("qwen/qwen3-235b-a22b:free",                       44000, False),  # 810M tokens/wk, 262k ctx
-        ("google/gemma-3-27b-it:free",                      44000, False),  # 693M tokens/wk, 131k ctx
-        ("mistralai/mistral-small-3.1-24b-instruct:free",   20000, True),   # 299M tokens/wk, 128k ctx
-        ("nous/hermes-3-llama-3.1-405b:free",               44000, False),  # 101M tokens/wk, 131k ctx
-        ("meta-llama/llama-3.2-3b-instruct:free",           14000, True),   # 88.1M tokens/wk, 131k ctx
-        ("google/gemma-3-12b-it:free",                      20000, True),   # 48.7M tokens/wk, 32k ctx
+        ("meta-llama/llama-3.3-70b-instruct:free",        20000, True),
+        ("google/gemma-3-27b-it:free",                    20000, True),
+        ("mistralai/mistral-small-3.1-24b-instruct:free", 20000, True),
+        ("meta-llama/llama-3.2-3b-instruct:free",         14000, True),
+        ("google/gemma-3-12b-it:free",                    14000, True),
+        ("google/gemma-3-4b-it:free",                     14000, True),
+        ("nousresearch/hermes-3-llama-3.1-405b:free",     20000, True),
+        ("qwen/qwen-2.5-72b-instruct:free",               20000, True),
+        ("qwen/qwen-2.5-7b-instruct:free",                14000, True),
     ]
 
     headers = {
@@ -1609,7 +1601,7 @@ def _sync_openrouter(text: str) -> dict:
         prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
         for attempt in range(2):
             try:
-                logger.info(f"OpenRouter {model}: sending {len(prompt):,} chars attempt {attempt+1}")
+                logger.info("OpenRouter %s: sending %d chars attempt %d", model, len(prompt), attempt+1)
                 resp = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers=headers,
@@ -1618,38 +1610,39 @@ def _sync_openrouter(text: str) -> dict:
                           "temperature": 0.1, "max_tokens": 8192},
                     timeout=120,
                 )
-                logger.info(f"OpenRouter {model}: HTTP {resp.status_code}")
+                logger.info("OpenRouter %s: HTTP %d", model, resp.status_code)
 
                 if resp.status_code == 429:
                     if attempt == 0:
-                        logger.warning(f"OpenRouter {model} rate-limited — waiting 20s")
-                        time.sleep(20)
+                        logger.warning("OpenRouter %s rate-limited — waiting 15s", model)
+                        time.sleep(15)
                         continue
+                    logger.warning("OpenRouter %s rate-limited twice — skipping", model)
                     break
 
                 if resp.status_code in (404, 400, 422):
-                    logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}: {resp.text[:150]}")
+                    logger.warning("OpenRouter %s: HTTP %d: %s", model, resp.status_code, resp.text[:150])
                     break
 
                 if resp.status_code == 200:
                     body = resp.json()
                     if "error" in body:
-                        logger.warning(f"OpenRouter {model} body error: {str(body['error'])[:150]}")
+                        logger.warning("OpenRouter %s body error: %s", model, str(body["error"])[:150])
                         break
                     raw = body["choices"][0]["message"]["content"]
-                    logger.info(f"OpenRouter {model}: ✅ received {len(raw)} chars")
+                    logger.info("OpenRouter %s: received %d chars", model, len(raw))
                     return safe_parse_json(raw)
 
-                logger.warning(f"OpenRouter {model}: HTTP {resp.status_code}: {resp.text[:100]}")
+                logger.warning("OpenRouter %s: HTTP %d: %s", model, resp.status_code, resp.text[:100])
                 break
 
             except requests.exceptions.Timeout:
-                logger.warning(f"OpenRouter {model} timed out attempt {attempt+1}")
+                logger.warning("OpenRouter %s timed out attempt %d", model, attempt+1)
                 if attempt == 0:
                     continue
                 break
             except Exception as e:
-                logger.warning(f"OpenRouter {model} error: {str(e)[:150]}")
+                logger.warning("OpenRouter %s error: %s", model, str(e)[:150])
                 break
 
     raise Exception("All OpenRouter models failed or unavailable")
