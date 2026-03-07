@@ -704,7 +704,7 @@ def _select_financial_pages(raw_bytes: bytes) -> list:
     for i, page in enumerate(reader.pages):
         t = (page.extract_text() or "").lower()
         score = sum(1 for kw in KEYWORDS if kw in t)
-        if score >= 3:
+        if score >= 2:  # lowered from 3 — capture more pages with financial data
             core_pages.add(i)
 
     logger.info(f"PDF: {total} pages total, {len(core_pages)} financial pages selected: {sorted(core_pages)}")
@@ -729,7 +729,7 @@ def _validate_extracted_numbers(text: str, source_text: str) -> bool:
     return True
 
 
-def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 40000) -> str:
+def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
     """
     FIXED extraction pipeline:
     1. Select financial pages using keyword scoring
@@ -849,295 +849,347 @@ def _repair_json(s: str) -> str:
 
 # ─── TEXT CHUNKING FOR LARGE FILINGS ───────────────────────────────
 
-def split_into_chunks(text, size=6000, overlap=600):
-
+def split_into_chunks(text, size=12000, overlap=1200):
+    """
+    Split text into overlapping chunks.
+    Larger size ensures more context per chunk; overlap prevents boundary cut-offs.
+    """
     chunks = []
     start = 0
-
     while start < len(text):
-
         chunk = text[start:start + size]
-
         chunks.append(chunk)
-
         start += size - overlap
-
-    logger.info(f"Split document into {len(chunks)} chunks")
-
+    logger.info(f"Split document into {len(chunks)} chunks of ~{size} chars")
     return chunks
 
 def build_prompt(text: str) -> str:
+    # Use up to 55,000 chars — most annual reports / quarterly results fit within this
+    snippet = text[:55000]
+    logger.info(f"Prompt snippet: {len(snippet)} chars from {len(text)} total")
 
-    snippet = text[:35000]
-
-    logger.info(f"Prompt snippet: {len(snippet)} chars")
-
-    financial_keywords = [
-        "revenue",
-        "profit",
-        "income",
-        "assets",
-        "crore",
-        "lakh",
-        "eps",
-        "ebitda"
-    ]
-
-    found_kw = [
-        kw for kw in financial_keywords
-        if kw.lower() in snippet.lower()
-    ]
-
+    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh", "eps", "ebitda", "loss",
+                          "balance sheet", "cash flow", "borrowing", "equity", "liabilities"]
+    found_kw = [kw for kw in financial_keywords if kw.lower() in snippet.lower()]
     if len(found_kw) < 2:
-        logger.warning(
-            f"Snippet may not contain financial data. "
-            f"Found keywords: {found_kw}. "
-            f"Preview: {snippet[:300]}"
-        )
+        logger.warning(f"Low financial keyword count: {found_kw}. Preview: {snippet[:300]}")
 
-    return f"""
-You are FinSight — an institutional-grade equity research analyst specialising in Indian listed companies.
+    return f"""You are FinSight — a senior institutional equity research analyst at a top-tier investment bank.
+Your job: extract EVERY number from this financial document and produce the most detailed, accurate, investor-grade analysis possible.
 
-Your job is to analyse financial statements and produce a comprehensive, investor-grade report covering ALL major types of financial analysis.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 1 — EXHAUSTIVE EXTRACTION (MOST IMPORTANT RULE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━
-CRITICAL RULES
-━━━━━━━━━━━━━━━━━━
+Before writing a single output field, you MUST perform a complete scan:
 
-1. Use ONLY numbers that appear in the document.
-2. NEVER fabricate or estimate data.
-3. If a metric is not in the document, write: "Not available in this filing".
-4. Scan the FULL document before declaring any data unavailable.
-5. Copy numbers EXACTLY as they appear — preserve commas and decimals.
+STEP 1: Read the entire document from top to bottom.
+STEP 2: Find and note EVERY table. Tables contain the most data. Look for:
+  - Standalone financial statements (P&L, Balance Sheet, Cash Flow)
+  - "Key Financial Data" / "Financial Highlights" / "Financial Summary" tables
+  - "Key Financial Ratios" sections — these often contain Current Ratio, D/E, ROE, ROCE, etc. already calculated
+  - Notes to Accounts — contain breakdowns of Borrowings, Receivables, Inventory, Capex
+  - Segment reporting tables — contain Revenue, EBIT per segment
+STEP 3: For EVERY number you find, record it with its label and period.
+STEP 4: Only AFTER completing the full scan, fill in the JSON output.
 
-Example:
-Document shows: 20,078.39
-Write exactly:  20,078.39  (not 2007.8, not 20078, not 20.07)
+FORBIDDEN: Writing "Not available in this filing" for ANY field unless you have
+read the COMPLETE document and confirmed the data is genuinely absent.
+FORBIDDEN: Skipping tables or footnotes.
+FORBIDDEN: Rounding or approximating numbers. Copy them exactly.
 
-━━━━━━━━━━━━━━━━━━
-WHAT IS FINANCIAL ANALYSIS?
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 2 — NUMBER ACCURACY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Financial analysis examines a company's financial data to understand its health, performance, and potential
-to improve decision-making. Ratios are preferred over individual numbers because they reveal relationships
-between figures. Past data is used to make projections. Key stakeholders — investors, analysts, lenders,
-auditors — all use financial analysis to assess whether a company is healthy, well-run, and fairly valued.
+Copy numbers EXACTLY as they appear. Preserve ALL digits, commas, and decimals.
+Units matter — if the document says "(₹ in Crores)", ALL numbers in that table are in Crores.
+If a table says "(₹ in Lakhs)", ALL numbers in that table are in Lakhs.
+Always state the unit in parentheses next to the number.
 
-━━━━━━━━━━━━━━━━━━
-EXTRACTION TARGETS
-━━━━━━━━━━━━━━━━━━
+CORRECT:  "20,078.39 Cr"
+WRONG:    "20078", "2007.8", "200.78 Cr", "20,078"
 
-Extract every available figure from these categories:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 3 — CALCULATION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-INCOME STATEMENT
-  Revenue / Total Income / Income from Operations / Net Sales
-  Gross Profit
-  EBITDA / Operating Profit
-  EBIT
-  Finance Cost / Interest Expense
-  Depreciation & Amortisation
-  Profit Before Tax (PBT)
-  Net Profit / Profit After Tax (PAT)
-  Basic EPS / Diluted EPS
+When base numbers are available, ALWAYS compute these — do not leave them blank:
 
-BALANCE SHEET
-  Total Assets | Current Assets | Non-Current Assets
-  Cash & Cash Equivalents
-  Inventories | Trade Receivables
-  Total Liabilities | Current Liabilities | Non-Current Liabilities
-  Borrowings / Total Debt
-  Total Equity / Net Worth / Shareholders' Equity
-  Reserves & Surplus | Share Capital
+  Gross Margin %         = (Gross Profit / Revenue) × 100
+  EBITDA Margin %        = (EBITDA / Revenue) × 100
+  EBIT Margin %          = (EBIT / Revenue) × 100
+  Net Profit Margin %    = (PAT / Revenue) × 100
+  Revenue Growth YoY %   = ((Current − Previous) / |Previous|) × 100
+  PAT Growth YoY %       = ((Current PAT − Previous PAT) / |Previous PAT|) × 100
+  Debt-to-Equity         = Total Borrowings / Total Equity
+  Debt-to-EBITDA         = Total Borrowings / EBITDA
+  Interest Coverage      = EBIT / Finance Cost
+  Current Ratio          = Current Assets / Current Liabilities
+  Quick Ratio            = (Current Assets − Inventory) / Current Liabilities
+  Cash Ratio             = Cash & Equivalents / Current Liabilities
+  Asset Turnover         = Revenue / Total Assets
+  Inventory Turnover     = Revenue / Inventory (or COGS / Inventory)
+  ROE %                  = (PAT / Total Equity) × 100
+  ROA %                  = (PAT / Total Assets) × 100
+  OCF-to-PAT             = Operating Cash Flow / PAT
+  FCF                    = Operating Cash Flow − CapEx
+  Net Working Capital    = Current Assets − Current Liabilities
+  EPS Growth YoY %       = ((Current EPS − Previous EPS) / |Previous EPS|) × 100
 
-CASH FLOW
-  Operating Cash Flow (OCF)
-  Investing Cash Flow
-  Financing Cash Flow
-  Free Cash Flow (FCF)
-  Capital Expenditure (CapEx)
+If a ratio is ALREADY stated in the document (e.g. in a "Key Ratios" table), use the document's figure.
+If not stated but calculable from available data, CALCULATE it.
+Only write "Not available" if the data to compute it genuinely does not exist anywhere in the document.
 
-━━━━━━━━━━━━━━━━━━
-ANALYSIS FRAMEWORK — APPLY ALL 8 TYPES
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULE 4 — COMMENTARY QUALITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. VERTICAL ANALYSIS
-   Express each P&L line as % of Revenue; Balance Sheet lines as % of Total Assets.
-   Compare against industry norms where possible.
-   Flag if any cost exceeds typical benchmarks (e.g. COGS > 60% of revenue).
+Every commentary field must contain SPECIFIC, NUMERIC, ACTIONABLE observations.
 
-2. HORIZONTAL ANALYSIS (Trend Analysis)
-   Calculate YoY and multi-period % changes for Revenue, Net Profit, EBITDA, Total Assets.
-   Identify: Revenue growing faster/slower than costs, AR growing faster than sales,
-   inventory outpacing sales, unusual spikes or drops.
+BAD commentary:  "Revenue grew well."
+GOOD commentary: "Revenue grew 18.4% YoY from ₹8,234 Cr to ₹9,750 Cr, driven by a 22% surge in the
+                  domestic business, partially offset by a 4% decline in exports. Growth outpaced cost
+                  inflation — COGS rose only 12% — resulting in gross margin expansion of 310 bps to 34.2%."
 
-3. LEVERAGE ANALYSIS
-   Debt-to-Equity Ratio = Total Debt / Total Equity
-   Debt-to-EBITDA Ratio = Total Debt / EBITDA
-   Interest Coverage Ratio (EBIT / Finance Cost)
-   Flag if D/E > 2.0 or interest coverage < 2.0x as risk signals.
+Every highlight and risk must name specific figures and explain the implication for investors.
 
-4. LIQUIDITY ANALYSIS
-   Current Ratio = Current Assets / Current Liabilities  (healthy: >1.5)
-   Quick Ratio   = (Current Assets - Inventory) / Current Liabilities  (healthy: >1.0)
-   Cash Ratio    = Cash / Current Liabilities
-   Interpret the company's ability to meet short-term obligations.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HEALTH SCORE METHODOLOGY (0–100)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-5. PROFITABILITY ANALYSIS
-   Gross Margin     = Gross Profit / Revenue
-   EBITDA Margin    = EBITDA / Revenue
-   EBIT Margin      = EBIT / Revenue
-   Net Profit Margin = Net Profit / Revenue
-   Return on Equity (ROE) = Net Profit / Total Equity
-   Return on Assets (ROA) = Net Profit / Total Assets
+Calculate transparently — show your reasoning in the investor_verdict:
 
-6. EFFICIENCY ANALYSIS
-   Asset Turnover    = Revenue / Total Assets
-   Inventory Turnover = Revenue / Inventory
-   OCF-to-Current-Liabilities = OCF / Current Liabilities
-   Assess how effectively the company converts assets into revenue.
+  Revenue growth YoY:    Positive = +10 pts | Negative = 0 pts
+  Net profit margin:     >15% = 20pts | 10–15% = 15pts | 5–10% = 10pts | 0–5% = 5pts | Negative = 0pts
+  EBITDA margin:         >25% = 15pts | 15–25% = 10pts | 8–15% = 6pts | <8% = 2pts
+  Debt-to-Equity:        <0.3 = 15pts | 0.3–1.0 = 10pts | 1.0–2.0 = 5pts | >2.0 = 0pts
+  Current Ratio:         >2.0 = 10pts | 1.5–2.0 = 8pts | 1.0–1.5 = 5pts | <1.0 = 0pts
+  OCF quality:           OCF > PAT = 10pts | OCF positive = 7pts | OCF negative = 0pts
+  ROE:                   >20% = 10pts | 15–20% = 7pts | 10–15% = 4pts | <10% = 1pt
+  EPS growth YoY:        Positive = +10 pts | Negative = 0 pts
 
-7. CASH FLOW ANALYSIS
-   Is Operating Cash Flow positive and growing?
-   FCF = OCF - CapEx. Is FCF sufficient to fund dividends and growth?
-   Is the company funding operations through debt or its own cash flows?
-   Cash quality: Is PAT backed by strong OCF (OCF/PAT ratio)?
+  Labels: 0–40 = "Caution" | 41–60 = "Fair" | 61–75 = "Good" | 76–88 = "Strong" | 89–100 = "Exceptional"
 
-8. RATES OF RETURN & VALUATION SIGNALS
-   ROE, ROA, ROIC (if data allows).
-   EPS trend (Basic and Diluted). Is EPS growing?
-   Note if valuation multiples (P/E, P/B) are mentioned.
-
-━━━━━━━━━━━━━━━━━━
-HEALTH SCORE CRITERIA
-━━━━━━━━━━━━━━━━━━
-
-Score the company 0–100 based on:
-- Revenue growth trend (+10 points if growing YoY)
-- Net profit margin (>10% = 15pts, 5–10% = 10pts, 0–5% = 5pts, negative = 0pts)
-- EBITDA margin (>20% = 15pts, 10–20% = 10pts, <10% = 5pts)
-- Debt-to-Equity (0–0.5 = 15pts, 0.5–1.5 = 10pts, 1.5–2.5 = 5pts, >2.5 = 0pts)
-- Current Ratio (>2 = 10pts, 1–2 = 7pts, <1 = 0pts)
-- OCF positive = 10pts
-- ROE >15% = 10pts, 10–15% = 7pts, <10% = 3pts
-- EPS growth = 5pts
-
-Labels: 0–40 = "Caution", 41–60 = "Fair", 61–75 = "Good", 76–90 = "Strong", 91–100 = "Exceptional"
-
-━━━━━━━━━━━━━━━━━━
-OUTPUT FORMAT — RETURN ONLY VALID JSON
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT — RETURN ONLY VALID JSON, NO MARKDOWN, NO PREAMBLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 {{
-  "company_name": "",
-  "statement_type": "",
-  "period": "",
+  "company_name": "Full legal name of the company",
+  "statement_type": "Annual Report / Quarterly Results / Half-Year Results",
+  "period": "e.g. Q2 FY2024 / FY2023-24 / H1 FY2025",
+  "reporting_currency": "INR / USD etc.",
+  "unit": "Crores / Lakhs / Millions — as stated in the document",
 
   "health_score": 0,
   "health_label": "",
+  "health_score_breakdown": {{
+    "revenue_growth_pts": 0,
+    "net_margin_pts": 0,
+    "ebitda_margin_pts": 0,
+    "debt_equity_pts": 0,
+    "current_ratio_pts": 0,
+    "ocf_quality_pts": 0,
+    "roe_pts": 0,
+    "eps_growth_pts": 0,
+    "total": 0
+  }},
 
-  "headline": "",
-  "executive_summary": "",
+  "headline": "One punchy sentence summarising the most important story in this filing",
+  "executive_summary": "4–6 sentences covering: overall performance, key growth drivers, cost dynamics, balance sheet health, cash flow quality, and key risks. Must contain specific numbers.",
+
+  "income_statement": {{
+    "revenue":          {{"current": "", "previous": "", "unit": ""}},
+    "other_income":     {{"current": "", "previous": "", "unit": ""}},
+    "total_income":     {{"current": "", "previous": "", "unit": ""}},
+    "cost_of_goods_sold":{{"current": "", "previous": "", "unit": ""}},
+    "gross_profit":     {{"current": "", "previous": "", "unit": ""}},
+    "employee_costs":   {{"current": "", "previous": "", "unit": ""}},
+    "other_expenses":   {{"current": "", "previous": "", "unit": ""}},
+    "ebitda":           {{"current": "", "previous": "", "unit": ""}},
+    "depreciation":     {{"current": "", "previous": "", "unit": ""}},
+    "ebit":             {{"current": "", "previous": "", "unit": ""}},
+    "finance_cost":     {{"current": "", "previous": "", "unit": ""}},
+    "pbt":              {{"current": "", "previous": "", "unit": ""}},
+    "tax_expense":      {{"current": "", "previous": "", "unit": ""}},
+    "pat":              {{"current": "", "previous": "", "unit": ""}},
+    "minority_interest":{{"current": "", "previous": "", "unit": ""}},
+    "pat_after_mi":     {{"current": "", "previous": "", "unit": ""}},
+    "eps_basic":        {{"current": "", "previous": "", "unit": "₹"}},
+    "eps_diluted":      {{"current": "", "previous": "", "unit": "₹"}}
+  }},
+
+  "balance_sheet": {{
+    "total_assets":           {{"current": "", "previous": "", "unit": ""}},
+    "non_current_assets":     {{"current": "", "previous": "", "unit": ""}},
+    "fixed_assets_net":       {{"current": "", "previous": "", "unit": ""}},
+    "capital_wip":            {{"current": "", "previous": "", "unit": ""}},
+    "investments":            {{"current": "", "previous": "", "unit": ""}},
+    "current_assets":         {{"current": "", "previous": "", "unit": ""}},
+    "inventories":            {{"current": "", "previous": "", "unit": ""}},
+    "trade_receivables":      {{"current": "", "previous": "", "unit": ""}},
+    "cash_equivalents":       {{"current": "", "previous": "", "unit": ""}},
+    "other_current_assets":   {{"current": "", "previous": "", "unit": ""}},
+    "total_equity":           {{"current": "", "previous": "", "unit": ""}},
+    "share_capital":          {{"current": "", "previous": "", "unit": ""}},
+    "reserves_surplus":       {{"current": "", "previous": "", "unit": ""}},
+    "total_liabilities":      {{"current": "", "previous": "", "unit": ""}},
+    "long_term_borrowings":   {{"current": "", "previous": "", "unit": ""}},
+    "short_term_borrowings":  {{"current": "", "previous": "", "unit": ""}},
+    "total_borrowings":       {{"current": "", "previous": "", "unit": ""}},
+    "trade_payables":         {{"current": "", "previous": "", "unit": ""}},
+    "current_liabilities":    {{"current": "", "previous": "", "unit": ""}},
+    "deferred_tax_liability": {{"current": "", "previous": "", "unit": ""}}
+  }},
+
+  "cash_flow_statement": {{
+    "operating_cash_flow":  {{"current": "", "previous": "", "unit": ""}},
+    "investing_cash_flow":  {{"current": "", "previous": "", "unit": ""}},
+    "financing_cash_flow":  {{"current": "", "previous": "", "unit": ""}},
+    "capex":                {{"current": "", "previous": "", "unit": ""}},
+    "free_cash_flow":       {{"current": "", "previous": "", "unit": ""}},
+    "net_change_in_cash":   {{"current": "", "previous": "", "unit": ""}}
+  }},
 
   "key_metrics": [
-    {{"metric": "Revenue",            "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "Gross Profit",       "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "EBITDA",             "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "EBIT",               "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "Net Profit (PAT)",   "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "EPS (Basic)",        "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "Total Assets",       "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "Total Equity",       "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "Total Debt",         "current": "", "previous": "", "change": "", "comment": ""}},
-    {{"metric": "Operating Cash Flow","current": "", "previous": "", "change": "", "comment": ""}}
+    {{"metric": "Revenue",              "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "Gross Profit",         "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "EBITDA",               "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "EBIT",                 "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "PAT",                  "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "EPS (Basic) ₹",        "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "Total Assets",         "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "Total Equity",         "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "Total Borrowings",     "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "Operating Cash Flow",  "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "Free Cash Flow",       "current": "", "previous": "", "change_pct": "", "comment": ""}},
+    {{"metric": "Cash & Equivalents",   "current": "", "previous": "", "change_pct": "", "comment": ""}}
   ],
 
   "vertical_analysis": {{
-    "gross_margin_pct": "",
-    "ebitda_margin_pct": "",
-    "ebit_margin_pct": "",
-    "net_profit_margin_pct": "",
-    "cost_of_revenue_pct": "",
-    "finance_cost_pct_revenue": "",
-    "commentary": ""
+    "base": "Revenue = 100%",
+    "gross_margin_pct":          {{"current": "", "previous": "", "comment": ""}},
+    "ebitda_margin_pct":         {{"current": "", "previous": "", "comment": ""}},
+    "ebit_margin_pct":           {{"current": "", "previous": "", "comment": ""}},
+    "net_profit_margin_pct":     {{"current": "", "previous": "", "comment": ""}},
+    "cogs_as_pct_revenue":       {{"current": "", "previous": "", "comment": ""}},
+    "employee_cost_pct_revenue": {{"current": "", "previous": "", "comment": ""}},
+    "finance_cost_pct_revenue":  {{"current": "", "previous": "", "comment": ""}},
+    "depreciation_pct_revenue":  {{"current": "", "previous": "", "comment": ""}},
+    "commentary": "2–3 sentences comparing margin structure to prior period and industry norms"
   }},
 
   "horizontal_analysis": {{
-    "revenue_growth_yoy": "",
-    "net_profit_growth_yoy": "",
-    "ebitda_growth_yoy": "",
-    "total_assets_growth_yoy": "",
-    "notable_trends": []
+    "revenue_growth_yoy_pct":      "",
+    "gross_profit_growth_yoy_pct": "",
+    "ebitda_growth_yoy_pct":       "",
+    "pat_growth_yoy_pct":          "",
+    "eps_growth_yoy_pct":          "",
+    "total_assets_growth_yoy_pct": "",
+    "borrowings_growth_yoy_pct":   "",
+    "notable_trends": [
+      "List 3–5 specific trend observations with numbers, e.g. 'Revenue grew 2x faster than COGS (18% vs 9%), expanding gross margin by 310 bps'"
+    ]
   }},
 
   "leverage_analysis": {{
-    "debt_to_equity": "",
-    "debt_to_ebitda": "",
+    "total_borrowings":        "",
+    "long_term_borrowings":    "",
+    "short_term_borrowings":   "",
+    "debt_to_equity":          "",
+    "debt_to_ebitda":          "",
     "interest_coverage_ratio": "",
-    "total_debt": "",
-    "commentary": ""
+    "net_debt":                "",
+    "net_debt_to_ebitda":      "",
+    "commentary": "Specific assessment of debt levels, trend vs prior year, and whether leverage is comfortable or concerning"
   }},
 
   "liquidity_analysis": {{
-    "current_ratio": "",
-    "quick_ratio": "",
-    "cash_ratio": "",
+    "current_ratio":       "",
+    "quick_ratio":         "",
+    "cash_ratio":          "",
     "net_working_capital": "",
-    "commentary": ""
+    "cash_and_equivalents":"",
+    "commentary": "Assess ability to meet short-term obligations; flag any deterioration"
   }},
 
   "profitability_analysis": {{
-    "gross_margin": "",
-    "ebitda_margin": "",
-    "net_profit_margin": "",
-    "roe": "",
-    "roa": "",
-    "commentary": ""
+    "gross_margin_pct":       "",
+    "ebitda_margin_pct":      "",
+    "ebit_margin_pct":        "",
+    "net_profit_margin_pct":  "",
+    "roe_pct":                "",
+    "roa_pct":                "",
+    "roic_pct":               "",
+    "roce_pct":               "",
+    "commentary": "Specific analysis of margin trends, drivers, and comparison to prior periods"
   }},
 
   "efficiency_analysis": {{
-    "asset_turnover": "",
-    "inventory_turnover": "",
-    "ocf_to_current_liabilities": "",
-    "commentary": ""
+    "asset_turnover":               "",
+    "inventory_turnover_days":      "",
+    "receivables_turnover_days":    "",
+    "payables_turnover_days":       "",
+    "cash_conversion_cycle_days":   "",
+    "fixed_asset_turnover":         "",
+    "commentary": "How effectively is the company using its assets? Any working capital pressure?"
   }},
 
   "cash_flow_analysis": {{
-    "operating_cash_flow": "",
-    "free_cash_flow": "",
-    "capex": "",
-    "ocf_to_pat_ratio": "",
-    "cash_quality": "",
-    "commentary": ""
+    "operating_cash_flow":    "",
+    "investing_cash_flow":    "",
+    "financing_cash_flow":    "",
+    "capex":                  "",
+    "free_cash_flow":         "",
+    "ocf_to_pat_ratio":       "",
+    "fcf_margin_pct":         "",
+    "cash_quality":           "Strong / Moderate / Weak — with reasoning",
+    "commentary": "Is earnings quality high? Is growth funded by internal cash or debt? Specific figures required."
   }},
 
   "rates_of_return": {{
-    "roe": "",
-    "roa": "",
-    "roic": "",
-    "eps_basic": "",
-    "eps_diluted": "",
-    "eps_growth_yoy": "",
-    "commentary": ""
+    "roe_pct":        "",
+    "roa_pct":        "",
+    "roic_pct":       "",
+    "roce_pct":       "",
+    "eps_basic":      "",
+    "eps_diluted":    "",
+    "eps_growth_pct": "",
+    "dividend_per_share": "",
+    "dividend_payout_ratio": "",
+    "commentary": "Are returns improving or declining? Is the company creating shareholder value?"
   }},
 
-  "highlights": [],
-  "risks": [],
-  "what_to_watch": [],
+  "segment_analysis": {{
+    "has_segments": false,
+    "segments": []
+  }},
 
-  "investor_verdict": ""
+  "highlights": [
+    "5–7 specific, numbered positive observations with exact figures — e.g. 'PAT surged 34% YoY to ₹1,240 Cr, the highest in company history'"
+  ],
+  "risks": [
+    "4–6 specific, numbered risk factors with exact figures — e.g. 'Short-term borrowings rose 67% YoY to ₹3,400 Cr, raising refinancing risk'"
+  ],
+  "what_to_watch": [
+    "3–5 forward-looking items an investor should monitor next quarter"
+  ],
+
+  "investor_verdict": "3–4 sentences: overall recommendation framing (NOT buy/sell — just analytical verdict), key strengths, key concerns, and what would change the outlook. Must include specific numbers."
 }}
 
-━━━━━━━━━━━━━━━━━━
-FINANCIAL DOCUMENT
-━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINANCIAL DOCUMENT TO ANALYSE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 {snippet}
 """
 
-def compress_prompt(prompt: str, max_chars: int = 40000) -> str:
+def compress_prompt(prompt: str, max_chars: int = 65000) -> str:
     if len(prompt) > max_chars:
         logger.warning(f"Prompt too large ({len(prompt)} chars) — compressing to {max_chars}")
-        return prompt[:max_chars] + "\n\n[Document truncated due to size limits]"
+        return prompt[:max_chars] + "\n\n[Document truncated due to model context limits]"
     return prompt
 
 # ─── AI RUNNERS ──────────────────────────────────────────────────────────────
@@ -1335,36 +1387,117 @@ def _sync_openrouter(text: str) -> dict:
     raise Exception("All OpenRouter models failed")
 
 
+def _extract_metrics_from_text(text: str) -> dict:
+    """
+    Regex-based metric extraction directly from extracted text.
+    Works on the plain text string (not PDF bytes), so it always runs.
+    Captures the most common label patterns in Indian financial filings.
+    """
+    metrics = defaultdict(str)
+    t = text  # preserve original case for number extraction
+
+    # Pattern: label ... number (handles both "Label  1,234.56" and "Label: 1,234.56")
+    NUM = r'[-]?\d{1,3}(?:,\d{2,3})*(?:\.\d+)?'
+
+    patterns = {
+        "revenue":            [r'(?:revenue from operations|net revenue|total revenue|income from operations)[^\n]{0,40}?(' + NUM + r')', r'(?:net sales|sales)[^\n]{0,30}?(' + NUM + r')'],
+        "total_income":       [r'total income[^\n]{0,30}?(' + NUM + r')'],
+        "gross_profit":       [r'gross profit[^\n]{0,30}?(' + NUM + r')'],
+        "ebitda":             [r'ebitda[^\n]{0,30}?(' + NUM + r')', r'operating profit before[^\n]{0,40}?(' + NUM + r')'],
+        "ebit":               [r'\bebit\b[^\n]{0,30}?(' + NUM + r')', r'operating profit[^\n]{0,30}?(' + NUM + r')'],
+        "finance_cost":       [r'finance costs?[^\n]{0,30}?(' + NUM + r')', r'interest expense[^\n]{0,30}?(' + NUM + r')', r'finance charges[^\n]{0,30}?(' + NUM + r')'],
+        "depreciation":       [r'depreciation[^\n]{0,60}?(' + NUM + r')', r'amortis[^\n]{0,40}?(' + NUM + r')'],
+        "pbt":                [r'profit before tax[^\n]{0,30}?(' + NUM + r')', r'\bpbt\b[^\n]{0,30}?(' + NUM + r')'],
+        "tax_expense":        [r'tax expense[^\n]{0,30}?(' + NUM + r')', r'income tax[^\n]{0,30}?(' + NUM + r')'],
+        "net_profit":         [r'profit (?:after tax|for the (?:year|period|quarter))[^\n]{0,30}?(' + NUM + r')', r'(?:^|\s)pat\b[^\n]{0,30}?(' + NUM + r')', r'net profit[^\n]{0,30}?(' + NUM + r')'],
+        "eps_basic":          [r'basic (?:eps|earnings per share)[^\n]{0,30}?(' + NUM + r')', r'(?:eps|earnings per share)[^\n\-]{0,20}basic[^\n]{0,20}?(' + NUM + r')'],
+        "eps_diluted":        [r'diluted (?:eps|earnings per share)[^\n]{0,30}?(' + NUM + r')'],
+        "total_assets":       [r'total assets[^\n]{0,30}?(' + NUM + r')'],
+        "current_assets":     [r'total current assets[^\n]{0,30}?(' + NUM + r')', r'current assets[^\n]{0,30}?(' + NUM + r')'],
+        "inventories":        [r'inventor(?:y|ies)[^\n]{0,30}?(' + NUM + r')'],
+        "trade_receivables":  [r'trade receivables[^\n]{0,30}?(' + NUM + r')', r'accounts receivable[^\n]{0,30}?(' + NUM + r')'],
+        "cash_equivalents":   [r'cash and (?:cash )?equivalents[^\n]{0,30}?(' + NUM + r')', r'cash & (?:cash )?equivalents[^\n]{0,30}?(' + NUM + r')'],
+        "total_equity":       [r'total equity[^\n]{0,30}?(' + NUM + r')', r'(?:shareholders|stockholders)[\'s]* equity[^\n]{0,30}?(' + NUM + r')', r'net worth[^\n]{0,30}?(' + NUM + r')'],
+        "reserves_surplus":   [r'reserves and surplus[^\n]{0,30}?(' + NUM + r')', r'reserves & surplus[^\n]{0,30}?(' + NUM + r')'],
+        "total_borrowings":   [r'total borrowings[^\n]{0,30}?(' + NUM + r')', r'total debt[^\n]{0,30}?(' + NUM + r')'],
+        "long_term_borrowings":[r'long[- ]term borrowings[^\n]{0,30}?(' + NUM + r')'],
+        "short_term_borrowings":[r'short[- ]term borrowings[^\n]{0,30}?(' + NUM + r')'],
+        "current_liabilities":[r'total current liabilities[^\n]{0,30}?(' + NUM + r')', r'current liabilities[^\n]{0,30}?(' + NUM + r')'],
+        "total_liabilities":  [r'total liabilities[^\n]{0,30}?(' + NUM + r')'],
+        "operating_cash_flow":[r'(?:net )?cash (?:from|generated (?:from|by)) operating[^\n]{0,30}?(' + NUM + r')', r'operating cash flow[^\n]{0,30}?(' + NUM + r')'],
+        "investing_cash_flow":[r'cash (?:from|used in) investing[^\n]{0,30}?(' + NUM + r')'],
+        "financing_cash_flow":[r'cash (?:from|used in) financing[^\n]{0,30}?(' + NUM + r')'],
+        "capex":              [r'capital expenditure[^\n]{0,30}?(' + NUM + r')', r'purchase of (?:property|fixed assets|ppe)[^\n]{0,30}?(' + NUM + r')', r'\bcapex\b[^\n]{0,30}?(' + NUM + r')'],
+        "current_ratio":      [r'current ratio[^\n]{0,30}?(' + NUM + r')'],
+        "debt_equity_ratio":  [r'debt[- /](?:to[- ])?equity[^\n]{0,30}?(' + NUM + r')', r'd/e ratio[^\n]{0,30}?(' + NUM + r')'],
+        "interest_coverage":  [r'interest coverage[^\n]{0,30}?(' + NUM + r')', r'interest cover[^\n]{0,30}?(' + NUM + r')'],
+        "roe":                [r'return on equity[^\n]{0,30}?(' + NUM + r')', r'\broe\b[^\n]{0,30}?(' + NUM + r')'],
+        "roa":                [r'return on assets[^\n]{0,30}?(' + NUM + r')', r'\broa\b[^\n]{0,30}?(' + NUM + r')'],
+        "roce":               [r'return on capital employed[^\n]{0,30}?(' + NUM + r')', r'\broce\b[^\n]{0,30}?(' + NUM + r')'],
+    }
+
+    t_lower = t.lower()
+    for metric, pats in patterns.items():
+        for pat in pats:
+            m = re.search(pat, t_lower)
+            if m:
+                metrics[metric] = m.group(1)
+                break
+
+    return dict(metrics)
+
+
 # ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
 async def run_analysis(text: str) -> dict:
 
     if not text or len(text.strip()) < 100:
         raise Exception("PDF extraction returned insufficient text.")
 
-    # Split large documents
-    chunks = split_into_chunks(text)
+    # Use as much of the document as possible — do NOT truncate aggressively here.
+    # build_prompt will take up to 55,000 chars; compress_prompt caps at 65,000.
+    # We pass the full extracted text and let the prompt builder slice it.
+    full_text = text.strip()
 
-    # Use first few chunks to guide analysis
-    text = "\n\n".join(chunks[:4])
-
-    # Guard: reject if text is too short or lacks any financial content
-    if not text or len(text.strip()) < 100:
-        raise Exception("PDF extraction returned insufficient text. The file may be scanned, empty, or corrupted.")
-
-    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh", "eps", "ebitda", "loss"]
-    found_kw = [kw for kw in financial_keywords if kw.lower() in text.lower()]
+    # Guard: reject if text lacks any financial content
+    financial_keywords = ["revenue", "profit", "income", "assets", "crore", "lakh",
+                          "eps", "ebitda", "loss", "balance sheet", "borrowing", "equity"]
+    found_kw = [kw for kw in financial_keywords if kw.lower() in full_text.lower()]
     if len(found_kw) < 2:
         raise Exception(
             f"Extracted text does not appear to contain financial data "
             f"(found only: {found_kw}). "
             f"Please verify the PDF is a financial results document. "
-            f"Text preview: {text[:200]}"
+            f"Text preview: {full_text[:200]}"
         )
 
-    logger.info(f"Analysis starting — text: {len(text)} chars, keywords found: {found_kw}")
+    logger.info(f"Analysis starting — text: {len(full_text):,} chars, keywords found: {found_kw}")
 
-    loop = asyncio.get_event_loop()
+    loop   = asyncio.get_event_loop()
     errors = []
+
+    # Pre-extract structured metrics from the raw PDF bytes stored in text
+    # Note: extract_tables_from_pdf requires actual PDF bytes, not text.
+    # metrics/ratios are computed from raw bytes upstream in extract_pdf_text.
+    # Here we pass the already-extracted text string directly to the AI.
+    # The structured metrics block below is a best-effort regex pass on the text.
+    metrics = _extract_metrics_from_text(full_text)
+    ratios  = compute_financial_ratios(metrics)
+    logger.info(f"Text-based metrics: {metrics}")
+    logger.info(f"Computed ratios: {ratios}")
+
+    # Build the enriched text block handed to every AI provider
+    metrics_block = ""
+    if any(metrics.values()):
+        metrics_block = f"""
+PRE-EXTRACTED METRICS (use as cross-reference, not as substitute for reading the document):
+{json.dumps(metrics, indent=2)}
+
+PRE-COMPUTED RATIOS (verify against document figures):
+{json.dumps(ratios, indent=2)}
+
+"""
+
+    enhanced_text = metrics_block + full_text
 
     providers = [
         ("Gemini",      _sync_gemini,      GEMINI_API_KEY),
@@ -1378,27 +1511,7 @@ async def run_analysis(text: str) -> dict:
             logger.info(f"Skipping {provider_name} (no API key)")
             continue
         try:
-            logger.info(f"Trying {provider_name}...")
-            tables = extract_tables_from_pdf(text.encode())
-            metrics = parse_financial_metrics(tables)
-            ratios  = compute_financial_ratios(metrics)
-
-            logger.info(f"Structured metrics extracted: {metrics}")
-            logger.info(f"Computed ratios: {ratios}")
-
-            enhanced_text = f"""
-Extracted financial metrics:
-
-{json.dumps(metrics, indent=2)}
-
-Computed financial ratios (cross-check your calculations against these):
-
-{json.dumps(ratios, indent=2)}
-
-Financial document:
-
-{text}
-"""
+            logger.info(f"Trying {provider_name} with {len(enhanced_text):,} chars...")
             result = await loop.run_in_executor(executor, func, enhanced_text)
             logger.info(f"{provider_name} succeeded!")
             return result
