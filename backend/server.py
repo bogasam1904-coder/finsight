@@ -29,7 +29,6 @@ executor = ThreadPoolExecutor(max_workers=4)
 app = FastAPI(title="FinSight API v13")
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
-# Explicit CORSMiddleware (belt) + custom middleware (suspenders)
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
@@ -581,31 +580,137 @@ def compute_financial_ratios(metrics: dict) -> dict:
     return ratios
 
 
+def _detect_currency_unit(text: str) -> str:
+    """
+    Detect the currency unit from document text.
+    Returns a clear statement to inject into the prompt.
+    """
+    t = text[:3000].lower()
+    if any(x in t for x in ["₹ in crore", "rs. in crore", "inr crore", "rupees in crore",
+                              "in crores", "(crore)", "crore each", "except per share"]):
+        return "INR Crores"
+    if any(x in t for x in ["₹ in lakh", "rs. in lakh", "inr lakh", "rupees in lakh",
+                              "in lakhs", "(lakh)", "lakhs each"]):
+        return "INR Lakhs"
+    if any(x in t for x in ["usd million", "$ million", "us million", "in millions"]):
+        return "USD Millions"
+    if any(x in t for x in ["usd billion", "$ billion", "in billions"]):
+        return "USD Billions"
+    # Default for large Indian companies (Reliance, TCS, etc.)
+    if any(x in t for x in ["reliance", "infosys", "wipro", "hdfc", "icici", "tcs",
+                              "tata", "mahindra", "bajaj", "adani"]):
+        return "INR Crores"
+    return "UNKNOWN — check document header carefully"
+
+
+def _annotate_table_columns(table: list) -> str:
+    """
+    For multi-period financial tables (quarterly/annual results),
+    detect the header row and annotate each data column with its period label.
+    This prevents AI from confusing Q3FY26 numbers with Q3FY25 numbers.
+    """
+    if not table or len(table) < 2:
+        return ""
+
+    # Detect header row — contains period labels like "31st Dec 25", "Q3FY26", etc.
+    PERIOD_HINTS = [
+        r"dec[\s\-\']*2[0-9]", r"sep[\s\-\']*2[0-9]", r"mar[\s\-\']*2[0-9]",
+        r"jun[\s\-\']*2[0-9]", r"q[1-4]fy[0-9]", r"fy[\s]*20[0-9]",
+        r"31st", r"30th", r"quarter ended", r"year ended", r"nine months",
+        r"half year", r"six months",
+    ]
+    header_idx = None
+    col_labels = []
+    for idx, row in enumerate(table[:5]):
+        row_text = " ".join(str(c) for c in row).lower()
+        if sum(1 for p in PERIOD_HINTS if re.search(p, row_text)) >= 2:
+            header_idx = idx
+            # Clean up column labels
+            col_labels = [str(c).strip().replace("\n", " ") for c in row]
+            break
+
+    lines = []
+    if header_idx is not None and col_labels:
+        col_desc = " | ".join(f"Col{i2}={l}" for i2, l in enumerate(col_labels) if l)
+        lines.append(f"[TABLE COLUMNS: {col_desc}]")
+        lines.append("[NOTE: Col0=row label, Col1=CURRENT PERIOD, subsequent cols=prior periods for comparison]")
+
+    for ridx, row in enumerate(table):
+        if ridx == header_idx:
+            continue  # skip raw header, already annotated above
+        cleaned = [str(c).strip() if c else "" for c in row]
+        if not any(cleaned):
+            continue
+        # Build annotated row
+        label = cleaned[0] if cleaned else ""
+        if not label:
+            continue
+        values = cleaned[1:]
+        if col_labels and len(col_labels) > 1:
+            annotated_vals = []
+            for i, val in enumerate(values):
+                if val and val not in ("None", ""):
+                    period = col_labels[i+1] if i+1 < len(col_labels) else f"col{i+1}"
+                    annotated_vals.append(f"{period}: {val}")
+            if annotated_vals:
+                lines.append(f"{label} → {' | '.join(annotated_vals)}")
+        else:
+            lines.append(" | ".join(cleaned))
+    return "\n".join(lines)
+
+
 def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
     """
-    Use pdfplumber for superior table extraction.
+    Enhanced pdfplumber extraction:
+    - Detects currency unit from document header
+    - Annotates multi-column table columns with period labels
+    - Prevents AI from confusing Q3FY26 with Q3FY25 numbers
     """
     try:
         import pdfplumber
         result = ""
+        currency_detected = None
+
         with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
             for i in page_indices:
                 if i >= len(pdf.pages):
                     continue
                 page = pdf.pages[i]
+                raw_text = page.extract_text() or ""
+
+                # Detect currency from first 5 pages
+                if currency_detected is None and i < 5 and raw_text:
+                    currency_detected = _detect_currency_unit(raw_text)
+
                 page_text = ""
                 tables = page.extract_tables()
                 for table in tables:
-                    for row in table:
-                        cleaned = [str(cell).strip() if cell else "" for cell in row]
-                        if any(cleaned):
-                            page_text += " | ".join(cleaned) + "\n"
-                raw_text = page.extract_text() or ""
+                    annotated = _annotate_table_columns(table)
+                    if annotated:
+                        page_text += annotated + "\n"
+                    else:
+                        # Fallback: plain join
+                        for row in table:
+                            cleaned = [str(c).strip() if c else "" for c in row]
+                            if any(cleaned):
+                                page_text += " | ".join(cleaned) + "\n"
+
                 if raw_text.strip():
                     page_text += raw_text
+
                 if page_text.strip():
                     result += f"\n--- PAGE {i+1} ---\n{page_text}\n"
-        logger.info(f"pdfplumber extracted {len(result):,} chars")
+
+        # Inject currency as authoritative fact at the top
+        currency_str = currency_detected or "INR Crores"
+        currency_header = (
+            f"\n[DOCUMENT CURRENCY UNIT: {currency_str}]\n"
+            f"[ALL NUMBERS IN THIS DOCUMENT ARE IN {currency_str} UNLESS STATED OTHERWISE]\n"
+            f"[DO NOT USE 'Lakhs' IF DOCUMENT SAYS 'Crores' — THIS IS A CRITICAL FACT]\n\n"
+        )
+        result = currency_header + result
+
+        logger.info(f"pdfplumber extracted {len(result):,} chars, currency={currency_str}")
         return result
     except ImportError:
         logger.warning("pdfplumber not available, falling back to pypdf")
@@ -648,6 +753,24 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
     """
     Full extraction pipeline with pdfplumber primary, pypdf fallback.
     """
+    # ── Guard: reject FinSight-generated reports fed back as input ────────────
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as _chk:
+            _sample = ""
+            for _p in _chk.pages[:2]:
+                _sample += (_p.extract_text() or "")
+            if "finsight" in _sample.lower() and "institutional equity research" in _sample.lower():
+                raise ValueError(
+                    "This appears to be a FinSight-generated report, not an original financial filing. "
+                    "Please upload the original PDF from BSE (www.bseindia.com) or NSE (www.nseindia.com), "
+                    "not the analysis report that FinSight generated."
+                )
+    except ValueError:
+        raise
+    except Exception:
+        pass
+
     page_indices = _select_financial_pages(raw_bytes)
     result = _extract_with_pdfplumber(raw_bytes, page_indices)
 
@@ -765,17 +888,44 @@ def split_into_chunks(text, size=12000, overlap=1200):
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
     snippet = text[:max_doc_chars]
     logger.info(f"build_prompt: {len(snippet):,} chars (from {len(text):,} total)")
-    return f"""Analyze the provided financial document and return ONLY one valid JSON object. Do not include markdown, explanations, code fences, or additional commentary. The response must strictly conform to the JSON schema provided below.
+    return f"""Analyze the provided financial document and return ONLY one valid JSON object. No markdown, no code fences, no explanation.
+
+━━━ CRITICAL RULES — BREAKING THESE MAKES THE REPORT WORTHLESS ━━━
+
+RULE 1 — ZERO ASSUMPTIONS: 
+NEVER write "assumed", "estimated", "based on industry trends", "not explicitly stated", or "moderate based on trends".
+If a number is not in the document → write exactly "Not available in this filing". NEVER invent data.
+
+RULE 2 — CURRENCY UNIT (MOST IMPORTANT):
+The document begins with [DOCUMENT CURRENCY UNIT: INR Crores/Lakhs/etc].
+Use THAT unit for ALL numbers. If it says "INR Crores", write "₹2,69,496 Cr" NOT "₹2,69,496 Lakhs".
+Wrong currency unit makes EVERY number in the report wrong by 100x.
+
+RULE 3 — MULTI-COLUMN TABLES:
+Quarterly/annual filings have multiple period columns: Q3FY26 | Q2FY26 | Q3FY25 | 9MFY26 | 9MFY25 | FY25
+The document marks these with [TABLE COLUMNS: Col1=period, Col2=period...].
+CURRENT values = Col1 (first data column, most recent period).
+PREVIOUS values for YoY comparison = the column from the SAME QUARTER PRIOR YEAR (e.g., Q3FY25, not Q2FY26).
+NEVER use two adjacent columns as current/previous — match by period name.
+
+RULE 4 — USE STATED RATIOS:
+For D/E ratio, current ratio, interest coverage — USE the values explicitly stated in the ratios section.
+Do NOT recalculate from raw balance sheet numbers (they may be in different units or annualized differently).
+
+RULE 5 — SPECIFIC NUMBERS ONLY:
+Every text field must contain 2+ actual numbers from the document with their units.
+"Strong performance" without a number = REJECTED. "Revenue grew 6.1% to ₹2,69,496 Cr" = ACCEPTED.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ANALYTICAL OBJECTIVE
-Produce an institutional-grade equity research assessment suitable for professional investors. The analysis must interpret financial performance, identify hidden signals, and explain what the data implies for capital allocation decisions. The final output should resemble analysis prepared by a senior equity research analyst at a global investment bank.
+Produce an institutional-grade equity research assessment. The final output should resemble analysis prepared by a senior equity research analyst at a global investment bank.
 
 CORE PRINCIPLES
 Interpret numbers rather than merely restating them. Always explain what the data implies about the company's underlying business performance.
 Contextualize metrics within the company's business model and industry structure.
 Identify non-obvious signals such as margin trends, working capital shifts, leverage changes, or capital allocation patterns.
 Avoid vague language. Use precise statements supported by extracted numbers.
-Assume the analysis will inform real investment decisions and maintain analytical rigor.
 Highlight risks even when performance appears strong to maintain intellectual honesty.
 
 DATA EXTRACTION PROTOCOL
@@ -985,6 +1135,13 @@ def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
     logger.info(f"build_lean_prompt: {len(snippet):,} chars (from {len(text):,} total)")
     return f"""Analyze this financial document and return ONLY valid JSON — no markdown, no preamble, no code fences.
 
+CRITICAL RULES:
+1. NEVER write "assumed", "estimated", "based on trends" — write "Not available in this filing" instead
+2. CURRENCY: Use the [DOCUMENT CURRENCY UNIT] stated in the document header. If it says "INR Crores", ALL values are Crores.
+3. MULTI-COLUMN TABLES: [TABLE COLUMNS] marks period headers. Col1=CURRENT period. Match same quarter prior year for YoY.
+4. USE STATED RATIOS: D/E, Current Ratio, Interest Coverage — use the values explicitly printed in the ratios section.
+5. Every field needs real numbers from the document. No vague statements.
+
 You are a senior equity research analyst. Extract all numbers exactly as written. Calculate all derivable ratios. Write institutional-quality commentary with specific numbers in every field.
 
 SCORING (use exact scores):
@@ -1116,10 +1273,10 @@ def _sync_gemini(text: str) -> dict:
         raise Exception("GEMINI_API_KEY not configured")
 
     models = [
-        ("gemini-2.0-flash",             44000, False),  # Primary — best speed/quality
-        ("gemini-2.0-flash-lite",        44000, False),  # Faster fallback
-        ("gemini-2.5-flash-preview-04-17", 44000, False), # Most capable
-        ("gemini-2.0-flash-exp",         20000, True),   # Experimental lean fallback
+        ("gemini-2.0-flash",               44000, False),
+        ("gemini-2.0-flash-lite",          44000, False),
+        ("gemini-2.5-flash-preview-04-17", 44000, False),
+        ("gemini-2.0-flash-exp",           20000, True),
     ]
 
     last_error = "unknown"
@@ -1184,10 +1341,10 @@ def _sync_groq(text: str) -> dict:
         raise Exception("GROQ_API_KEY not configured")
 
     models = [
-        ("llama-3.3-70b-versatile",        20000, False),  # Working — reduced size to avoid 413
-        ("llama-3.1-8b-instant",           14000, True),   # Working lean
-        ("llama3-groq-70b-8192-tool-use-preview", 14000, True),  # Working
-        ("llama3-groq-8b-8192-tool-use-preview",  14000, True),  # Working lean
+        ("llama-3.3-70b-versatile",              20000, False),
+        ("llama-3.1-8b-instant",                 14000, True),
+        ("llama3-groq-70b-8192-tool-use-preview", 14000, True),
+        ("llama3-groq-8b-8192-tool-use-preview",  14000, True),
     ]
 
     last_error = "unknown"
@@ -1356,9 +1513,9 @@ def _sync_cloudflare(text: str) -> dict:
         raise Exception("CF_ACCOUNT_ID or CF_API_TOKEN not configured")
 
     models = [
-        ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 12000, False),  # 24k ctx, 13k input safe
-        ("@cf/meta/llama-3.1-8b-instruct-fast",       10000, True),   # 24k ctx, lean only
-        ("@cf/mistral/mistral-7b-instruct-v0.2-lora",  8000, True),   # 15k ctx, small only
+        ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 12000, False),
+        ("@cf/meta/llama-3.1-8b-instruct-fast",        10000, True),
+        ("@cf/mistral/mistral-7b-instruct-v0.2-lora",   8000, True),
     ]
 
     headers = {
@@ -1414,181 +1571,6 @@ def _sync_cloudflare(text: str) -> dict:
 
 
 # ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
-# ─── FMP ANALYSIS ENRICHMENT ─────────────────────────────────────────────────
-
-def _detect_ticker_from_text(text: str) -> str | None:
-    """Detect NSE ticker from financial document text. Strict to avoid false positives."""
-    import re
-
-    # Common false positives to ignore
-    BLOCKLIST = {
-        "THE", "AND", "FOR", "ITS", "ALL", "NEW", "OLD", "HUT", "MR", "DR",
-        "MD", "CEO", "CFO", "CIO", "CTO", "COO", "BSE", "NSE", "SEC", "RBI",
-        "GOI", "INR", "USD", "PDF", "FY", "QR", "AGM", "EGM", "ROE", "ROA",
-        "PAT", "PBT", "EPS", "NAV", "NPA", "EMI", "GST", "TDS", "CIN", "DIN",
-        "PAN", "TAN", "KYC", "MCA", "SEBI", "IRDAI", "RBI", "NCLT", "NCLAT",
-    }
-
-    t = text[:6000]
-
-    # Strict patterns — only match explicit symbol declarations
-    patterns = [
-        r"NSE\s*(?:Symbol|Code|Scrip)?\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})(?:\s|$|,|;)",
-        r"BSE\s*(?:Symbol|Code|Scrip)?\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})(?:\s|$|,|;)",
-        r"(?:Stock|Trading|Scrip)\s*Symbol\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})",
-        r"Symbol\s*[:\-]\s*([A-Z][A-Z0-9]{1,11})(?:\s|$|,|\])",
-    ]
-    for p in patterns:
-        m = re.search(p, t)
-        if m:
-            sym = m.group(1).strip().upper()
-            if sym not in BLOCKLIST and 2 <= len(sym) <= 12:
-                logger.info(f"Ticker from pattern: {sym}")
-                return sym
-
-    # Company name → known ticker mapping (curated, not broad regex)
-    KNOWN = {
-        "infosys limited": "INFY", "infosys ltd": "INFY", "infosys": "INFY",
-        "tata consultancy services": "TCS", "tcs limited": "TCS",
-        "wipro limited": "WIPRO", "wipro ltd": "WIPRO",
-        "hcl technologies": "HCLTECH", "hcl tech": "HCLTECH",
-        "reliance industries": "RELIANCE",
-        "hdfc bank limited": "HDFCBANK", "hdfc bank": "HDFCBANK",
-        "icici bank limited": "ICICIBANK", "icici bank": "ICICIBANK",
-        "axis bank limited": "AXISBANK", "axis bank": "AXISBANK",
-        "kotak mahindra bank": "KOTAKBANK",
-        "state bank of india": "SBIN",
-        "maruti suzuki": "MARUTI",
-        "bajaj finance limited": "BAJFINANCE",
-        "bajaj finserv": "BAJAJFINSV",
-        "asian paints limited": "ASIANPAINT",
-        "hindustan unilever": "HINDUNILVR",
-        "itc limited": "ITC",
-        "larsen & toubro": "LT", "l&t limited": "LT",
-        "tech mahindra": "TECHM",
-        "sun pharmaceutical": "SUNPHARMA",
-        "dr. reddy's": "DRREDDY", "dr reddys": "DRREDDY",
-        "cipla limited": "CIPLA",
-        "titan company": "TITAN",
-        "tata motors limited": "TATAMOTORS",
-        "tata steel limited": "TATASTEEL",
-        "ultratech cement": "ULTRACEMCO",
-        "nestle india": "NESTLEIND",
-        "power grid corporation": "POWERGRID",
-        "ntpc limited": "NTPC",
-        "oil and natural gas": "ONGC",
-        "coal india limited": "COALINDIA",
-        "bharat petroleum": "BPCL",
-        "indian oil corporation": "IOC",
-        "hindalco industries": "HINDALCO",
-        "jsw steel": "JSWSTEEL",
-        "grasim industries": "GRASIM",
-        "avenue supermarts": "DMART",
-        "apollo hospitals": "APOLLOHOSP",
-        "divi's laboratories": "DIVISLAB",
-        "divis laboratories": "DIVISLAB",
-        "adani enterprises": "ADANIENT",
-        "adani ports": "ADANIPORTS",
-        "tata consumer": "TATACONSUM",
-        "bajaj auto": "BAJAJ-AUTO",
-        "hero motocorp": "HEROMOTOCO",
-        "eicher motors": "EICHERMOT",
-        "mahindra & mahindra": "M&M",
-        "britannia industries": "BRITANNIA",
-        "pidilite industries": "PIDILITIND",
-        "havells india": "HAVELLS",
-        "voltas limited": "VOLTAS",
-        "muthoot finance": "MUTHOOTFIN",
-        "shree cement": "SHREECEM",
-        "dlf limited": "DLF",
-        "godrej consumer": "GODREJCP",
-        "marico limited": "MARICO",
-        "dabur india": "DABUR",
-        "emami limited": "EMAMILTD",
-        "page industries": "PAGEIND",
-    }
-    t_lower = text[:4000].lower()
-    for name, ticker in KNOWN.items():
-        if name in t_lower:
-            logger.info(f"Ticker from company name '{name}': {ticker}")
-            return ticker
-
-    return None
-
-
-def _fmp_data_to_text(d: dict) -> str:
-    """Format FMP data into clean text for AI prompt enrichment."""
-    lines = []
-    if d.get("quote"):
-        q = d["quote"]
-        lines += [
-            "LIVE MARKET DATA (Financial Modeling Prep — use for valuation context):",
-            f"  Current Price:    {q.get('price', 'N/A')}  |  Market Cap: {q.get('marketCap', 'N/A')}",
-            f"  52w High/Low:     {q.get('yearHigh', 'N/A')} / {q.get('yearLow', 'N/A')}",
-            f"  P/E Ratio (TTM):  {q.get('pe', 'N/A')}x  |  EPS: {q.get('eps', 'N/A')}",
-            f"  Beta:             {q.get('beta', 'N/A')}  |  Div Yield: {q.get('dividendYield', 'N/A')}%",
-            "",
-        ]
-    if d.get("profile"):
-        p = d["profile"]
-        lines += [
-            "COMPANY PROFILE:",
-            f"  Sector: {p.get('sector', 'N/A')}  |  Industry: {p.get('industry', 'N/A')}",
-            f"  Employees: {p.get('fullTimeEmployees', 'N/A')}  |  CEO: {p.get('ceo', 'N/A')}",
-            "",
-        ]
-    if d.get("ratios"):
-        r = d["ratios"]
-        lines += [
-            "KEY RATIOS TTM (cross-validate with document figures):",
-            f"  P/E: {r.get('peRatioTTM', 'N/A')}x  |  P/B: {r.get('priceToBookRatioTTM', 'N/A')}x  |  EV/EBITDA: {r.get('enterpriseValueMultipleTTM', 'N/A')}x",
-            f"  ROE: {r.get('returnOnEquityTTM', 'N/A')}  |  ROA: {r.get('returnOnAssetsTTM', 'N/A')}  |  Net Margin: {r.get('netProfitMarginTTM', 'N/A')}",
-            f"  D/E: {r.get('debtEquityRatioTTM', 'N/A')}  |  Current Ratio: {r.get('currentRatioTTM', 'N/A')}  |  Div Yield: {r.get('dividendYieldTTM', 'N/A')}%",
-            "",
-        ]
-    return "\n".join(lines)
-
-
-async def _fmp_fetch_for_analysis(ticker: str) -> dict | None:
-    """Fetch live FMP data for AI prompt enrichment. Tries plain, .NS, .BO variants."""
-    try:
-        sym = ticker.upper()
-        candidates = [sym, f"{sym}.NS", f"{sym}.BO"]
-
-        def safe_j(r):
-            try:
-                if isinstance(r, Exception): return None
-                if r.status_code == 403:
-                    logger.warning("FMP 403 — plan may not include this endpoint")
-                    return None
-                if r.status_code != 200: return None
-                data = r.json()
-                if isinstance(data, dict) and "Error Message" in data: return None
-                return data[0] if isinstance(data, list) and data else (data if data else None)
-            except Exception:
-                return None
-
-        for fmp_sym in candidates:
-            async with httpx.AsyncClient(timeout=12) as c:
-                results = await asyncio.gather(
-                    c.get(f"{FMP_BASE}/v3/quote/{fmp_sym}", params={"apikey": FMP_API_KEY}),
-                    c.get(f"{FMP_BASE}/v3/profile/{fmp_sym}", params={"apikey": FMP_API_KEY}),
-                    c.get(f"{FMP_BASE}/v3/ratios-ttm/{fmp_sym}", params={"apikey": FMP_API_KEY}),
-                    return_exceptions=True,
-                )
-            q, p, r = safe_j(results[0]), safe_j(results[1]), safe_j(results[2])
-            if q or p:
-                logger.info(f"FMP OK: {fmp_sym} — quote={bool(q)}, profile={bool(p)}, ratios={bool(r)}")
-                return {"quote": q, "profile": p, "ratios": r}
-
-        logger.warning(f"FMP: no data found for any variant of {sym}")
-        return None
-
-    except Exception as e:
-        logger.warning(f"FMP enrichment error (non-fatal): {e}")
-        return None
-
-
 async def run_analysis(text: str) -> dict:
 
     if not text or len(text.strip()) < 100:
@@ -1634,24 +1616,7 @@ The regex hints above are frequently wrong on Indian quarterly filings due to mi
 
 """
 
-    # ── FMP live enrichment ──────────────────────────────────────────────────
-    fmp_block = ""
-    if FMP_API_KEY:
-        try:
-            ticker = _detect_ticker_from_text(full_text)
-            if ticker:
-                fmp_data = await _fmp_fetch_for_analysis(ticker)
-                if fmp_data:
-                    fmp_block = (
-                        "\n\n━━━ LIVE MARKET DATA (Financial Modeling Prep) ━━━\n"
-                        + _fmp_data_to_text(fmp_data)
-                        + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    )
-                    logger.info(f"FMP enrichment injected ({len(fmp_block)} chars) for {ticker}")
-        except Exception as fmp_err:
-            logger.warning(f"FMP enrichment skipped (non-fatal): {fmp_err}")
-
-    enhanced_text = fmp_block + metrics_block + full_text
+    enhanced_text = metrics_block + full_text
 
     providers = [
         ("Gemini",      _sync_gemini,      GEMINI_API_KEY),
