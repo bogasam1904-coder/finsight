@@ -773,11 +773,15 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
             structured_text = raw_result
             currency = _detect_currency_unit(raw_result)
 
-        # Prepend authoritative currency header
+        # Prepend authoritative currency header + consolidation instruction
         header = (
             f"\n[DOCUMENT CURRENCY UNIT: {currency}]\n"
             f"[CRITICAL: ALL NUMBERS IN THIS DOCUMENT ARE IN {currency}]\n"
-            f"[DO NOT change the unit — if document says Crores, write Crores]\n\n"
+            f"[DO NOT change the unit — if document says Crores, write Crores]\n"
+            f"[CONSOLIDATION RULE: If this filing contains BOTH consolidated AND standalone "
+            f"financial statements, USE ONLY THE CONSOLIDATED FIGURES. "
+            f"Consolidated results appear first (pages 1-2). Standalone results appear later "
+            f"(pages 5-8) and must be IGNORED if consolidated data is present.]\n\n"
         )
         logger.info(f"pdfplumber extracted {len(structured_text):,} chars, currency={currency}")
         return header + structured_text
@@ -796,10 +800,17 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
 def _select_financial_pages(raw_bytes: bytes) -> list:
     """
     Score every page by financial keyword density.
+    Critically: CONSOLIDATED results are preferred over STANDALONE.
+    Indian quarterly filings typically have:
+      Pages 1-2:  Consolidated P&L + ratios  ← WE WANT THIS
+      Pages 3-4:  Segment data
+      Pages 5-8:  Standalone P&L + ratios    ← MUST NOT OVERRIDE CONSOLIDATED
+      Pages 9-16: Notes
     """
     reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
     total  = len(reader.pages)
 
+    # Base financial keywords (score 1 each)
     KEYWORDS = [
         "total assets", "profit and loss", "statement of profit",
         "cash flow", "balance sheet", "total income", "borrowing",
@@ -810,16 +821,56 @@ def _select_financial_pages(raw_bytes: bytes) -> list:
         "revenue from operations", "other income", "tax expense",
         "depreciation", "amortisation", "reserves and surplus",
     ]
+    # Consolidated markers (score 3 each — strong signal)
+    CONSOLIDATED_MARKERS = [
+        "consolidated", "unaudited consolidated", "audited consolidated",
+        "consolidated financial results", "consolidated statement",
+    ]
+    # Standalone markers — deprioritise these pages
+    STANDALONE_MARKERS = [
+        "standalone", "unaudited standalone", "audited standalone",
+        "standalone financial results", "standalone statement",
+    ]
 
-    core_pages = set(range(min(5, total)))
+    page_scores = []
+    has_consolidated = False
+
     for i, page in enumerate(reader.pages):
         t = (page.extract_text() or "").lower()
         score = sum(1 for kw in KEYWORDS if kw in t)
-        if score >= 2:
-            core_pages.add(i)
+        # Boost consolidated pages
+        consol_hits = sum(1 for m in CONSOLIDATED_MARKERS if m in t)
+        if consol_hits > 0:
+            score += consol_hits * 3
+            has_consolidated = True
+        # Penalise standalone pages (they duplicate consolidated data)
+        standalone_hits = sum(1 for m in STANDALONE_MARKERS if m in t)
+        if standalone_hits > 0:
+            score -= standalone_hits * 2
+        page_scores.append((i, score, consol_hits > 0, standalone_hits > 0))
 
-    logger.info(f"PDF: {total} pages total, {len(core_pages)} financial pages selected: {sorted(core_pages)}")
-    return sorted(core_pages)
+    # Select pages: always include first 2 pages (cover + main results)
+    # Then add high-scoring pages, but if consolidated exists, exclude standalone pages
+    selected = set(range(min(2, total)))
+
+    for i, score, is_consol, is_standalone in page_scores:
+        if score >= 2:
+            # If we found consolidated sections, skip pages marked as standalone
+            if has_consolidated and is_standalone and not is_consol:
+                logger.info(f"Page {i+1}: SKIPPED (standalone, consolidated exists, score={score})")
+                continue
+            selected.add(i)
+
+    # Safety cap: for large filings, limit to first 10 pages
+    # Consolidated results are always in the first half of quarterly filings
+    if total > 12:
+        selected = {i for i in selected if i < 10}
+        # Always keep first 2 pages
+        selected.update(range(min(2, total)))
+
+    result = sorted(selected)
+    logger.info(f"PDF: {total} pages, consolidated_found={has_consolidated}, selected pages: {[p+1 for p in result]}")
+    return result
 
 
 def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
@@ -987,6 +1038,12 @@ Do NOT recalculate from raw borrowing/equity numbers (may be in different denomi
 RULE 5 — EVERY TEXT FIELD NEEDS REAL NUMBERS:
 "Strong performance" without a number = REJECTED.
 "Revenue grew 6.1% to ₹2,69,496 Cr vs ₹2,43,865 Cr in Q3FY25" = ACCEPTED.
+
+RULE 6 — CONSOLIDATED vs STANDALONE:
+Many Indian filings contain BOTH consolidated AND standalone financials.
+ALWAYS use CONSOLIDATED figures (appear first, labeled "Consolidated").
+NEVER mix standalone numbers into a consolidated analysis.
+If the document says [CONSOLIDATION RULE], follow it strictly.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1210,6 +1267,7 @@ CRITICAL RULES:
 3. TABLE FORMAT: Rows are "Label: Period1=Value | Period2=Value". First period = CURRENT. Same-quarter prior year = PREVIOUS for YoY.
 4. RATIOS: Use D/E, Current Ratio as explicitly printed in the Ratios section — do NOT recalculate.
 5. Every field needs 2+ real numbers. No vague statements.
+6. CONSOLIDATED vs STANDALONE: Always use consolidated figures (appear first). Never use standalone numbers if consolidated are present.
 
 You are a senior equity research analyst. Extract all numbers exactly as written. Calculate all derivable ratios. Write institutional-quality commentary with specific numbers in every field.
 
