@@ -581,143 +581,216 @@ def compute_financial_ratios(metrics: dict) -> dict:
 
 
 def _detect_currency_unit(text: str) -> str:
-    """
-    Detect the currency unit from document text.
-    Returns a clear statement to inject into the prompt.
-    """
-    t = text[:3000].lower()
-    if any(x in t for x in ["₹ in crore", "rs. in crore", "inr crore", "rupees in crore",
-                              "in crores", "(crore)", "crore each", "except per share"]):
+    """Detect currency unit from document — critical for correct number interpretation."""
+    t = text[:4000].lower()
+    if any(x in t for x in ["₹ in crore", "rs. in crore", "inr crore", "in crores",
+                              "(crore)", "crore each", "except per share", "crore, except"]):
         return "INR Crores"
-    if any(x in t for x in ["₹ in lakh", "rs. in lakh", "inr lakh", "rupees in lakh",
-                              "in lakhs", "(lakh)", "lakhs each"]):
+    if any(x in t for x in ["₹ in lakh", "rs. in lakh", "inr lakh", "in lakhs", "(lakh)", "lakhs each"]):
         return "INR Lakhs"
-    if any(x in t for x in ["usd million", "$ million", "us million", "in millions"]):
+    if any(x in t for x in ["usd million", "$ million", "in millions", "us$ million"]):
         return "USD Millions"
     if any(x in t for x in ["usd billion", "$ billion", "in billions"]):
         return "USD Billions"
-    # Default for large Indian companies (Reliance, TCS, etc.)
-    if any(x in t for x in ["reliance", "infosys", "wipro", "hdfc", "icici", "tcs",
-                              "tata", "mahindra", "bajaj", "adani"]):
-        return "INR Crores"
-    return "UNKNOWN — check document header carefully"
+    return "INR Crores"  # Safe default for large Indian companies
 
 
-def _annotate_table_columns(table: list) -> str:
+def _parse_period_header(row: list) -> list:
     """
-    For multi-period financial tables (quarterly/annual results),
-    detect the header row and annotate each data column with its period label.
-    This prevents AI from confusing Q3FY26 numbers with Q3FY25 numbers.
+    Detect if a table row is a period header (Quarter Ended, Year Ended, etc.)
+    Returns clean period labels if detected, else empty list.
     """
-    if not table or len(table) < 2:
+    import re
+    row_text = " ".join(str(c) for c in row if c).lower()
+    PERIOD_PATTERNS = [
+        r"dec['\s\-]*2[0-9]", r"sep['\s\-]*2[0-9]", r"mar['\s\-]*2[0-9]",
+        r"jun['\s\-]*2[0-9]", r"q[1-4]\s*fy\s*2[0-9]", r"fy\s*20[0-9]{2}",
+        r"31st", r"30th", r"quarter ended", r"year ended", r"nine months", r"half.?year",
+    ]
+    hits = sum(1 for p in PERIOD_PATTERNS if re.search(p, row_text))
+    if hits >= 2:
+        return [str(c).strip().replace("\n", " ") for c in row]
+    return []
+
+
+def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> str:
+    """
+    The heart of accurate extraction:
+    1. Parse each financial table with column headers
+    2. For each data row: label → current_period: value | prior_year_period: value
+    3. Returns a clean, unambiguous text block the AI can read directly
+
+    This removes multi-column parsing from the AI entirely.
+    """
+    import pdfplumber, io, re
+
+    result_sections = []
+    currency = "INR Crores"
+    col_headers = []       # period labels from most recent header row seen
+    current_col_idx = 1    # default: first data column = current period
+    prior_yr_col_idx = 3   # default: third data column = same quarter prior year
+
+    try:
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            for page_idx in page_indices:
+                if page_idx >= len(pdf.pages):
+                    continue
+                page = pdf.pages[page_idx]
+                raw_text = page.extract_text() or ""
+
+                # Detect currency from page text
+                if page_idx < 3:
+                    currency = _detect_currency_unit(raw_text)
+
+                tables = page.extract_tables()
+                if not tables:
+                    # No table — just add raw text
+                    if raw_text.strip():
+                        result_sections.append(raw_text.strip())
+                    continue
+
+                page_rows = []
+                for table in tables:
+                    for row in table:
+                        if not row or not any(row):
+                            continue
+                        cleaned = [str(c).strip().replace("\n", " ") if c else "" for c in row]
+
+                        # Check if this is a period header row
+                        detected_periods = _parse_period_header(cleaned)
+                        if detected_periods:
+                            col_headers = detected_periods
+                            # Figure out which column index is "current" and "prior year same quarter"
+                            # Current = first non-empty data column (index 1)
+                            # Prior year same quarter = match "Dec'24" if current is "Dec'25", etc.
+                            current_col_idx = 1
+                            prior_yr_col_idx = None
+                            if len(col_headers) > 1:
+                                cur_label = col_headers[1].lower() if len(col_headers) > 1 else ""
+                                # Extract month from current period label
+                                month_match = re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', cur_label)
+                                cur_month = month_match.group(1) if month_match else ""
+                                # Find same month in prior year columns (skip col 2 = sequential quarter)
+                                for ci in range(2, len(col_headers)):
+                                    lbl = col_headers[ci].lower()
+                                    if cur_month and cur_month in lbl and ci != current_col_idx:
+                                        prior_yr_col_idx = ci
+                                        break
+                                # Fallback: col 3 is typically same quarter prior year in standard format
+                                if prior_yr_col_idx is None and len(col_headers) > 3:
+                                    prior_yr_col_idx = 3
+                            continue  # Don't add header row to output
+
+                        # Data row — extract label and key columns
+                        label = cleaned[0] if cleaned else ""
+                        if not label or label in ("None", "", "Particulars"):
+                            continue
+
+                        # Skip pure separator rows
+                        if all(c in ("", "-", "—", "None") for c in cleaned[1:]):
+                            continue
+
+                        def safe_val(row, idx):
+                            if idx is not None and idx < len(row) and row[idx] not in ("", "None", "-", "—"):
+                                return row[idx]
+                            return None
+
+                        cur_val = safe_val(cleaned, current_col_idx)
+                        prev_val = safe_val(cleaned, prior_yr_col_idx)
+
+                        cur_period = col_headers[current_col_idx] if col_headers and current_col_idx < len(col_headers) else "Current Period"
+                        prev_period = col_headers[prior_yr_col_idx] if col_headers and prior_yr_col_idx and prior_yr_col_idx < len(col_headers) else "Prior Year Same Period"
+
+                        if cur_val:
+                            entry = f"{label}: {cur_period}={cur_val}"
+                            if prev_val:
+                                entry += f" | {prev_period}={prev_val}"
+                            # Also include 9M/annual if available (col 4 or 5)
+                            for extra_idx in [4, 5]:
+                                extra_val = safe_val(cleaned, extra_idx)
+                                extra_lbl = col_headers[extra_idx] if col_headers and extra_idx < len(col_headers) else f"Col{extra_idx}"
+                                if extra_val and extra_idx not in (current_col_idx, prior_yr_col_idx):
+                                    entry += f" | {extra_lbl}={extra_val}"
+                                    break  # Just one extra column
+                            page_rows.append(entry)
+                        else:
+                            # Include row even without structured match — raw pipe format
+                            non_empty = [c for c in cleaned if c and c not in ("None",)]
+                            if len(non_empty) >= 2:
+                                page_rows.append(" | ".join(non_empty))
+
+                if page_rows:
+                    result_sections.append("\n".join(page_rows))
+                elif raw_text.strip():
+                    result_sections.append(raw_text.strip())
+
+    except Exception as e:
+        logger.warning(f"Structured extraction failed: {e}, using fallback")
         return ""
 
-    # Detect header row — contains period labels like "31st Dec 25", "Q3FY26", etc.
-    PERIOD_HINTS = [
-        r"dec[\s\-\']*2[0-9]", r"sep[\s\-\']*2[0-9]", r"mar[\s\-\']*2[0-9]",
-        r"jun[\s\-\']*2[0-9]", r"q[1-4]fy[0-9]", r"fy[\s]*20[0-9]",
-        r"31st", r"30th", r"quarter ended", r"year ended", r"nine months",
-        r"half year", r"six months",
-    ]
-    header_idx = None
-    col_labels = []
-    for idx, row in enumerate(table[:5]):
-        row_text = " ".join(str(c) for c in row).lower()
-        if sum(1 for p in PERIOD_HINTS if re.search(p, row_text)) >= 2:
-            header_idx = idx
-            # Clean up column labels
-            col_labels = [str(c).strip().replace("\n", " ") for c in row]
-            break
+    structured = "\n\n".join(result_sections)
+    logger.info(f"Structured extraction: {len(structured):,} chars, currency={currency}")
+    return structured, currency
 
-    lines = []
-    if header_idx is not None and col_labels:
-        col_desc = " | ".join(f"Col{i2}={l}" for i2, l in enumerate(col_labels) if l)
-        lines.append(f"[TABLE COLUMNS: {col_desc}]")
-        lines.append("[NOTE: Col0=row label, Col1=CURRENT PERIOD, subsequent cols=prior periods for comparison]")
 
-    for ridx, row in enumerate(table):
-        if ridx == header_idx:
-            continue  # skip raw header, already annotated above
-        cleaned = [str(c).strip() if c else "" for c in row]
-        if not any(cleaned):
-            continue
-        # Build annotated row
-        label = cleaned[0] if cleaned else ""
-        if not label:
-            continue
-        values = cleaned[1:]
-        if col_labels and len(col_labels) > 1:
-            annotated_vals = []
-            for i, val in enumerate(values):
-                if val and val not in ("None", ""):
-                    period = col_labels[i+1] if i+1 < len(col_labels) else f"col{i+1}"
-                    annotated_vals.append(f"{period}: {val}")
-            if annotated_vals:
-                lines.append(f"{label} → {' | '.join(annotated_vals)}")
-        else:
-            lines.append(" | ".join(cleaned))
-    return "\n".join(lines)
+def _detect_currency_unit(text: str) -> str:
+    """Detect currency unit from document — critical for correct number interpretation."""
+    t = text[:4000].lower()
+    if any(x in t for x in ["₹ in crore", "rs. in crore", "inr crore", "in crores",
+                              "(crore)", "crore each", "except per share", "crore, except"]):
+        return "INR Crores"
+    if any(x in t for x in ["₹ in lakh", "rs. in lakh", "inr lakh", "in lakhs", "(lakh)", "lakhs each"]):
+        return "INR Lakhs"
+    if any(x in t for x in ["usd million", "$ million", "in millions", "us$ million"]):
+        return "USD Millions"
+    return "INR Crores"
 
 
 def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
     """
-    Enhanced pdfplumber extraction:
-    - Detects currency unit from document header
-    - Annotates multi-column table columns with period labels
-    - Prevents AI from confusing Q3FY26 with Q3FY25 numbers
+    Enhanced extraction: structured multi-column table parsing first,
+    then falls back to raw text.
     """
     try:
         import pdfplumber
-        result = ""
-        currency_detected = None
+        result = _build_structured_financials(raw_bytes, page_indices)
+        if isinstance(result, tuple):
+            structured_text, currency = result
+        else:
+            structured_text, currency = result, "INR Crores"
 
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
-            for i in page_indices:
-                if i >= len(pdf.pages):
-                    continue
-                page = pdf.pages[i]
-                raw_text = page.extract_text() or ""
+        if not structured_text.strip():
+            # Fallback to raw extraction
+            import io
+            raw_result = ""
+            with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                for i in page_indices:
+                    if i >= len(pdf.pages): continue
+                    page = pdf.pages[i]
+                    raw_text = page.extract_text() or ""
+                    if raw_text.strip():
+                        raw_result += f"\n--- PAGE {i+1} ---\n{raw_text}\n"
+            structured_text = raw_result
+            currency = _detect_currency_unit(raw_result)
 
-                # Detect currency from first 5 pages
-                if currency_detected is None and i < 5 and raw_text:
-                    currency_detected = _detect_currency_unit(raw_text)
-
-                page_text = ""
-                tables = page.extract_tables()
-                for table in tables:
-                    annotated = _annotate_table_columns(table)
-                    if annotated:
-                        page_text += annotated + "\n"
-                    else:
-                        # Fallback: plain join
-                        for row in table:
-                            cleaned = [str(c).strip() if c else "" for c in row]
-                            if any(cleaned):
-                                page_text += " | ".join(cleaned) + "\n"
-
-                if raw_text.strip():
-                    page_text += raw_text
-
-                if page_text.strip():
-                    result += f"\n--- PAGE {i+1} ---\n{page_text}\n"
-
-        # Inject currency as authoritative fact at the top
-        currency_str = currency_detected or "INR Crores"
-        currency_header = (
-            f"\n[DOCUMENT CURRENCY UNIT: {currency_str}]\n"
-            f"[ALL NUMBERS IN THIS DOCUMENT ARE IN {currency_str} UNLESS STATED OTHERWISE]\n"
-            f"[DO NOT USE 'Lakhs' IF DOCUMENT SAYS 'Crores' — THIS IS A CRITICAL FACT]\n\n"
+        # Prepend authoritative currency header
+        header = (
+            f"\n[DOCUMENT CURRENCY UNIT: {currency}]\n"
+            f"[CRITICAL: ALL NUMBERS IN THIS DOCUMENT ARE IN {currency}]\n"
+            f"[DO NOT change the unit — if document says Crores, write Crores]\n\n"
         )
-        result = currency_header + result
+        logger.info(f"pdfplumber extracted {len(structured_text):,} chars, currency={currency}")
+        return header + structured_text
 
-        logger.info(f"pdfplumber extracted {len(result):,} chars, currency={currency_str}")
-        return result
     except ImportError:
-        logger.warning("pdfplumber not available, falling back to pypdf")
+        logger.warning("pdfplumber not available")
         return ""
     except Exception as e:
-        logger.warning(f"pdfplumber failed: {e}, falling back to pypdf")
+        logger.warning(f"pdfplumber failed: {e}")
         return ""
+
+
+
 
 
 def _select_financial_pages(raw_bytes: bytes) -> list:
@@ -753,18 +826,15 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
     """
     Full extraction pipeline with pdfplumber primary, pypdf fallback.
     """
-    # ── Guard: reject FinSight-generated reports fed back as input ────────────
+    # Guard: reject FinSight reports fed back as input
     try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as _chk:
-            _sample = ""
-            for _p in _chk.pages[:2]:
-                _sample += (_p.extract_text() or "")
+        import pdfplumber as _plumber, io as _io
+        with _plumber.open(_io.BytesIO(raw_bytes)) as _chk:
+            _sample = " ".join((_chk.pages[i].extract_text() or "") for i in range(min(2, len(_chk.pages))))
             if "finsight" in _sample.lower() and "institutional equity research" in _sample.lower():
                 raise ValueError(
-                    "This appears to be a FinSight-generated report, not an original financial filing. "
-                    "Please upload the original PDF from BSE (www.bseindia.com) or NSE (www.nseindia.com), "
-                    "not the analysis report that FinSight generated."
+                    "This is a FinSight-generated report, not an original filing. "
+                    "Please upload the original PDF from BSE (bseindia.com) or NSE (nseindia.com)."
                 )
     except ValueError:
         raise
@@ -888,38 +958,37 @@ def split_into_chunks(text, size=12000, overlap=1200):
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
     snippet = text[:max_doc_chars]
     logger.info(f"build_prompt: {len(snippet):,} chars (from {len(text):,} total)")
-    return f"""Analyze the provided financial document and return ONLY one valid JSON object. No markdown, no code fences, no explanation.
-
-━━━ CRITICAL RULES — BREAKING THESE MAKES THE REPORT WORTHLESS ━━━
-
-RULE 1 — ZERO ASSUMPTIONS: 
-NEVER write "assumed", "estimated", "based on industry trends", "not explicitly stated", or "moderate based on trends".
-If a number is not in the document → write exactly "Not available in this filing". NEVER invent data.
-
-RULE 2 — CURRENCY UNIT (MOST IMPORTANT):
-The document begins with [DOCUMENT CURRENCY UNIT: INR Crores/Lakhs/etc].
-Use THAT unit for ALL numbers. If it says "INR Crores", write "₹2,69,496 Cr" NOT "₹2,69,496 Lakhs".
-Wrong currency unit makes EVERY number in the report wrong by 100x.
-
-RULE 3 — MULTI-COLUMN TABLES:
-Quarterly/annual filings have multiple period columns: Q3FY26 | Q2FY26 | Q3FY25 | 9MFY26 | 9MFY25 | FY25
-The document marks these with [TABLE COLUMNS: Col1=period, Col2=period...].
-CURRENT values = Col1 (first data column, most recent period).
-PREVIOUS values for YoY comparison = the column from the SAME QUARTER PRIOR YEAR (e.g., Q3FY25, not Q2FY26).
-NEVER use two adjacent columns as current/previous — match by period name.
-
-RULE 4 — USE STATED RATIOS:
-For D/E ratio, current ratio, interest coverage — USE the values explicitly stated in the ratios section.
-Do NOT recalculate from raw balance sheet numbers (they may be in different units or annualized differently).
-
-RULE 5 — SPECIFIC NUMBERS ONLY:
-Every text field must contain 2+ actual numbers from the document with their units.
-"Strong performance" without a number = REJECTED. "Revenue grew 6.1% to ₹2,69,496 Cr" = ACCEPTED.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    return f"""Analyze the provided financial document and return ONLY one valid JSON object. Do not include markdown, explanations, code fences, or additional commentary. The response must strictly conform to the JSON schema provided below.
 
 ANALYTICAL OBJECTIVE
-Produce an institutional-grade equity research assessment. The final output should resemble analysis prepared by a senior equity research analyst at a global investment bank.
+Produce an institutional-grade equity research assessment suitable for professional investors. The analysis must interpret financial performance, identify hidden signals, and explain what the data implies for capital allocation decisions. The final output should resemble analysis prepared by a senior equity research analyst at a global investment bank.
+
+━━━ CRITICAL RULES — BREAKING THESE MAKES THE REPORT WRONG ━━━
+
+RULE 1 — NEVER ASSUME OR ESTIMATE:
+If a number is not in the document, write "Not available in this filing". 
+NEVER write "assumed", "estimated", "based on industry trends", or "moderate based on trends".
+
+RULE 2 — CURRENCY UNIT IS AUTHORITATIVE:
+The document starts with [DOCUMENT CURRENCY UNIT: X]. Use that unit for ALL numbers.
+If it says INR Crores, write "₹2,69,496 Cr" — NEVER "₹2,69,496 Lakhs".
+Wrong currency = every number is wrong by 100x.
+
+RULE 3 — MULTI-COLUMN TABLE FORMAT:
+Each financial row is formatted as: "Label: Period1=Value | Period2=Value | Period3=Value"
+The FIRST period listed after ":" = CURRENT period (most recent).
+The period matching the SAME QUARTER prior year = PREVIOUS period for YoY comparison.
+NEVER use two adjacent listed values as current/previous without checking their period labels.
+
+RULE 4 — USE STATED RATIOS:
+For D/E ratio, Current Ratio, Interest Coverage — use values explicitly printed in the Ratios section.
+Do NOT recalculate from raw borrowing/equity numbers (may be in different denominators).
+
+RULE 5 — EVERY TEXT FIELD NEEDS REAL NUMBERS:
+"Strong performance" without a number = REJECTED.
+"Revenue grew 6.1% to ₹2,69,496 Cr vs ₹2,43,865 Cr in Q3FY25" = ACCEPTED.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 CORE PRINCIPLES
 Interpret numbers rather than merely restating them. Always explain what the data implies about the company's underlying business performance.
@@ -1136,11 +1205,11 @@ def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
     return f"""Analyze this financial document and return ONLY valid JSON — no markdown, no preamble, no code fences.
 
 CRITICAL RULES:
-1. NEVER write "assumed", "estimated", "based on trends" — write "Not available in this filing" instead
-2. CURRENCY: Use the [DOCUMENT CURRENCY UNIT] stated in the document header. If it says "INR Crores", ALL values are Crores.
-3. MULTI-COLUMN TABLES: [TABLE COLUMNS] marks period headers. Col1=CURRENT period. Match same quarter prior year for YoY.
-4. USE STATED RATIOS: D/E, Current Ratio, Interest Coverage — use the values explicitly printed in the ratios section.
-5. Every field needs real numbers from the document. No vague statements.
+1. NEVER write "assumed", "estimated", "based on trends" → write "Not available in this filing" instead.
+2. CURRENCY: Use [DOCUMENT CURRENCY UNIT] from document header. If Crores, ALL values are Crores.
+3. TABLE FORMAT: Rows are "Label: Period1=Value | Period2=Value". First period = CURRENT. Same-quarter prior year = PREVIOUS for YoY.
+4. RATIOS: Use D/E, Current Ratio as explicitly printed in the Ratios section — do NOT recalculate.
+5. Every field needs 2+ real numbers. No vague statements.
 
 You are a senior equity research analyst. Extract all numbers exactly as written. Calculate all derivable ratios. Write institutional-quality commentary with specific numbers in every field.
 
@@ -1341,8 +1410,8 @@ def _sync_groq(text: str) -> dict:
         raise Exception("GROQ_API_KEY not configured")
 
     models = [
-        ("llama-3.3-70b-versatile",              20000, False),
-        ("llama-3.1-8b-instant",                 14000, True),
+        ("llama-3.3-70b-versatile",               20000, False),
+        ("llama-3.1-8b-instant",                  14000, True),
         ("llama3-groq-70b-8192-tool-use-preview", 14000, True),
         ("llama3-groq-8b-8192-tool-use-preview",  14000, True),
     ]
