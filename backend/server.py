@@ -493,6 +493,15 @@ def _score_page_for_extraction(page_text: str) -> dict:
         (poison_hits >= 4 and table_hits < 3)
     )
 
+    # NEVER exclude pages that are the actual P&L table header — these are the real financials
+    is_actual_financial_table = (
+        "unaudited consolidated financial results for the quarter" in t or
+        "unaudited standalone financial results for the quarter" in t or
+        ("revenue from operations" in t and "profit before tax" in t and "profit after tax" in t)
+    )
+    if is_actual_financial_table:
+        is_auditor_narrative = False
+
     return {
         "poison_hits": poison_hits,
         "table_hits": table_hits,
@@ -541,9 +550,11 @@ def _select_financial_pages(raw_bytes: bytes) -> list:
             selected.add(i)
             logger.info(f"Page {i+1}: SELECTED (net_score={info['net_score']}, table_hits={info['table_hits']}, consol={info['consol_hits']})")
 
-    # Safety cap: limit to first 12 pages for large filings
-    if total > 12:
-        selected = {i for i in selected if i < 12}
+    # Safety cap: limit to first 20 pages for large filings
+    # NOTE: Reliance and other large multi-subsidiary filings have auditor pages 1-9
+    # and actual P&L tables starting at page 10+. The old cap of 12 was too tight.
+    if total > 20:
+        selected = {i for i in selected if i < 20}
 
     result = sorted(selected)
     logger.info(f"PDF: {total} pages, consolidated={has_consolidated}, selected: {[p+1 for p in result]}")
@@ -1083,7 +1094,9 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                         break
 
     # ── Net Worth ─────────────────────────────────────────────────────────────
-    for page_idx in pl_pages:
+    # Look in all available pages (not just P&L pages) since Net Worth / EPS
+    # appear on the ratios page as well. Take the FIRST (current quarter) value.
+    for page_idx in list(page_texts.keys()):
         lines = page_texts[page_idx].split("\n")
         for i, line in enumerate(lines):
             ll = line.lower()
@@ -1094,12 +1107,15 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                     if i+offset < len(lines):
                         nums = _get_large_nums(lines[i+offset])
                 if nums:
+                    # nums[0] = current quarter, nums[1] = prior quarter, nums[2] = prior year
                     result["balance_sheet"]["net_worth"] = {
-                        "current": nums[0], "prior": nums[2] if len(nums)>2 else "",
+                        "current": nums[0], "prior": nums[1] if len(nums) > 1 else "",
                         "source": f"Page {page_idx+1}, Line {i+1}"
                     }
                     log.append(f"[net_worth] = {nums[0]}")
                     break
+        if "net_worth" in result["balance_sheet"]:
+            break
 
     # ── Ratios ────────────────────────────────────────────────────────────────
     RATIO_ROWS = [
@@ -1133,10 +1149,18 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                     continue
                 if any(p in ll for p in patterns):
                     nums = _extract_line_values(line)
+                    if not nums:
+                        # Try next line (column-first layout)
+                        for offset in [1, 2]:
+                            if i + offset < len(lines):
+                                nums = _extract_line_values(lines[i + offset])
+                                if nums:
+                                    break
                     if nums:
                         result["ratios"][key] = {
                             "current": nums[0],
-                            "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
+                            # nums[1] = prior quarter (Sep'25), nums[2] = prior year same quarter
+                            "prior": nums[1] if len(nums) > 1 else "",
                             "source": f"Page {page_idx+1}, Line {i+1}",
                         }
                         log.append(f"ratio [{key}] = {nums[0]}")
@@ -1240,11 +1264,14 @@ def _build_verified_block(extracted: dict) -> str:
     lines.append(fmt("depreciation",   pl, "Depreciation & Amortisation"))
     lines.append(fmt("finance_costs",  pl, "Finance Costs"))
     lines.append(fmt("pbt",            pl, "Profit Before Tax"))
-    lines.append(fmt("pat_total",      pl, "PAT (Total incl. Minority)"))
-    lines.append(fmt("pat_owners",     pl, "PAT Attributable to Owners ← USE THIS AS NET PROFIT"))
-    lines.append(fmt("pat_minority",   pl, "PAT Attributable to Minority"))
+    lines.append(fmt("pat_total",      pl, "PAT (Total incl. Minority Interest)"))
+    lines.append(fmt("pat_owners",     pl, "PAT Attributable to Owners ← THIS IS NET PROFIT (use for Net Profit metric)"))
+    lines.append(fmt("pat_minority",   pl, "PAT Attributable to Non-Controlling Interest (minority only, NOT Net Profit)"))
     lines.append(fmt("eps_basic",      pl, "Basic EPS"))
     lines.append(fmt("eps_diluted",    pl, "Diluted EPS"))
+    lines.append("")
+    lines.append("  ⚠ IMPORTANT: 'Net Profit' in key_metrics = PAT Attributable to Owners (pat_owners above).")
+    lines.append("  ⚠ DO NOT use PAT Total (which includes minority interest) as Net Profit.")
     lines.append("")
 
     lines.append("━━━ RATIOS (as printed in filing — DO NOT RECALCULATE) ━━━")
@@ -1269,6 +1296,8 @@ def _build_verified_block(extracted: dict) -> str:
 
     if segments:
         lines.append("━━━ SEGMENT EBITDA ━━━")
+        total_ebitda = 0.0
+        has_total = False
         for seg_name, seg_data in segments.items():
             src = seg_data.get("source", "")
             cur = seg_data.get("ebitda", "")
@@ -1279,6 +1308,13 @@ def _build_verified_block(extracted: dict) -> str:
             if src:
                 line += f"  [SOURCE: {src}]"
             lines.append(line)
+            try:
+                total_ebitda += float(str(cur).replace(",", ""))
+                has_total = True
+            except:
+                pass
+        if has_total and total_ebitda > 0:
+            lines.append(f"  TOTAL Segment EBITDA: {total_ebitda:,.0f}  ← USE THIS for EBITDA Margin calculation")
         lines.append("")
 
     if is_quarterly:
@@ -1295,6 +1331,12 @@ def _build_verified_block(extracted: dict) -> str:
     lines.append("4. Net Profit = PAT Attributable to Owners (not total PAT including minority interest).")
     lines.append("5. Ratios are already computed by the company — use them directly, never recalculate.")
     lines.append("6. Your job is to WRITE COMMENTARY on these verified numbers, not find new ones.")
+    lines.append("7. ROE: If 'Return on Equity %' is 'Not found in filing', write 'Not disclosed in filing'.")
+    lines.append("   DO NOT calculate ROE yourself. The filing may not publish it as a separate ratio.")
+    lines.append("8. EBITDA Margin = Total Segment EBITDA ÷ Gross Revenue from Operations × 100.")
+    lines.append("   Use only numbers from the SEGMENT EBITDA section above.")
+    lines.append("9. For key_metrics 'previous' field: use the PRIOR YEAR SAME PERIOD value (YoY comparison),")
+    lines.append("   not the prior quarter. This gives a meaningful growth comparison.")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
 
@@ -1638,10 +1680,17 @@ These are SUBSIDIARY-SCOPE figures cited for audit disclosure only — NOT the c
 
 RULE 2 — THE P&L TABLE:
 Find the table "UNAUDITED CONSOLIDATED FINANCIAL RESULTS FOR THE QUARTER / NINE MONTHS ENDED..."
-Column headers: 31st Dec'25 | 30th Sep'25 | 31st Dec'24 | 31st Dec'25 (9M) | 31st Dec'24 (9M)
+Column headers (left to right): 31st Dec'25 | 30th Sep'25 | 31st Dec'24 | 31st Dec'25 (9M) | 31st Dec'24 (9M) | Year Ended Mar'25
 The FIRST data column (31st Dec'25) = current quarter. Use this column for all current metrics.
+The SECOND data column (30th Sep'25) = previous quarter. Use for QoQ comparison.
+The THIRD data column (31st Dec'24) = same quarter prior year. Use for YoY comparison.
 Row names to find: "Revenue from Operations", "Profit Before Tax", "Profit After Tax", "Finance Costs", etc.
-The number in the cell at the intersection of the row and current quarter column = the value.
+The number in the cell at the intersection of the row and FIRST data column = the current quarter value.
+
+NOTE ON NET PROFIT: The filing shows TWO profit figures after PAT:
+  a) Net Profit attributable to Owners of the Company  ← USE THIS as "Net Profit"
+  b) Non-Controlling Interest  ← this is minority share, do NOT use as Net Profit
+For Reliance Q3 FY26: PAT Owners = ₹18,645 Cr, NOT ₹22,167 Cr (which includes minority)
 
 NOTE ON PDF RENDERING: Some PDFs have font encoding issues where a number in column 1 may appear
 garbled (e.g. "J,912" instead of "7,912", or "-Aoa,245:" instead of "2,93,829").
@@ -1653,6 +1702,16 @@ If the document begins with a [PRINTED RATIOS FROM FILING] block, those are the 
 from the filing's printed Ratios section. USE THOSE EXACT VALUES.
 Do NOT recalculate D/E, Current Ratio, Interest Coverage, Operating Margin, Net Profit Margin.
 The printed values are already correct — recalculation introduces errors.
+
+RULE 3b — ROE:
+If ROE is not in the printed ratios section, write "Not disclosed in this filing" — do NOT calculate it.
+The Reliance filing does NOT publish ROE as a standalone ratio row.
+
+RULE 3c — EBITDA MARGIN:
+EBITDA = Total Segment EBITDA (from the Segment Results table, labeled "Total Segment Profit before
+Interest, Tax and Depreciation"). Divide by Gross Revenue (Value of Sales & Services) × 100.
+For Reliance Q3 FY26: Total EBITDA = ₹50,355 Cr, Revenue = ₹2,93,829 Cr → EBITDA Margin ≈ 17.1%
+Do NOT use Net Profit Margin as EBITDA Margin — they are different metrics.
 
 RULE 4 — CONSOLIDATED ONLY:
 Use "UNAUDITED CONSOLIDATED" tables. Ignore standalone tables that appear later.
