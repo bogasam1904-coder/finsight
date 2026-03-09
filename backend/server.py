@@ -2592,12 +2592,17 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
                     break
 
     # Parse financial table sections
+    # Use a robust extractor that handles nested tags by finding the section start
+    # and scanning forward to the matching </section> — non-greedy regex fails on large pages
     for section_id, target in [("quarters", "quarterly_results"),
                                 ("profit-loss", "annual_results"),
                                 ("balance-sheet", "balance_sheet")]:
-        sec = re.findall(f'<section[^>]*id="{section_id}"[^>]*>(.*?)</section>', html, re.S)
-        if sec:
-            result[target] = _parse_screener_table(sec[0])
+        section_html = _extract_section(html, section_id)
+        if section_html:
+            result[target] = _parse_screener_table(section_html)
+            logger.info(f"Screener section '{section_id}': {len(result[target])} rows parsed")
+        else:
+            logger.warning(f"Screener section '{section_id}' not found in HTML")
 
     if not result["quarterly_results"] and not result["annual_results"]:
         raise Exception(
@@ -2613,23 +2618,84 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
     return result
 
 
+def _extract_section(html: str, section_id: str) -> str:
+    """
+    Robustly extract a <section id="..."> block from HTML.
+    Handles nested tags by counting open/close section tags rather than
+    using non-greedy regex (which stops at the first </section> found).
+    """
+    # Find the opening tag
+    import re as _re
+    pattern = f'<section[^>]*\\bid="{_re.escape(section_id)}"[^>]*>'
+    m = _re.search(pattern, html, _re.S)
+    if not m:
+        return ""
+    start = m.end()
+    depth = 1
+    pos = start
+    while pos < len(html) and depth > 0:
+        next_open  = html.find("<section", pos)
+        next_close = html.find("</section>", pos)
+        if next_close == -1:
+            break
+        if next_open != -1 and next_open < next_close:
+            depth += 1
+            pos = next_open + 8
+        else:
+            depth -= 1
+            if depth == 0:
+                return html[start:next_close]
+            pos = next_close + 10
+    return html[start:pos]
+
+
 def _parse_screener_table(html_section: str) -> list:
-    """Parse a Screener.in HTML table into [{label, values, headers}] list."""
+    """
+    Parse a Screener.in HTML table into [{label, values, headers}] list.
+    Screener uses <th> for header rows and <td> for data rows.
+    Header row has empty first cell followed by period labels (Mar 2025, TTM, etc).
+    """
     rows = []
     headers = []
+
     for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', html_section, re.S):
+        # Detect if this is a header row (contains <th> tags)
+        has_th = bool(re.search(r'<th[\s>]', tr, re.S))
         cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', tr, re.S)
-        cells = [re.sub(r'<[^>]+>', '', c).replace('\xa0', ' ').replace('\n', ' ').strip() for c in cells]
-        cells = [re.sub(r'\s+', ' ', c).strip() for c in cells]
+
+        def clean(c):
+            # Strip HTML tags, decode nbsp, normalise whitespace
+            c = re.sub(r'<[^>]+>', '', c)
+            c = c.replace('\xa0', ' ').replace('&nbsp;', ' ').replace('\n', ' ')
+            return re.sub(r'\s+', ' ', c).strip()
+
+        cells = [clean(c) for c in cells]
         if not cells or not any(c for c in cells):
             continue
-        first = cells[0].lower()
-        # Header rows: empty first cell, or starts with month/year
-        if not first or re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|20\d\d|ttm)', first):
-            headers = list(cells)
+
+        first = cells[0].lower().strip()
+
+        # Header row detection:
+        # 1. Row uses <th> tags, OR
+        # 2. First cell empty and rest look like period labels, OR
+        # 3. First cell is a period label itself (Mar 2025, Dec 2022, TTM...)
+        is_period = bool(re.match(
+            r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|20\d\d|ttm|fy\d|yr)',
+            first
+        ))
+        is_header = has_th or not first or is_period
+
+        if is_header:
+            # Only update headers if this row has actual period content
+            period_cells = [c for c in cells[1:] if c]
+            if period_cells or not first:
+                headers = list(cells)
             continue
+
+        # Data row: must have a label and at least one numeric value
         if cells[0] and any(v for v in cells[1:] if v):
             rows.append({"label": cells[0], "values": cells[1:], "headers": list(headers)})
+
     return rows
 
 
