@@ -541,9 +541,9 @@ def _select_financial_pages(raw_bytes: bytes) -> list:
             selected.add(i)
             logger.info(f"Page {i+1}: SELECTED (net_score={info['net_score']}, table_hits={info['table_hits']}, consol={info['consol_hits']})")
 
-    # Safety cap: limit to first 12 pages for large filings
-    if total > 12:
-        selected = {i for i in selected if i < 12}
+    # Safety cap: BSE filings have auditor pages 1-9, real data from page 10
+    if total > 20:
+        selected = {i for i in selected if i < 20}
 
     result = sorted(selected)
     logger.info(f"PDF: {total} pages, consolidated={has_consolidated}, selected: {[p+1 for p in result]}")
@@ -891,7 +891,10 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
 
     result = {}
 
-    # ── Pass 1: Row-by-row (label + values same line or lookahead) ────────────
+    # ── Pass 1: Row-by-row ─────────────────────────────────────────────────────
+    # BSE filing column order (pypdf text): Dec25 | Sep25 | Dec24 | 9M-cur | 9M-prior
+    # _get_large_nums_with_fallback returns (current, sep_qtr, prior_yr_same_qtr)
+    # "prior" for YoY display = prior_yr_same_qtr (index 2 in raw line)
     all_patterns = PL_ORDERED + ATTR_ROWS + EPS_ROWS
     for i, line in enumerate(lines):
         ll = line.lower().strip()
@@ -900,20 +903,22 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
                 continue
             if not any(p in ll for p in patterns):
                 continue
-            # Try same line, then next 2 lines
-            nums = _get_large_nums(line)
+            cur, sep_q, prior_yr = _get_large_nums_with_fallback(line)
             for offset in [1, 2]:
-                if nums:
+                if cur:
                     break
                 if i + offset < len(lines):
-                    nums = _get_large_nums(lines[i + offset])
-            if nums:
+                    cur, sep_q, prior_yr = _get_large_nums_with_fallback(lines[i + offset])
+            if not cur and sep_q:
+                cur = sep_q
+                log.append(f"[{key}] col-1 font-corrupted, using col-2 fallback @ P{page_num}L{i+1}")
+            if cur:
                 result[key] = {
-                    "current": nums[0],
-                    "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
+                    "current": cur,
+                    "prior": prior_yr if prior_yr else sep_q,
                     "source": f"Page {page_num}, Line {i + 1} (row-by-row)",
                 }
-                log.append(f"[{key}] = {nums[0]} @ P{page_num}L{i+1} (row-by-row)")
+                log.append(f"[{key}] = {cur} @ P{page_num}L{i+1} (row-by-row)")
             break
 
     if len([k for k in result if k in dict(PL_ORDERED)]) >= 4:
@@ -1416,11 +1421,11 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
     """
     Extract text from PDF and return it for AI analysis.
     Strategy:
-      1. Select the right pages (consolidated P&L, ratios, segment)
-      2. Extract text via pdfplumber first, pypdf fallback
-      3. Prepend a compact cheat-sheet of the PRINTED RATIOS TABLE values
-         (ratios extract reliably; P&L column 1 has font encoding issues in some PDFs)
-      4. Return combined text for the AI prompt
+      1. Select the right pages (consolidated P&L, ratios, segment) — up to page 20
+      2. Run deterministic extractor to get verified numbers with source citations
+      3. Extract structured text via pdfplumber (table-aware) with pypdf fallback
+      4. Prepend VERIFIED DATA BLOCK (deterministic numbers) + PRINTED RATIOS
+         so AI uses ground-truth numbers, not hallucinated ones
     """
     # Guard: reject FinSight reports
     try:
@@ -1439,10 +1444,26 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
 
     page_indices = _select_financial_pages(raw_bytes)
     if not page_indices:
-        logger.warning("No financial pages selected — falling back to first 5 pages")
-        page_indices = list(range(min(5, pypdf.PdfReader(io.BytesIO(raw_bytes)).pages.__len__())))
+        logger.warning("No financial pages selected — falling back to first 8 pages")
+        page_indices = list(range(min(8, pypdf.PdfReader(io.BytesIO(raw_bytes)).pages.__len__())))
 
-    # ── Extract text ──────────────────────────────────────────────────────────
+    # ── Also scan ALL pages for ratios (ratios section may be page 5-8, excluded by page filter) ──
+    try:
+        all_page_count = len(pypdf.PdfReader(io.BytesIO(raw_bytes)).pages)
+        ratios_scan_pages = sorted(set(page_indices) | set(range(min(all_page_count, 20))))
+    except Exception:
+        ratios_scan_pages = page_indices
+
+    # ── Step 1: Deterministic extraction — verified numbers with source citations ──
+    try:
+        det = _extract_deterministic(raw_bytes, ratios_scan_pages)
+        verified_block = _build_verified_block(det)
+        logger.info(f"Deterministic: pl_keys={list(det['pl'].keys())}, ratio_keys={list(det['ratios'].keys())}")
+    except Exception as e:
+        logger.warning(f"Deterministic extraction failed: {e}")
+        verified_block = ""
+
+    # ── Step 2: Extract full document text via pdfplumber ────────────────────
     text = _extract_with_pdfplumber(raw_bytes, page_indices)
     if not text.strip():
         logger.info("pdfplumber empty, falling back to pypdf")
@@ -1453,27 +1474,36 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
             if pt.strip():
                 text += f"\n--- PAGE {i+1} ---\n{pt}\n"
 
-    # ── Build ratios cheat-sheet from the printed Ratios table ────────────────
-    # Ratios page text extracts cleanly; pre-extract and pin these for the AI.
-    ratios_hint = _extract_ratios_hint(raw_bytes, page_indices)
+    # ── Step 3: Ratios cheat-sheet (scans wider page range than page_indices) ──
+    ratios_hint = _extract_ratios_hint(raw_bytes, ratios_scan_pages)
+
+    # ── Step 4: Assemble final prompt input ──────────────────────────────────
+    # Order: VERIFIED BLOCK (ground truth) → RATIOS HINT → DOCUMENT TEXT
+    # AI must use verified block numbers; document text provides context
+    parts = []
+    if verified_block:
+        parts.append(verified_block)
     if ratios_hint:
-        text = ratios_hint + "\n\n" + text
+        parts.append(ratios_hint)
+    if text.strip():
+        parts.append("\n━━━ FULL DOCUMENT TEXT (for context) ━━━\n" + text)
+    combined = "\n\n".join(parts)
 
     is_partial = (
-        "newspaper" in text.lower() or
-        "business standard" in text.lower() or
-        "extract of" in text.lower() or
-        len(text) < 3000
+        "newspaper" in combined.lower() or
+        "business standard" in combined.lower() or
+        "extract of" in combined.lower() or
+        len(combined) < 3000
     )
     if is_partial:
-        text = (
+        combined = (
             "[SYSTEM NOTE: PARTIAL FILING DETECTED. "
             "Only write numbers explicitly visible. Mark unavailable fields as 'Not available'.\n\n"
-            + text
+            + combined
         )
 
-    final = text[:max_chars]
-    logger.info(f"Final snippet: {len(final):,} chars")
+    final = combined[:max_chars]
+    logger.info(f"Final snippet: {len(final):,} chars (verified={len(verified_block)}, ratios={len(ratios_hint)}, text={len(text)})")
     return final
 
 
@@ -1625,267 +1655,243 @@ def _repair_json(s: str) -> str:
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
     snippet = text[:max_doc_chars]
     logger.info(f"build_prompt: {len(snippet):,} chars")
-    return f"""You are a senior equity research analyst at a top-tier institutional fund. 
-Analyze the financial document below and return ONLY one valid JSON object.
-Your analysis must read like a Goldman Sachs or Morgan Stanley research note — specific, opinionated, number-driven.
+    return f"""You are a senior equity research analyst at an institutional fund.
+Analyze the financial data below and return ONLY one valid JSON object.
+Write like a Goldman Sachs research note: specific, opinionated, number-driven.
 
-━━━ DOCUMENT READING RULES (FOLLOW STRICTLY) ━━━
+━━━ VERIFIED DATA BLOCK (if present) ━━━
+The document may begin with a VERIFIED FINANCIAL DATA block enclosed in ╔══╗ borders.
+These numbers were deterministically extracted from the filing tables with source citations.
+TREAT THEM AS ABSOLUTE GROUND TRUTH. Do not override them with numbers from the document text.
 
-RULE 1 — AUDITOR NARRATIVE TRAP:
-The document may start with an Independent Auditor Report containing sentences like:
-  "247 subsidiaries reflect total revenues of Rs. 3,04,299 crore and net profit of Rs. 12,966 crore"
-These are AUDIT SCOPE DISCLOSURE figures — NOT consolidated results. IGNORE them entirely.
-→ Real financials are in the table titled "UNAUDITED CONSOLIDATED FINANCIAL RESULTS".
+━━━ DOCUMENT RULES ━━━
+RULE 1 — AUDITOR TRAP: Text like "subsidiaries reflect revenues of Rs. X crore" = audit scope note.
+These are NOT consolidated results. Only use numbers from the P&L table rows.
 
-RULE 2 — COLUMN ORDER IN P&L TABLE:
-Columns: [Current Quarter] | [Prior Quarter] | [Same Quarter Last Year] | [9M Current] | [9M Prior]
-→ ALWAYS use the FIRST column for current metrics. ALWAYS use the THIRD column for YoY comparison.
+RULE 2 — PRINTED RATIOS: If [PRINTED RATIOS FROM FILING] block exists, use those exact values.
+Never recalculate D/E, Current Ratio, Interest Coverage, Operating Margin, Net Profit Margin.
 
-RULE 3 — USE PRINTED RATIOS EXACTLY:
-If the document contains a [PRINTED RATIOS FROM FILING] block, use those exact values.
-Do NOT recalculate D/E, Current Ratio, Interest Coverage, Operating Margin, Net Profit Margin.
+RULE 3 — CONSOLIDATED ONLY: Ignore standalone tables.
 
-RULE 4 — CONSOLIDATED ONLY: Ignore standalone tables.
+RULE 4 — CASH FLOW:
+- Quarterly PDF (Q1/Q2/Q3): NO cash flow statement included. Set ALL CF fields to
+  "Not available — quarterly filing". Cash Flow score = 9. NEVER fabricate OCF figures.
+- Annual report or Screener.in data: analyse cash flow figures actually present.
+  Compute OCF/PAT ratio. State earnings quality (Strong if OCF>PAT, Moderate if ≈PAT, Weak if <PAT).
 
-RULE 5 — CASH FLOW IN QUARTERLY FILINGS:
-Q1/Q2/Q3 filings do NOT include Cash Flow Statements.
-→ Set ALL cash flow fields to "Not available in quarterly filing" and cash_conversion_quality to "Not available — quarterly filing does not include cash flow statement".
-→ Cash Flow score = 9 (neutral). Do NOT fabricate any OCF number.
+RULE 5 — HALLUCINATION BAN (CRITICAL):
+If a number is NOT explicitly in the document or verified block → write "Not available in this filing".
+NEVER invent, estimate, or calculate values not shown. One wrong number destroys user trust.
 
-RULE 6 — HALLUCINATION BAN:
-If a number is not explicitly present in the document, write "Not available in this filing".
-NEVER invent, estimate, or calculate values not shown in the document.
-This is a hard rule. Hallucinated numbers are worse than missing numbers.
+RULE 6 — SPECIFICITY (MOST IMPORTANT FOR QUALITY):
+Every analysis field MUST cite actual numbers. Vague commentary is waste.
+❌ REJECTED: "Revenue grew strongly reflecting robust demand across segments"
+✅ ACCEPTED: "Revenue ₹2,69,496 Cr, up 10.5% YoY from ₹2,43,865 Cr — Jio +17%, Retail +8%"
+❌ REJECTED: "Company has maintained strong profitability metrics"
+✅ ACCEPTED: "Net margin 6.9% (₹18,645 Cr PAT on ₹2,69,496 Cr revenue), expanded 140bps YoY"
 
-RULE 7 — SPECIFICITY REQUIREMENT (MOST IMPORTANT):
-Every analysis field MUST contain actual numbers from the document. Vague statements are REJECTED.
-❌ REJECTED: "Revenue grew strongly reflecting robust demand"
-✅ ACCEPTED: "Revenue ₹2,69,496 Cr, up 10.5% YoY from ₹2,43,865 Cr, driven by Jio (+17% YoY) and Retail (+8% YoY)"
-❌ REJECTED: "The company has strong profitability metrics"
-✅ ACCEPTED: "Net margin 6.9% (₹18,645 Cr PAT on ₹2,69,496 Cr revenue), up from 5.5% a year ago; ROE not disclosed but net worth ₹8.5L Cr indicates large equity base"
+━━━ SCORING ━━━
+Profitability(20): ROE>20%+Margin>15%=20|12-20%=14|else=7
+Growth(15): Rev>15%+PAT>20%=15|Rev8-15%+PAT10-20%=10|else=4
+BalanceSheet(15): D/E<0.5=15|0.5-1.0=11|1.0-1.5=7|>1.5=3
+Liquidity(10): CR>2=10|1.5-2=8|1-1.5=5|<1=2
+CashFlow(15): OCF>PAT=15|OCF≈PAT=10|OCF<PAT=4|NotAvailable=9
+Governance(15): Clean+LowPledging=15|MinorIssues=9|MajorConcerns=3
+Industry(10): MarketLeader=10|Strong#2-3=7|Average=4|Lagging=2
+health_label: >=80=Excellent|65-79=Good|45-64=Fair|25-44=Poor|<25=Critical
+investment_label: Strong Buy/Buy/Hold/Reduce/Avoid
 
-━━━ SCORING FRAMEWORK ━━━
-Profitability (max 20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=14 | ROE<12% OR Margin<8%=7
-Growth (max 15): Rev>15% AND Profit>20%=15 | Rev 8-15% AND Profit 10-20%=10 | else=4
-Balance Sheet (max 15): D/E<0.5=15 | D/E 0.5-1.0=11 | D/E 1.0-1.5=7 | D/E>1.5=3
-Liquidity (max 10): CR>2.0=10 | CR 1.5-2.0=8 | CR 1.0-1.5=5 | CR<1.0=2
-Cash Flow (max 15): OCF>PAT and FCF positive=15 | OCF≈PAT=10 | OCF<PAT=4 | Not available=9
-Governance (max 15): Clean audit+low pledging+no red flags=15 | Minor issues=9 | Major concerns=3
-Industry (max 10): Clear market leader=10 | Strong #2/#3=7 | Average=4 | Lagging=2
-health_label: >=80=Excellent | 65-79=Good | 45-64=Fair | 25-44=Poor | <25=Critical
-investment_label: Strong Buy (conviction long) / Buy (positive bias) / Hold (wait and watch) / Reduce (take some off) / Avoid (stay out)
+━━━ WRITING STYLE ━━━
+executive_summary: 5 sentences — (1) top-line revenue+PAT with figures (2) biggest positive with figures (3) biggest concern with figures (4) balance sheet/CF status (5) 1-2 quarter outlook
+investor_verdict: 2 sentences — lead with rating + core reason, end with key risk
+reasoning in breakdown: must cite exact numbers justifying the score
+highlights: each starts with a specific metric e.g. "PAT up 38.7% YoY to ₹18,645 Cr"
+risks: concrete, evidence-based — not "market risk" or "competition"
+investor_faq: 3-4 sentences each, number-heavy, directly answer the question
+key_monitorables: specific metrics with thresholds, not generic watchpoints
 
-━━━ TONE & STYLE ━━━
-- Write executive_summary as 4-5 sentences: quarter overview, key positives, key negatives, outlook
-- investor_verdict: 2 sentences max, lead with the rating rationale  
-- for_long_term_investors / for_short_term_traders: specific, actionable, mention entry/exit signals
-- reasoning fields in score breakdown: must mention exact numbers that justify the score
-- highlights: 3-5 bullet points, each starting with a specific metric or fact
-- risks: 3-5 concrete risks with context, not generic statements
-- investor_faq answers: 3-4 sentences each, number-heavy, directly address the question
-- key_monitorables: what specific metrics or events to track next quarter
-
-Return ONLY this JSON (all fields required, no nulls, no markdown):
-
+Return ONLY this JSON (all fields required, no nulls, no markdown fences):
 {{
   "company_name": "",
-  "statement_type": "Quarterly Results / Annual Report",
-  "period": "Q3 FY26 / FY2025 etc",
-  "currency": "₹ Crore / ₹ Lakh etc",
+  "statement_type": "Quarterly Results or Annual Report",
+  "period": "e.g. Q3 FY26 or FY2025",
+  "currency": "e.g. INR Crore",
   "health_score": 0,
   "health_label": "",
-
   "health_score_breakdown": {{
     "total": 0,
     "components": [
-      {{"category": "Profitability",     "weight": 20, "score": 0, "max": 20, "rating": "Strong/Average/Weak", "reasoning": "Must include specific margin %, ROE %, PAT figure"}},
-      {{"category": "Growth",            "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "Revenue growth % YoY, PAT growth % YoY with actual figures"}},
-      {{"category": "Balance Sheet",     "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "D/E ratio, net worth, total debt figures"}},
-      {{"category": "Liquidity",         "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak", "reasoning": "Current ratio, cash position if available"}},
-      {{"category": "Cash Flow",         "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "OCF vs PAT comparison, FCF if available; or state quarterly limitation"}},
-      {{"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "Strong/Average/Weak", "reasoning": "Audit opinion, promoter pledging, related party concerns if any"}},
-      {{"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "Strong/Average/Weak", "reasoning": "Market share, competitive moat, sector positioning"}}
+      {{"category":"Profitability","weight":20,"score":0,"max":20,"rating":"Strong/Average/Weak","reasoning":"Cite actual margin % and ROE % with figures"}},
+      {{"category":"Growth","weight":15,"score":0,"max":15,"rating":"Strong/Average/Weak","reasoning":"Revenue % YoY and PAT % YoY with actual figures"}},
+      {{"category":"Balance Sheet","weight":15,"score":0,"max":15,"rating":"Strong/Average/Weak","reasoning":"D/E ratio, net worth, total debt figures"}},
+      {{"category":"Liquidity","weight":10,"score":0,"max":10,"rating":"Strong/Average/Weak","reasoning":"Current ratio and cash context with figures"}},
+      {{"category":"Cash Flow","weight":15,"score":0,"max":15,"rating":"Strong/Average/Weak","reasoning":"OCF/PAT ratio if available, or clearly state quarterly limitation"}},
+      {{"category":"Governance & Risk","weight":15,"score":0,"max":15,"rating":"Strong/Average/Weak","reasoning":"Audit opinion, promoter pledging, related party concerns"}},
+      {{"category":"Industry Position","weight":10,"score":0,"max":10,"rating":"Strong/Average/Weak","reasoning":"Market share, moat, competitive position vs named peers"}}
     ]
   }},
-
-  "headline": "One punchy line max 15 words summarizing the quarter/year result",
-  "executive_summary": "4-5 sentences. Sentence 1: top-line summary with numbers. Sentence 2: key positive driver with numbers. Sentence 3: key concern or negative with numbers. Sentence 4: balance sheet / cash flow status. Sentence 5: forward outlook.",
+  "headline": "One punchy line ≤15 words with the single most important number from this result",
+  "executive_summary": "5 sentences: (1) top-line revenue+PAT with exact numbers (2) biggest positive driver with figures (3) biggest concern with figures (4) balance sheet/CF status (5) forward outlook",
   "investment_label": "",
-  "investor_verdict": "2 sentences. Lead with rating and core reason. Second sentence: key risk to this thesis.",
-  "for_long_term_investors": "3-4 sentences. Is the business compounding? Entry valuation context? Catalysts over 2-3 years?",
-  "for_short_term_traders": "3-4 sentences. Near-term triggers? Momentum signals? What would change the short-term thesis?",
-  "bottom_line": "One sentence summary verdict.",
-
+  "investor_verdict": "2 sentences: rating + core rationale with numbers + single biggest risk",
+  "for_long_term_investors": "3-4 sentences: compounding thesis, 2-3 year catalysts, entry context with specifics",
+  "for_short_term_traders": "3-4 sentences: near-term triggers, momentum signals, what would flip the thesis",
+  "bottom_line": "One sentence conviction statement",
   "key_metrics": [
-    {{"label": "Revenue",             "current": "", "previous": "", "change": "", "trend": "up/down/stable", "signal": "Positive/Negative/Neutral", "comment": "One line with context — what drove the change"}},
-    {{"label": "Net Profit",          "current": "", "previous": "", "change": "", "trend": "up/down/stable", "signal": "Positive/Negative/Neutral", "comment": ""}},
-    {{"label": "EBITDA Margin",       "current": "", "previous": "", "change": "", "trend": "up/down/stable", "signal": "Positive/Negative/Neutral", "comment": ""}},
-    {{"label": "ROE",                 "current": "", "previous": "", "change": "", "trend": "up/down/stable", "signal": "Positive/Negative/Neutral", "comment": ""}},
-    {{"label": "Debt to Equity",      "current": "", "previous": "", "change": "", "trend": "up/down/stable", "signal": "Positive/Negative/Neutral", "comment": ""}},
-    {{"label": "Operating Cash Flow", "current": "", "previous": "", "change": "", "trend": "up/down/stable", "signal": "Positive/Negative/Neutral", "comment": ""}}
+    {{"label":"Revenue","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":"One specific line on what drove the change"}},
+    {{"label":"Net Profit","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"EBITDA Margin","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"ROE","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}}
   ],
-
   "cash_flow_deep_dive": {{
-    "operating_cf": "Exact figure or 'Not available in quarterly filing'",
-    "investing_cf": "Exact figure or 'Not available in quarterly filing'",
-    "financing_cf": "Exact figure or 'Not available in quarterly filing'",
-    "free_cash_flow": "OCF minus Capex, or 'Not available in quarterly filing'",
-    "capex": "Exact figure or 'Not available in quarterly filing'",
-    "cash_conversion_quality": "Strong / Moderate / Weak — with OCF/PAT ratio if available; or 'Not available — quarterly filing does not include cash flow statement'",
-    "ocf_vs_pat_insight": "Is cash profit higher or lower than accounting profit? What does this say about earnings quality? Or state quarterly limitation."
+    "operating_cf": "Exact figure with period, or 'Not available — quarterly filing'",
+    "investing_cf": "Exact figure or not available",
+    "financing_cf": "Exact figure or not available",
+    "free_cash_flow": "OCF minus Capex or not available",
+    "capex": "Exact figure or not available",
+    "cash_conversion_quality": "Strong (OCF 1.3x PAT) / Moderate / Weak — with actual ratio; or 'Not available — quarterly filing does not include cash flow statement'",
+    "ocf_vs_pat_insight": "Earnings quality: is cash profit higher than accounting profit? Use actual numbers. Or state quarterly limitation."
   }},
-
   "balance_sheet_deep_dive": {{
-    "asset_quality": "What does the asset base look like? Fixed assets, investments, working capital quality",
-    "debt_profile": "Total debt figure, mix of long vs short term if known, cost of debt if disclosed",
-    "working_capital_insight": "Debtors days, inventory days, payables if available",
+    "asset_quality": "Asset base with figures — fixed assets, investments, working capital quality",
+    "debt_profile": "Total debt figure, LT vs ST mix if available, cost of debt if disclosed",
+    "working_capital_insight": "Debtor days, inventory days if derivable from data",
     "total_debt": "",
     "net_worth": "",
     "debt_to_equity": "",
     "interest_coverage": "",
-    "debt_comfort_level": "Comfortable / Elevated / Stressed — with specific rationale"
+    "debt_comfort_level": "Comfortable/Elevated/Stressed — with D/E and ICR rationale"
   }},
-
   "growth_quality": {{
-    "revenue_growth_context": "Not just the % — WHY did revenue grow/fall? Which segment drove it? Numbers required.",
-    "profit_growth_context": "PAT growth drivers — margin expansion, lower tax, one-off items? Numbers required.",
-    "margin_trend": "Is operating margin expanding or contracting vs last year? By how many bps?",
-    "growth_outlook": "What are the next 2-4 quarters likely to look like based on disclosed guidance or sector trends?",
-    "catalysts": ["specific catalyst 1 with context", "specific catalyst 2 with context"],
-    "headwinds": ["specific headwind 1 with context", "specific headwind 2 with context"]
+    "revenue_growth_context": "WHY did revenue grow/fall — which segments, what magnitude? Cite figures.",
+    "profit_growth_context": "PAT growth drivers — margin expansion, lower tax, one-offs? Cite figures.",
+    "margin_trend": "Operating margin expansion/contraction vs last year in exact bps",
+    "growth_outlook": "Next 2-4 quarters based on guidance or sector momentum",
+    "catalysts": ["Specific catalyst 1 with expected magnitude", "Specific catalyst 2"],
+    "headwinds": ["Specific headwind 1 with context and magnitude", "Specific headwind 2"]
   }},
-
   "industry_context": {{
-    "sector_tailwinds": ["tailwind 1", "tailwind 2"],
-    "sector_headwinds": ["headwind 1", "headwind 2"],
-    "competitive_position": "Where does this company sit vs peers? Market share leader? Niche player?",
-    "peer_benchmarks": "How do margins / growth / leverage compare to sector peers? Name peers if known.",
-    "regulatory_environment": "Any regulatory tailwinds/headwinds relevant to this company?"
+    "sector_tailwinds": ["Tailwind 1 specific to this sector/company", "Tailwind 2"],
+    "sector_headwinds": ["Headwind 1", "Headwind 2"],
+    "competitive_position": "Market position vs named peers — leader, challenger, or niche?",
+    "peer_benchmarks": "Margins/growth/D/E vs named peers in same sector",
+    "regulatory_environment": "Relevant regulatory tailwinds or headwinds"
   }},
-
-  "red_flags": ["Specific red flag 1 with evidence from the document", "Specific red flag 2"],
-  "strengths_and_moats": ["Specific moat 1 — e.g. network effect, pricing power, brand", "Specific moat 2"],
-
+  "red_flags": ["Specific red flag with evidence from filing", "Specific red flag 2 — not generic"],
+  "strengths_and_moats": ["Specific moat — e.g. 430M subscriber base, pricing power, brand", "Specific moat 2"],
   "investor_faq": [
-    {{"question": "Is this company a good investment right now?", "answer": "3-4 sentences. Start with the investment case. Mention valuation context if possible. State key risk."}},
-    {{"question": "What is the biggest risk to monitor?", "answer": "3-4 sentences. Be specific — not generic market risk."}},
-    {{"question": "How sustainable is the current growth rate?", "answer": "3-4 sentences. Refer to specific segments, market opportunity, or constraints."}}
+    {{"question":"Is this company a good investment right now?","answer":"3-4 sentences: investment case with numbers, valuation context, key risk."}},
+    {{"question":"What is the biggest risk to monitor?","answer":"3-4 sentences: specific, evidence-based, not generic."}},
+    {{"question":"How sustainable is the current growth rate?","answer":"3-4 sentences: segment drivers, market opportunity, structural constraints."}}
   ],
-
   "key_monitorables": [
-    "Specific metric or event to track next quarter — e.g. Jio ARPU trajectory above ₹200",
-    "Specific metric 2",
-    "Specific metric 3"
+    "Specific metric with threshold — e.g. Watch Jio ARPU: needs to sustain above ₹195 to justify Digital valuation",
+    "Monitorable 2 with context and threshold",
+    "Monitorable 3"
   ],
-
   "profitability": {{
-    "analysis": "3-4 sentences on profitability quality — not just margins but what drives them, sustainability, trend",
+    "analysis": "3-4 sentences: margin quality, what drives them, sustainability, trend vs historical and peers",
     "net_margin_current": "",
     "ebitda_margin_current": "",
     "roe": "",
     "roa": ""
   }},
-
   "liquidity": {{
-    "analysis": "2-3 sentences on liquidity position — can company meet near-term obligations comfortably?",
+    "analysis": "2-3 sentences: can company meet near-term obligations? Any stress signals?",
     "current_ratio": "",
     "quick_ratio": "",
     "cash_position": "",
     "operating_cash_flow": "",
     "free_cash_flow": ""
   }},
-
   "highlights": [
-    "Specific highlight 1 — number-led, e.g. 'Net profit up 38.7% YoY to ₹18,645 Cr, highest in 6 quarters'",
-    "Specific highlight 2",
-    "Specific highlight 3"
+    "Number-led — e.g. PAT up 38.7% YoY to ₹18,645 Cr, strongest quarter in last 6",
+    "Number-led highlight 2",
+    "Number-led highlight 3"
   ],
   "risks": [
-    "Specific risk 1 — e.g. 'O2C segment margin pressure: GRMs compressed to $8.4/bbl vs $10.1/bbl YoY'",
-    "Specific risk 2",
+    "Specific risk with magnitude — e.g. O2C under pressure: GRMs at $8.4/bbl vs $10.1/bbl YoY, -17%",
+    "Specific risk 2 with evidence",
     "Specific risk 3"
   ],
   "what_to_watch": [
-    "What to watch 1 — specific trigger or metric for next quarter",
+    "Specific trigger for next quarter with clear threshold",
     "What to watch 2",
     "What to watch 3"
   ]
 }}
 
-FINANCIAL DOCUMENT:
+FINANCIAL DATA:
 {snippet}
 """
-
-
-
 
 def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
     snippet = text[:max_doc_chars]
-    return f"""Senior equity research analyst. Return ONLY valid JSON analyzing the financial data below.
-Write like an institutional analyst — every field must contain actual numbers, not vague statements.
+    return f"""Senior equity research analyst. Return ONLY valid JSON. Every field needs actual numbers from the data.
 
-CRITICAL RULES:
-1. AUDITOR TRAP: "subsidiaries reflect revenues of Rs. X crore" = audit scope note, NOT consolidated results. Ignore.
-2. HALLUCINATION BAN: If a number is not in the document, write "Not available in this filing". Never invent numbers.
-3. SPECIFICITY: Every analysis sentence needs actual figures. "Revenue ₹X Cr, up Y% YoY" not "revenue grew strongly".
-4. CASH FLOW — QUARTERLY: Q1/Q2/Q3 filings have no cash flow. Set all CF fields to "Not available — quarterly filing". Score CF as 9.
-5. CASH FLOW — ANNUAL/SCREENER: If annual data or Screener.in data is present, use the cash flow figures provided.
-6. CONSOLIDATED ONLY: Ignore standalone tables.
-7. USE PRINTED RATIOS: D/E, CR, ICR as printed in the ratios section — do not recalculate.
+RULES:
+1. VERIFIED BLOCK: If ╔══╗ bordered block present at top — use those numbers as ground truth.
+2. AUDITOR TRAP: "subsidiaries reflect revenues Rs. X crore" = audit note. Ignore. Not consolidated results.
+3. HALLUCINATION BAN: Number not in data → "Not available in this filing". Never invent or estimate.
+4. SPECIFICITY: Every sentence needs actual figures. "Revenue ₹X Cr, up Y% YoY" not "revenue grew."
+5. CASH FLOW QUARTERLY: No CF in Q1/Q2/Q3 filings. All CF fields = "Not available — quarterly filing". CF score = 9.
+6. CASH FLOW ANNUAL/SCREENER: If annual data present, analyse OCF, FCF. Compute OCF/PAT ratio.
+7. CONSOLIDATED ONLY. USE PRINTED RATIOS exactly — never recalculate.
 
-SCORING: Profitability(20): ROE>20%+Margin>15%=20|12-20%=14|else=7 | Growth(15): Rev>15%+Profit>20%=15|8-15%=10|else=4 | BalanceSheet(15): D/E<0.5=15|0.5-1.0=11|1.0-1.5=7|>1.5=3 | Liquidity(10): CR>2=10|1.5-2=8|1-1.5=5|<1=2 | CashFlow(15): OCF>PAT=15|~PAT=10|<PAT=4|NotAvail=9 | Governance(15): Clean=15|Minor=9|Major=3 | Industry(10): Leader=10|Strong=7|Avg=4|Lag=2
+SCORING: Profitability(20):ROE>20%+Margin>15%=20|12-20%=14|else=7 | Growth(15):Rev>15%+PAT>20%=15|8-15%=10|else=4 | BalSheet(15):D/E<0.5=15|0.5-1.0=11|1.0-1.5=7|>1.5=3 | Liquidity(10):CR>2=10|1.5-2=8|1-1.5=5|<1=2 | CF(15):OCF>PAT=15|≈PAT=10|<PAT=4|NA=9 | Gov(15):Clean=15|Minor=9|Major=3 | Industry(10):Leader=10|Strong=7|Avg=4|Lag=2
 health_label: >=80=Excellent|65-79=Good|45-64=Fair|25-44=Poor|<25=Critical
 investment_label: Strong Buy/Buy/Hold/Reduce/Avoid
 
-Return ONLY this JSON (no markdown, no nulls):
+Return ONLY this JSON:
 {{
   "company_name":"","statement_type":"","period":"","currency":"","health_score":0,"health_label":"",
   "health_score_breakdown":{{"total":0,"components":[
-    {{"category":"Profitability","weight":20,"score":0,"max":20,"rating":"","reasoning":"Must include margin % and ROE % with actual figures"}},
-    {{"category":"Growth","weight":15,"score":0,"max":15,"rating":"","reasoning":"Revenue growth % and PAT growth % YoY with figures"}},
-    {{"category":"Balance Sheet","weight":15,"score":0,"max":15,"rating":"","reasoning":"D/E ratio, net worth, debt figures"}},
-    {{"category":"Liquidity","weight":10,"score":0,"max":10,"rating":"","reasoning":"Current ratio and cash context"}},
-    {{"category":"Cash Flow","weight":15,"score":0,"max":15,"rating":"","reasoning":"OCF vs PAT or quarterly limitation statement"}},
-    {{"category":"Governance & Risk","weight":15,"score":0,"max":15,"rating":"","reasoning":"Audit, pledging, red flags"}},
-    {{"category":"Industry Position","weight":10,"score":0,"max":10,"rating":"","reasoning":"Market position and competitive moat"}}
+    {{"category":"Profitability","weight":20,"score":0,"max":20,"rating":"","reasoning":"margin % + ROE % with figures"}},
+    {{"category":"Growth","weight":15,"score":0,"max":15,"rating":"","reasoning":"rev % + PAT % YoY with figures"}},
+    {{"category":"Balance Sheet","weight":15,"score":0,"max":15,"rating":"","reasoning":"D/E, net worth, debt figures"}},
+    {{"category":"Liquidity","weight":10,"score":0,"max":10,"rating":"","reasoning":"current ratio + cash context"}},
+    {{"category":"Cash Flow","weight":15,"score":0,"max":15,"rating":"","reasoning":"OCF/PAT ratio or quarterly limitation"}},
+    {{"category":"Governance & Risk","weight":15,"score":0,"max":15,"rating":"","reasoning":"audit, pledging, red flags"}},
+    {{"category":"Industry Position","weight":10,"score":0,"max":10,"rating":"","reasoning":"market position + moat vs peers"}}
   ]}},
-  "headline":"Punchy one-line summary with key number",
-  "executive_summary":"4-5 sentences: (1) top-line with numbers (2) key positive driver (3) key concern (4) balance sheet status (5) outlook",
-  "investment_label":"","investor_verdict":"2 sentences: rating rationale + key risk",
+  "headline":"Single most important number from this result in ≤15 words",
+  "executive_summary":"5 sentences: (1)top-line with exact numbers (2)biggest positive driver (3)key concern (4)balance sheet/CF (5)outlook",
+  "investment_label":"","investor_verdict":"2 sentences: rating+rationale with numbers + key risk",
   "for_long_term_investors":"3-4 sentences with specific catalysts and entry context",
   "for_short_term_traders":"3-4 sentences with near-term triggers and momentum signals",
-  "bottom_line":"One sentence verdict",
+  "bottom_line":"One conviction sentence",
   "key_metrics":[
-    {{"label":"Revenue","current":"","previous":"","change":"","trend":"","signal":"","comment":"What drove the change"}},
-    {{"label":"Net Profit","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
-    {{"label":"EBITDA Margin","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
-    {{"label":"ROE","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
-    {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
-    {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"","signal":"","comment":""}}
+    {{"label":"Revenue","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":"What drove the change"}},
+    {{"label":"Net Profit","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"EBITDA Margin","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"ROE","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
+    {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}}
   ],
-  "cash_flow_deep_dive":{{"operating_cf":"","investing_cf":"","financing_cf":"","free_cash_flow":"","capex":"","cash_conversion_quality":"Strong/Moderate/Weak with OCF/PAT ratio, or not available reason","ocf_vs_pat_insight":"Earnings quality analysis or quarterly limitation"}},
-  "balance_sheet_deep_dive":{{"asset_quality":"","debt_profile":"Total debt, LT vs ST mix","working_capital_insight":"","total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":"Comfortable/Elevated/Stressed with rationale"}},
-  "growth_quality":{{"revenue_growth_context":"WHY revenue grew — which segments, what drove it","profit_growth_context":"PAT growth drivers — margins, tax, one-offs","margin_trend":"bps expansion/contraction vs last year","growth_outlook":"Next 2-4 quarters outlook","catalysts":["specific catalyst 1","specific catalyst 2"],"headwinds":["specific headwind 1","specific headwind 2"]}},
-  "industry_context":{{"sector_tailwinds":["tailwind 1","tailwind 2"],"sector_headwinds":["headwind 1","headwind 2"],"competitive_position":"Market position vs peers","peer_benchmarks":"Margin/growth/leverage vs named peers","regulatory_environment":"Relevant regulatory factors"}},
-  "red_flags":["Specific red flag with evidence","Specific red flag 2"],
-  "strengths_and_moats":["Specific moat 1 — network/brand/cost/pricing power","Specific moat 2"],
+  "cash_flow_deep_dive":{{"operating_cf":"Figure or not available","investing_cf":"","financing_cf":"","free_cash_flow":"OCF-Capex or not available","capex":"","cash_conversion_quality":"Strong(OCF Xx PAT)/Moderate/Weak with ratio; or not available reason","ocf_vs_pat_insight":"Earnings quality analysis with numbers, or quarterly limitation"}},
+  "balance_sheet_deep_dive":{{"asset_quality":"Asset base with figures","debt_profile":"Total debt, LT vs ST","working_capital_insight":"Debtor/inventory days if available","total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":"Comfortable/Elevated/Stressed with D/E+ICR rationale"}},
+  "growth_quality":{{"revenue_growth_context":"WHY revenue changed — segments and figures","profit_growth_context":"PAT drivers with numbers","margin_trend":"Exact bps expansion/contraction","growth_outlook":"Next 2-4 quarters","catalysts":["Catalyst 1 with magnitude","Catalyst 2"],"headwinds":["Headwind 1 with context","Headwind 2"]}},
+  "industry_context":{{"sector_tailwinds":["Tailwind 1","Tailwind 2"],"sector_headwinds":["Headwind 1","Headwind 2"],"competitive_position":"Position vs named peers","peer_benchmarks":"Margins/growth/D/E vs named peers","regulatory_environment":"Relevant factors"}},
+  "red_flags":["Red flag with evidence from filing","Red flag 2 specific not generic"],
+  "strengths_and_moats":["Specific moat 1 — scale/brand/network/pricing power","Specific moat 2"],
   "investor_faq":[
-    {{"question":"Is this company a good investment right now?","answer":"3-4 sentences, investment case + valuation + risk"}},
-    {{"question":"What is the biggest risk to monitor?","answer":"3-4 sentences, specific not generic"}},
-    {{"question":"How sustainable is the current growth rate?","answer":"3-4 sentences, segments + market opportunity"}}
+    {{"question":"Is this company a good investment right now?","answer":"3-4 sentences: investment case + numbers + valuation + risk"}},
+    {{"question":"What is the biggest risk to monitor?","answer":"3-4 sentences: specific risk with evidence"}},
+    {{"question":"How sustainable is the current growth rate?","answer":"3-4 sentences: segments + opportunity + constraints"}}
   ],
-  "key_monitorables":["Specific metric to watch next quarter — e.g. segment ARPU, margin trajectory","Specific metric 2","Specific metric 3"],
-  "profitability":{{"analysis":"3-4 sentences on profitability quality, sustainability, trend","net_margin_current":"","ebitda_margin_current":"","roe":"","roa":""}},
-  "liquidity":{{"analysis":"2-3 sentences on liquidity with specific ratios","current_ratio":"","quick_ratio":"","cash_position":"","operating_cash_flow":"","free_cash_flow":""}},
-  "highlights":["Number-led highlight 1 — e.g. PAT up 38.7% YoY to ₹18,645 Cr","Number-led highlight 2","Number-led highlight 3"],
-  "risks":["Specific risk 1 with context and magnitude","Specific risk 2","Specific risk 3"],
-  "what_to_watch":["Specific trigger or metric for next quarter","What to watch 2","What to watch 3"]
+  "key_monitorables":["Specific metric with threshold — e.g. Watch ARPU sustain above ₹195","Monitorable 2 with threshold","Monitorable 3"],
+  "profitability":{{"analysis":"3-4 sentences on margin quality, drivers, sustainability, trend","net_margin_current":"","ebitda_margin_current":"","roe":"","roa":""}},
+  "liquidity":{{"analysis":"2-3 sentences with specific ratios and liquidity assessment","current_ratio":"","quick_ratio":"","cash_position":"","operating_cash_flow":"","free_cash_flow":""}},
+  "highlights":["Number-led highlight 1 — e.g. PAT up 38.7% YoY to ₹18,645 Cr","Highlight 2","Highlight 3"],
+  "risks":["Specific risk with magnitude and evidence","Risk 2","Risk 3"],
+  "what_to_watch":["Specific trigger with threshold for next quarter","Watch 2","Watch 3"]
 }}
 
-FINANCIAL DOCUMENT:
+FINANCIAL DATA:
 {snippet}
 """
-
 
 # ─── AI PROVIDER FUNCTIONS ───────────────────────────────────────────────────
 
@@ -2516,6 +2522,239 @@ async def analyze(file: UploadFile = File(...), user=Depends(get_optional_user))
         msg = str(e); logger.error(f"analyze failed {analysis_id}: {msg}")
         await analyses_col.update_one({"analysis_id": analysis_id}, {"$set": {"status": "failed", "message": msg}})
         return {"analysis_id": analysis_id, "status": "failed", "message": msg}
+
+# ─── SCREENER.IN INTEGRATION ─────────────────────────────────────────────────
+
+SCREENER_HEADERS = {
+    **BROWSER_HEADERS,
+    "Referer": "https://www.screener.in/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
+    """Fetch clean structured financials from Screener.in for a given NSE/BSE symbol."""
+    url_type = "consolidated" if consolidated else "standalone"
+    url = f"https://www.screener.in/company/{symbol.upper()}/{url_type}/"
+    logger.info(f"Screener.in fetch: {url}")
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(url, headers=SCREENER_HEADERS)
+            if r.status_code == 404 and consolidated:
+                url = f"https://www.screener.in/company/{symbol.upper()}/"
+                r = await c.get(url, headers=SCREENER_HEADERS)
+            if r.status_code != 200:
+                raise Exception(
+                    f"Screener.in returned HTTP {r.status_code} for '{symbol}'. "
+                    f"Verify the symbol is a valid NSE ticker (e.g. RELIANCE, TCS, HDFCBANK)."
+                )
+            html = r.text
+    except Exception as e:
+        raise Exception(f"Could not reach Screener.in: {e}")
+
+    result = {
+        "symbol": symbol.upper(), "url": url, "consolidated": consolidated,
+        "company_name": "", "ratios": {},
+        "quarterly_results": [], "annual_results": [], "balance_sheet": [],
+        "raw_text": "",
+    }
+
+    # Company name — try multiple selectors
+    for pat in [r'<h1[^>]*class="[^"]*company-name[^"]*"[^>]*>(.*?)</h1>',
+                r'<h1[^>]*>(.*?)</h1>',
+                r'<title>([^<|]+)']:
+        m = re.search(pat, html, re.S)
+        if m:
+            name = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+            if name and len(name) > 2:
+                result["company_name"] = name
+                break
+
+    # Key ratios — multiple patterns per ratio for robustness
+    ratio_defs = [
+        ("market_cap",     [r'Market Cap\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+        ("pe_ratio",       [r'Stock P/E\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+        ("book_value",     [r'Book Value\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+        ("dividend_yield", [r'Dividend Yield\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+        ("roce",           [r'\bROCE\b\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+        ("roe",            [r'\bROE\b\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+        ("face_value",     [r'Face Value\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+        ("eps",            [r'EPS\s*(?:\([^)]+\))?\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
+    ]
+    for key, patterns in ratio_defs:
+        for pat in patterns:
+            m = re.search(pat, html, re.S)
+            if m:
+                val = re.sub(r'<[^>]+>', '', m.group(1)).strip().replace(",", "")
+                if val and val != "0":
+                    result["ratios"][key] = val
+                    break
+
+    # Parse financial table sections
+    for section_id, target in [("quarters", "quarterly_results"),
+                                ("profit-loss", "annual_results"),
+                                ("balance-sheet", "balance_sheet")]:
+        sec = re.findall(f'<section[^>]*id="{section_id}"[^>]*>(.*?)</section>', html, re.S)
+        if sec:
+            result[target] = _parse_screener_table(sec[0])
+
+    if not result["quarterly_results"] and not result["annual_results"]:
+        raise Exception(
+            f"No financial data found for '{symbol}' on Screener.in. "
+            f"Check the symbol spelling (use NSE ticker, e.g. RELIANCE not Reliance Industries)."
+        )
+
+    result["raw_text"] = _screener_to_text(result)
+    logger.info(
+        f"Screener.in {symbol}: qtr={len(result['quarterly_results'])}, "
+        f"annual={len(result['annual_results'])}, ratios={list(result['ratios'].keys())}"
+    )
+    return result
+
+
+def _parse_screener_table(html_section: str) -> list:
+    """Parse a Screener.in HTML table into [{label, values, headers}] list."""
+    rows = []
+    headers = []
+    for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', html_section, re.S):
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', tr, re.S)
+        cells = [re.sub(r'<[^>]+>', '', c).replace('\xa0', ' ').replace('\n', ' ').strip() for c in cells]
+        cells = [re.sub(r'\s+', ' ', c).strip() for c in cells]
+        if not cells or not any(c for c in cells):
+            continue
+        first = cells[0].lower()
+        # Header rows: empty first cell, or starts with month/year
+        if not first or re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|20\d\d|ttm)', first):
+            headers = list(cells)
+            continue
+        if cells[0] and any(v for v in cells[1:] if v):
+            rows.append({"label": cells[0], "values": cells[1:], "headers": list(headers)})
+    return rows
+
+
+def _screener_to_text(data: dict) -> str:
+    """Convert Screener.in data to clean text optimised for AI analysis."""
+    L = []
+    L.append(f"COMPANY: {data['company_name']}")
+    L.append(f"SYMBOL: {data['symbol']}")
+    L.append(f"SOURCE: Screener.in {'Consolidated' if data['consolidated'] else 'Standalone'} — {data['url']}")
+    L.append("CURRENCY: INR Crores unless stated otherwise")
+    L.append("DATA TYPE: Annual financial data — Cash Flow Statement IS available. Analyse it fully.")
+    L.append("IMPORTANT: Use the most recent quarter from QUARTERLY RESULTS for current period metrics.")
+    L.append("")
+
+    if data["ratios"]:
+        L.append("=== LIVE KEY RATIOS (current, from Screener.in) ===")
+        ratio_labels = {
+            "market_cap": "Market Cap (Cr)", "pe_ratio": "Stock P/E",
+            "book_value": "Book Value per share (₹)", "dividend_yield": "Dividend Yield (%)",
+            "roce": "ROCE (%)", "roe": "ROE (%)", "face_value": "Face Value (₹)", "eps": "EPS TTM (₹)"
+        }
+        for k, v in data["ratios"].items():
+            L.append(f"  {ratio_labels.get(k, k)}: {v}")
+        L.append("")
+
+    if data["quarterly_results"]:
+        L.append("=== QUARTERLY RESULTS (INR Cr) — USE MOST RECENT QUARTER FOR CURRENT METRICS ===")
+        hdrs = data["quarterly_results"][0].get("headers", [])
+        if hdrs:
+            L.append("  Periods: " + " | ".join(hdrs))
+        for row in data["quarterly_results"]:
+            L.append(f"  {row['label']}: {' | '.join(row['values'])}")
+        L.append("")
+
+    if data["annual_results"]:
+        L.append("=== ANNUAL P&L — USE FOR CASH FLOW ANALYSIS (INR Cr) ===")
+        L.append("  Find: Cash from Operations, Cash from Investing, Cash from Financing, Capex rows")
+        L.append("  Compute: OCF/PAT ratio to assess cash conversion quality")
+        hdrs = data["annual_results"][0].get("headers", [])
+        if hdrs:
+            L.append("  Years: " + " | ".join(hdrs))
+        for row in data["annual_results"]:
+            L.append(f"  {row['label']}: {' | '.join(row['values'])}")
+        L.append("")
+
+    if data["balance_sheet"]:
+        L.append("=== BALANCE SHEET (INR Cr) ===")
+        hdrs = data["balance_sheet"][0].get("headers", [])
+        if hdrs:
+            L.append("  Years: " + " | ".join(hdrs))
+        for row in data["balance_sheet"]:
+            L.append(f"  {row['label']}: {' | '.join(row['values'])}")
+        L.append("")
+
+    return "\n".join(L)
+
+
+class ScreenerAnalyzeRequest(BaseModel):
+    symbol: str
+    consolidated: bool = True
+
+
+@app.post("/api/analyze-from-screener")
+async def analyze_from_screener(req: ScreenerAnalyzeRequest, user=Depends(get_optional_user)):
+    """
+    Fetch live data from Screener.in and run full AI analysis.
+    More reliable than PDF: no font-encoding issues, always latest annual data with cash flows.
+    """
+    analysis_id = str(uuid.uuid4())
+    user_id = user["user_id"] if user else f"guest_{str(uuid.uuid4())[:8]}"
+
+    await analyses_col.insert_one({
+        "analysis_id": analysis_id, "user_id": user_id, "is_guest": user is None,
+        "filename": f"{req.symbol.upper()}_screener",
+        "source": "screener", "status": "processing",
+        "created_at": datetime.utcnow().isoformat(), "result": None,
+    })
+
+    try:
+        logger.info(f"Screener analysis: {req.symbol} (consolidated={req.consolidated})")
+        data = await fetch_screener_data(req.symbol, req.consolidated)
+
+        if not data["raw_text"] or len(data["raw_text"].strip()) < 200:
+            raise Exception(
+                f"Screener.in returned insufficient data for '{req.symbol}'. "
+                f"Try the exact NSE ticker symbol."
+            )
+
+        result = await run_analysis(data["raw_text"])
+
+        meta = {
+            "company_name": data["company_name"],
+            "url": data["url"],
+            "ratios": data["ratios"],
+        }
+        await analyses_col.update_one(
+            {"analysis_id": analysis_id},
+            {"$set": {"status": "completed", "result": result, "screener_meta": meta}},
+        )
+        logger.info(f"Screener complete: {req.symbol} → {analysis_id}")
+        return {
+            "analysis_id": analysis_id, "status": "completed",
+            "result": result, "screener_meta": meta
+        }
+
+    except Exception as e:
+        msg = str(e)
+        logger.error(f"Screener failed {analysis_id} ({req.symbol}): {msg}")
+        await analyses_col.update_one(
+            {"analysis_id": analysis_id},
+            {"$set": {"status": "failed", "message": msg}},
+        )
+        return {"analysis_id": analysis_id, "status": "failed", "message": msg}
+
+
+@app.get("/api/screener/{symbol}")
+async def get_screener_preview(symbol: str, consolidated: bool = True):
+    """Return raw Screener.in data for a symbol (no AI analysis — useful for debugging)."""
+    try:
+        data = await fetch_screener_data(symbol, consolidated)
+        data.pop("raw_text", None)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.post("/api/analyze-from-url")
 async def analyze_from_url(req: AnalyzeFromURLRequest, user=Depends(get_optional_user)):
