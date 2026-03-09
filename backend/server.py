@@ -684,6 +684,440 @@ def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> tuple:
     return structured, currency
 
 
+# ─── DETERMINISTIC EXTRACTOR ─────────────────────────────────────────────────
+# Philosophy: AI does interpretation + writing. NOT data extraction.
+# Every number shown to a user must be traceable to a specific row/table in the filing.
+# If we can't find it deterministically → mark as "Not available" rather than let AI guess.
+
+# P&L row labels to look for (case-insensitive partial match)
+_PL_ROW_MAP = {
+    "revenue":          ["revenue from operations", "net revenue", "total revenue", "revenue from operation"],
+    "total_income":     ["total income"],
+    "other_income":     ["other income"],
+    "total_expenses":   ["total expenses", "total expenditure"],
+    "ebitda":           ["ebitda"],
+    "depreciation":     ["depreciation", "amortisation", "amortization"],
+    "finance_costs":    ["finance costs", "interest expense", "finance cost"],
+    "pbt":              ["profit before tax", "profit/(loss) before tax"],
+    "tax":              ["tax expense", "income tax expense", "current tax"],
+    "pat_total":        ["profit after tax", "profit/(loss) after tax", "net profit after tax", "profit for the period", "profit for the quarter"],
+    "pat_owners":       ["profit attributable to owners", "attributable to owners", "attributable to equity holders", "owners of the company", "owners of the parent"],
+    "pat_minority":     ["non-controlling interest", "minority interest", "attributable to non-controlling"],
+    "eps_basic":        ["basic eps", "basic earnings per share", "earnings per share - basic"],
+    "eps_diluted":      ["diluted eps", "diluted earnings per share", "earnings per share - diluted"],
+}
+
+# Ratios section row labels
+_RATIO_ROW_MAP = {
+    "debt_service_coverage":     ["debt service coverage"],
+    "interest_coverage":         ["interest service coverage", "interest coverage"],
+    "debt_equity":               ["debt equity ratio", "debt-equity ratio", "d/e ratio"],
+    "current_ratio":             ["current ratio"],
+    "long_term_debt_wc":         ["long-term debt to working capital", "long term debt to working capital"],
+    "current_liability_ratio":   ["current liability ratio"],
+    "total_debt_to_assets":      ["total debts to total assets", "total debt to total assets"],
+    "debtors_turnover":          ["debtors turnover", "trade receivables turnover"],
+    "inventory_turnover":        ["inventory turnover"],
+    "operating_margin":          ["operating profit margin", "operating margin"],
+    "net_profit_margin":         ["net profit margin", "net margin"],
+    "return_on_equity":          ["return on equity", "return on net worth"],
+    "return_on_assets":          ["return on assets", "return on total assets"],
+    "return_on_capital":         ["return on capital employed", "roce"],
+}
+
+# Segment EBITDA section
+_SEGMENT_KEYWORDS = ["segment", "ebitda", "segment result", "profit from segment"]
+
+# Balance sheet rows
+_BS_ROW_MAP = {
+    "total_assets":     ["total assets"],
+    "total_equity":     ["total equity", "equity attributable", "shareholders equity", "total equity and liabilities"],
+    "net_worth":        ["net worth", "shareholders' funds", "total equity"],
+    "total_borrowings": ["total borrowings", "borrowings", "long-term borrowings", "short-term borrowings"],
+    "total_liabilities":["total liabilities", "total equity and liabilities"],
+}
+
+
+def _clean_num(val: str) -> str:
+    """Clean a cell value — strip whitespace, handle parentheses as negative."""
+    if not val:
+        return ""
+    v = str(val).strip().replace(",", "").replace(" ", "")
+    if v.startswith("(") and v.endswith(")"):
+        v = "-" + v[1:-1]
+    return v
+
+
+def _parse_float(val: str):
+    """Parse a cell value to float, return None if unparseable."""
+    v = _clean_num(val)
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _match_row_label(label: str, patterns: list) -> bool:
+    """Check if a row label matches any of the given patterns (case-insensitive)."""
+    label_lower = label.lower().strip()
+    return any(p in label_lower for p in patterns)
+
+
+def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
+    """
+    Deterministically extract all key financial numbers from the filing.
+    Returns a structured dict with:
+      - company_name
+      - currency
+      - period (current quarter label)
+      - prior_period (YoY comparison label)
+      - pl: income statement rows  {key: {"current": val, "prior": val, "source": "Page X, Row Y"}}
+      - ratios: ratio rows         {key: {"current": val, "prior": val, "source": "Page X, Row Y"}}
+      - segments: segment data     {name: {"ebitda": val, "source": "Page X"}}
+      - balance_sheet: BS rows     {key: {"current": val, "source": "Page X"}}
+      - is_quarterly: bool
+      - filing_type: str
+    """
+    import pdfplumber
+
+    result = {
+        "company_name": "",
+        "currency": "INR Crores",
+        "period": "",
+        "prior_period": "",
+        "pl": {},
+        "ratios": {},
+        "segments": {},
+        "balance_sheet": {},
+        "is_quarterly": True,
+        "filing_type": "Quarterly",
+        "extraction_log": [],
+    }
+
+    log = result["extraction_log"]
+
+    try:
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            all_pages_text = ""
+            page_tables = {}  # page_idx -> list of tables
+
+            for page_idx in page_indices:
+                if page_idx >= len(pdf.pages):
+                    continue
+                page = pdf.pages[page_idx]
+                raw_text = page.extract_text() or ""
+                all_pages_text += "\n" + raw_text
+
+                # Extract tables per page
+                tables = page.extract_tables() or []
+                page_tables[page_idx] = tables
+
+            # ── Currency detection ──────────────────────────────────────────
+            result["currency"] = _detect_currency_unit(all_pages_text)
+
+            # ── Company name ────────────────────────────────────────────────
+            result["company_name"] = _extract_company_name_v2(all_pages_text)
+
+            # ── Filing type detection ───────────────────────────────────────
+            text_lower = all_pages_text.lower()
+            if any(x in text_lower for x in ["annual report", "year ended 31st march", "full year"]):
+                result["is_quarterly"] = False
+                result["filing_type"] = "Annual"
+            elif any(x in text_lower for x in ["nine months", "half year", "six months"]):
+                result["is_quarterly"] = True
+                result["filing_type"] = "Quarterly (YTD)"
+
+            # ── Scan all tables for P&L, Ratios, Segments, Balance Sheet ───
+            col_headers = []
+            current_col = 1
+            prior_yr_col = None
+            in_ratios_section = False
+            in_segment_section = False
+            in_pl_section = False
+            in_bs_section = False
+
+            for page_idx, tables in page_tables.items():
+                page_num = page_idx + 1
+                for table_idx, table in enumerate(tables):
+                    for row_idx, row in enumerate(table):
+                        if not row or not any(row):
+                            continue
+                        cleaned = [str(c).strip().replace("\n", " ") if c else "" for c in row]
+                        label = cleaned[0] if cleaned else ""
+                        label_lower = label.lower()
+
+                        # ── Detect column headers ──────────────────────────
+                        detected = _parse_period_header(cleaned)
+                        if detected:
+                            col_headers = detected
+                            current_col = 1
+                            prior_yr_col = None
+                            # Find same-quarter prior year column
+                            if len(col_headers) > 1:
+                                cur_label = col_headers[1].lower()
+                                month_match = re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', cur_label)
+                                cur_month = month_match.group(1) if month_match else ""
+                                for ci in range(2, len(col_headers)):
+                                    lbl = col_headers[ci].lower()
+                                    if cur_month and cur_month in lbl and ci != current_col:
+                                        prior_yr_col = ci
+                                        break
+                                if prior_yr_col is None and len(col_headers) > 3:
+                                    prior_yr_col = 3
+                            if col_headers and len(col_headers) > 1:
+                                result["period"] = col_headers[current_col]
+                            if col_headers and prior_yr_col and len(col_headers) > prior_yr_col:
+                                result["prior_period"] = col_headers[prior_yr_col]
+                            continue
+
+                        # ── Section detection ──────────────────────────────
+                        if any(x in label_lower for x in ["ratio", "ratios"]) and len(label) < 40:
+                            in_ratios_section = True
+                            in_segment_section = False
+                            in_pl_section = False
+                            in_bs_section = False
+                            continue
+                        if any(x in label_lower for x in ["segment information", "segment revenue", "segment result"]):
+                            in_segment_section = True
+                            in_ratios_section = False
+                            in_pl_section = False
+                            in_bs_section = False
+                            continue
+                        if any(x in label_lower for x in ["balance sheet", "assets and liabilities"]):
+                            in_bs_section = True
+                            in_ratios_section = False
+                            in_segment_section = False
+                            in_pl_section = False
+                            continue
+                        if any(x in label_lower for x in ["financial results", "profit and loss", "income statement", "statement of profit"]):
+                            in_pl_section = True
+                            in_ratios_section = False
+                            in_segment_section = False
+                            in_bs_section = False
+                            continue
+
+                        # ── Extract cell values ────────────────────────────
+                        def get_val(col_idx):
+                            if col_idx is not None and col_idx < len(cleaned):
+                                v = cleaned[col_idx]
+                                if v and v not in ("", "-", "—", "None", "nil", "Nil"):
+                                    return v
+                            return None
+
+                        cur_val = get_val(current_col)
+                        prior_val = get_val(prior_yr_col)
+                        source = f"Page {page_num}, Table {table_idx+1}, Row {row_idx+1}"
+
+                        # ── P&L extraction ─────────────────────────────────
+                        for key, patterns in _PL_ROW_MAP.items():
+                            if key not in result["pl"] and _match_row_label(label, patterns):
+                                if cur_val:
+                                    result["pl"][key] = {
+                                        "current": _clean_num(cur_val),
+                                        "prior": _clean_num(prior_val) if prior_val else "",
+                                        "label": label.strip(),
+                                        "source": source,
+                                    }
+                                    log.append(f"✓ P&L [{key}] = {cur_val} (from {source})")
+                                break
+
+                        # ── Ratios extraction ──────────────────────────────
+                        if in_ratios_section or any(x in label_lower for x in ["debt equity", "current ratio", "interest coverage", "net profit margin", "operating margin", "return on equity"]):
+                            for key, patterns in _RATIO_ROW_MAP.items():
+                                if key not in result["ratios"] and _match_row_label(label, patterns):
+                                    # Ratios table: value is usually col 1 or 2
+                                    ratio_val = get_val(1) or get_val(2) or get_val(current_col)
+                                    prior_ratio = get_val(2) or get_val(prior_yr_col)
+                                    if ratio_val:
+                                        result["ratios"][key] = {
+                                            "current": _clean_num(ratio_val),
+                                            "prior": _clean_num(prior_ratio) if prior_ratio else "",
+                                            "label": label.strip(),
+                                            "source": source,
+                                        }
+                                        log.append(f"✓ Ratio [{key}] = {ratio_val} (from {source})")
+                                    break
+
+                        # ── Segment extraction ─────────────────────────────
+                        if in_segment_section:
+                            seg_keywords = ["o2c", "oil & gas", "oil and gas", "retail", "digital services",
+                                           "jio", "media", "financial services", "chemicals", "energy",
+                                           "consumer", "enterprise", "technology", "services", "infrastructure",
+                                           "segment total", "total segment"]
+                            if any(x in label_lower for x in seg_keywords) and cur_val:
+                                result["segments"][label.strip()] = {
+                                    "ebitda": _clean_num(cur_val),
+                                    "prior": _clean_num(prior_val) if prior_val else "",
+                                    "source": source,
+                                }
+                                log.append(f"✓ Segment [{label}] = {cur_val} (from {source})")
+
+                        # ── Balance sheet extraction ───────────────────────
+                        if in_bs_section:
+                            for key, patterns in _BS_ROW_MAP.items():
+                                if key not in result["balance_sheet"] and _match_row_label(label, patterns):
+                                    if cur_val:
+                                        result["balance_sheet"][key] = {
+                                            "current": _clean_num(cur_val),
+                                            "source": source,
+                                        }
+                                        log.append(f"✓ BS [{key}] = {cur_val} (from {source})")
+                                    break
+
+    except Exception as e:
+        log.append(f"✗ Extraction error: {e}")
+        logger.warning(f"Deterministic extraction failed: {e}")
+
+    logger.info(f"Deterministic extraction: {len(result['pl'])} P&L rows, "
+                f"{len(result['ratios'])} ratios, {len(result['segments'])} segments")
+    return result
+
+
+def _build_verified_block(extracted: dict) -> str:
+    """
+    Build the VERIFIED DATA BLOCK from deterministically extracted numbers.
+    This block is placed at the top of every AI prompt.
+    Numbers here are sourced directly from the filing tables — AI must use them as ground truth.
+    """
+    currency = extracted.get("currency", "INR Crores")
+    pl = extracted.get("pl", {})
+    ratios = extracted.get("ratios", {})
+    segments = extracted.get("segments", {})
+    bs = extracted.get("balance_sheet", {})
+    company = extracted.get("company_name", "")
+    period = extracted.get("period", "")
+    prior = extracted.get("prior_period", "")
+    is_quarterly = extracted.get("is_quarterly", True)
+
+    def fmt(key, store, label=None):
+        if key in store:
+            d = store[key]
+            lbl = label or d.get("label", key)
+            cur = d.get("current", "")
+            pri = d.get("prior", "")
+            src = d.get("source", "")
+            line = f"  {lbl}: {cur} {currency}"
+            if pri:
+                line += f"  [Prior year same period: {pri}]"
+            if src:
+                line += f"  [SOURCE: {src}]"
+            return line
+        return f"  {label or key}: Not found in filing"
+
+    lines = [
+        "╔══════════════════════════════════════════════════════════════╗",
+        "║  VERIFIED FINANCIAL DATA — EXTRACTED DIRECTLY FROM FILING  ║",
+        "║  AI MUST USE THESE NUMBERS. DO NOT SUBSTITUTE OR RECALCULATE ║",
+        "╚══════════════════════════════════════════════════════════════╝",
+        "",
+    ]
+
+    if company:
+        lines.append(f"COMPANY: {company}")
+    if period:
+        lines.append(f"CURRENT PERIOD: {period}   COMPARISON PERIOD: {prior}")
+    lines.append(f"CURRENCY: All values in {currency}")
+    lines.append(f"FILING TYPE: {extracted.get('filing_type', 'Quarterly')}")
+    lines.append("")
+
+    lines.append("━━━ INCOME STATEMENT (from P&L table) ━━━")
+    lines.append(fmt("revenue",        pl, "Revenue from Operations"))
+    lines.append(fmt("total_income",   pl, "Total Income"))
+    lines.append(fmt("other_income",   pl, "Other Income"))
+    lines.append(fmt("total_expenses", pl, "Total Expenses"))
+    lines.append(fmt("depreciation",   pl, "Depreciation & Amortisation"))
+    lines.append(fmt("finance_costs",  pl, "Finance Costs"))
+    lines.append(fmt("pbt",            pl, "Profit Before Tax"))
+    lines.append(fmt("pat_total",      pl, "PAT (Total incl. Minority)"))
+    lines.append(fmt("pat_owners",     pl, "PAT Attributable to Owners ← USE THIS AS NET PROFIT"))
+    lines.append(fmt("pat_minority",   pl, "PAT Attributable to Minority"))
+    lines.append(fmt("eps_basic",      pl, "Basic EPS"))
+    lines.append(fmt("eps_diluted",    pl, "Diluted EPS"))
+    lines.append("")
+
+    lines.append("━━━ RATIOS (as printed in filing — DO NOT RECALCULATE) ━━━")
+    lines.append(fmt("debt_equity",        ratios, "Debt to Equity Ratio"))
+    lines.append(fmt("current_ratio",      ratios, "Current Ratio"))
+    lines.append(fmt("interest_coverage",  ratios, "Interest Coverage Ratio"))
+    lines.append(fmt("operating_margin",   ratios, "Operating Margin %"))
+    lines.append(fmt("net_profit_margin",  ratios, "Net Profit Margin %"))
+    lines.append(fmt("return_on_equity",   ratios, "Return on Equity %"))
+    lines.append(fmt("return_on_assets",   ratios, "Return on Assets %"))
+    lines.append(fmt("debt_service_coverage", ratios, "Debt Service Coverage"))
+    lines.append(fmt("debtors_turnover",   ratios, "Debtors Turnover"))
+    lines.append(fmt("inventory_turnover", ratios, "Inventory Turnover"))
+    lines.append("")
+
+    if bs:
+        lines.append("━━━ BALANCE SHEET ━━━")
+        lines.append(fmt("total_assets",     bs, "Total Assets"))
+        lines.append(fmt("net_worth",        bs, "Net Worth / Equity"))
+        lines.append(fmt("total_borrowings", bs, "Total Borrowings"))
+        lines.append("")
+
+    if segments:
+        lines.append("━━━ SEGMENT EBITDA ━━━")
+        for seg_name, seg_data in segments.items():
+            src = seg_data.get("source", "")
+            cur = seg_data.get("ebitda", "")
+            pri = seg_data.get("prior", "")
+            line = f"  {seg_name}: {cur}"
+            if pri:
+                line += f"  [Prior: {pri}]"
+            if src:
+                line += f"  [SOURCE: {src}]"
+            lines.append(line)
+        lines.append("")
+
+    if is_quarterly:
+        lines.append("━━━ CASH FLOW ━━━")
+        lines.append("  QUARTERLY FILING — Cash Flow Statement NOT included in quarterly results.")
+        lines.append("  Set ALL cash flow fields to 'Not available in this filing'. Score Cash Flow = 9.")
+        lines.append("  DO NOT estimate or fabricate OCF, FCF, Capex from PAT or any other figure.")
+        lines.append("")
+
+    lines.append("━━━ AI INSTRUCTIONS ━━━")
+    lines.append("1. Every number in your response must come from this VERIFIED block above.")
+    lines.append("2. If a field is marked 'Not found in filing' → write 'Not available in this filing'.")
+    lines.append("3. NEVER use numbers from the auditor's review report text (subsidiary scope figures).")
+    lines.append("4. Net Profit = PAT Attributable to Owners (not total PAT including minority interest).")
+    lines.append("5. Ratios are already computed by the company — use them directly, never recalculate.")
+    lines.append("6. Your job is to WRITE COMMENTARY on these verified numbers, not find new ones.")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _extract_company_name_v2(text: str) -> str:
+    """Extract company name from top of filing text."""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    company_keywords = [
+        "limited", "ltd", "ltd.", "corporation", "industries", "technologies",
+        "bank", "finance", "energy", "infosys", "wipro", "tcs", "reliance",
+        "hdfc", "icici", "bharti", "airtel", "tata", "bajaj", "kotak",
+        "maruti", "itc", "hindustan", "ultratech", "nestle", "asian paints",
+        "axis", "sun pharma", "dr. reddy", "cipla", "hcl", "tech mahindra",
+        "power grid", "ntpc", "ongc", "coal india", "bharat",
+    ]
+    for line in lines[:40]:
+        clean = line.strip("*-–—|_ \t©®™")
+        if len(clean) < 5 or len(clean) > 100:
+            continue
+        words = clean.split()
+        if len(words) < 2:
+            continue
+        line_lower = clean.lower()
+        if any(kw in line_lower for kw in company_keywords):
+            if not any(w in line_lower for w in [
+                "quarter ended", "financial results", "pursuant to",
+                "regulation", "sebi", "stock exchange", "bse", "nse",
+                "page ", "generated by", "finsight"
+            ]):
+                return clean
+    return ""
+
+
 def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
     try:
         import pdfplumber
@@ -701,7 +1135,11 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
             structured_text = raw_result
             currency = _detect_currency_unit(raw_result)
 
+        company_name = _extract_company_name(structured_text)
+        company_line = f"[COMPANY NAME: {company_name}]\n" if company_name else ""
+
         header = (
+            company_line +
             f"\n[DOCUMENT CURRENCY UNIT: {currency}]\n"
             f"[ALL NUMBERS ARE IN {currency} — DO NOT CHANGE THIS UNIT]\n\n"
 
@@ -734,7 +1172,43 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
         return ""
 
 
+def _extract_company_name(text: str) -> str:
+    """Extract company name from the top of a BSE/NSE quarterly filing."""
+    import re
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    # Look in first 30 lines for company name patterns
+    skip_words = {"unaudited", "consolidated", "standalone", "financial", "results",
+                  "quarter", "ended", "statement", "limited", "bse", "nse", "page",
+                  "pursuant", "regulation", "sebi", "crore", "lakhs", "rs.", "inr"}
+    for line in lines[:30]:
+        # Lines in ALL CAPS or Title Case that look like company names
+        clean = line.strip("*-–—|_ \t")
+        if len(clean) < 5 or len(clean) > 80:
+            continue
+        words = clean.split()
+        if len(words) < 2:
+            continue
+        # Must contain "Limited" or "Ltd" or "Corporation" or "Industries" etc.
+        company_keywords = ["limited", "ltd", "corporation", "industries", "technologies",
+                            "bank", "finance", "energy", "infosys", "wipro", "tcs",
+                            "reliance", "hdfc", "icici", "bharti", "airtel", "tata"]
+        line_lower = clean.lower()
+        if any(kw in line_lower for kw in company_keywords):
+            # Filter out lines that are mostly metadata
+            if not any(w in line_lower for w in ["quarter ended", "financial results", "pursuant to"]):
+                return clean
+    return ""
+
+
 def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
+    """
+    Main entry point for PDF processing.
+    New architecture:
+      1. Deterministically extract all key numbers with source citations
+      2. Build a VERIFIED DATA BLOCK (ground truth for AI)
+      3. Append raw structured text as supporting context
+      4. AI only writes commentary — never finds new numbers
+    """
     # Guard: reject FinSight reports
     try:
         import pdfplumber as _plumber
@@ -782,7 +1256,40 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
             "Only write numbers explicitly visible. Mark unavailable fields as 'Not available'.]\n"
         )
 
-    final = (doc_type_hint + result)[:max_chars]
+    # ── STEP 1: Deterministic extraction ─────────────────────────────────────
+    extracted = _extract_deterministic(raw_bytes, page_indices)
+    verified_block = _build_verified_block(extracted)
+    logger.info(f"Verified block built: {len(extracted['pl'])} P&L rows, "
+                f"{len(extracted['ratios'])} ratios, company={extracted['company_name']}")
+
+    # ── STEP 2: Raw structured text (context only) ────────────────────────────
+    raw_text = _extract_with_pdfplumber(raw_bytes, page_indices)
+    if not raw_text.strip():
+        logger.info("Falling back to pypdf extraction")
+        reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+        raw_text = ""
+        for i in page_indices:
+            pt = reader.pages[i].extract_text() or ""
+            if pt.strip():
+                raw_text += f"\n--- PAGE {i+1} ---\n{pt}\n"
+
+    is_partial = (
+        "newspaper" in raw_text.lower() or
+        "business standard" in raw_text.lower() or
+        len(raw_text) < 3000
+    )
+    partial_note = (
+        "\n[NOTE: PARTIAL FILING — only use numbers from VERIFIED block above.]\n"
+        if is_partial else ""
+    )
+
+    context_section = (
+        "\n\n━━━ SUPPORTING DOCUMENT TEXT (context only — use VERIFIED block above for all numbers) ━━━\n"
+        + partial_note
+        + raw_text
+    )
+
+    final = (verified_block + context_section)[:max_chars]
     logger.info(f"Final snippet: {len(final):,} chars")
     return final
 
@@ -892,6 +1399,16 @@ RULE 7 — EVERY FIELD NEEDS REAL NUMBERS:
 "Strong performance" without a number = REJECTED.
 "Revenue grew 10.5% to ₹2,69,496 Cr vs ₹2,43,865 Cr YoY" = ACCEPTED.
 
+RULE 8 — CASH FLOW: Indian quarterly filings (Q1/Q2/Q3/Q4) DO NOT include Cash Flow Statements.
+Cash Flow Statements only appear in Annual Reports (full year filings).
+If this is a quarterly filing: set operating_cf, investing_cf, financing_cf, free_cash_flow, capex ALL to "Not available in this filing".
+DO NOT fabricate or estimate cash flow numbers. DO NOT use PAT as a proxy for OCF.
+The Cash Flow score should be set to 9 (neutral/average) when cash flow data is unavailable.
+
+RULE 9 — COMPANY NAME: Extract the company name from the document header or title page.
+Look for lines like "RELIANCE INDUSTRIES LIMITED" or "Infosys Limited" near the top.
+Set company_name to the exact company name found. Never set it to "Not available in this filing".
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SCORING FRAMEWORK:
@@ -899,7 +1416,7 @@ Profitability (max 20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=1
 Growth (max 15): Rev>20% AND Profit>25%=15 | Rev 10-20% AND Profit 10-25%=9 | else=4
 Balance Sheet (max 15): D/E<0.5=15 | D/E 0.5-1.5=9 | D/E>1.5=3
 Liquidity (max 10): CR>1.5=10 | CR 1.0-1.5=6 | CR<1.0=2
-Cash Flow (max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3
+Cash Flow (max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3 | Not available in quarterly filing=9
 Governance (max 15): Clean audit=15 | Minor issues=9 | Major=3
 Industry (max 10): Leader=10 | Average=6 | Lagging=2
 health_label: >=80=Excellent | 60-79=Good | 40-59=Fair | 20-39=Poor | <20=Critical
@@ -1030,11 +1547,14 @@ CRITICAL RULES:
    These are NOT consolidated figures. Only use numbers from the actual P&L table rows.
 2. CURRENCY: Use [DOCUMENT CURRENCY UNIT] from header. If Crores, ALL values are Crores.
 3. STATED RATIOS: Use D/E, Current Ratio exactly as printed in the Ratios section.
-4. NO ESTIMATES: Write "Not available" not guesses.
+4. NO ESTIMATES: Write "Not available in this filing" not guesses.
 5. CONSOLIDATED ONLY: Ignore standalone figures if consolidated data present.
 6. NUMBERS IN EVERY FIELD: No vague statements.
+7. CASH FLOW: Quarterly filings DO NOT contain Cash Flow Statements. If this is a quarterly filing,
+   set ALL cash flow fields to "Not available in this filing". Score Cash Flow as 9. Do NOT fabricate OCF.
+8. COMPANY NAME: Extract from [COMPANY NAME: ...] tag in header, or from the document title. Never leave blank.
 
-SCORING: Profitability(20): ROE>20%+Margin>15%=20|12-20%=12|else=5 | Growth(15): Rev>20%+Profit>25%=15|10-20%=9|else=4 | BalanceSheet(15): D/E<0.5=15|0.5-1.5=9|>1.5=3 | Liquidity(10): CR>1.5=10|1-1.5=6|<1=2 | CashFlow(15): OCF>PAT=15|~PAT=9|<PAT=3 | Governance(15): Clean=15|Minor=9|Major=3 | Industry(10): Leader=10|Avg=6|Lag=2
+SCORING: Profitability(20): ROE>20%+Margin>15%=20|12-20%=12|else=5 | Growth(15): Rev>20%+Profit>25%=15|10-20%=9|else=4 | BalanceSheet(15): D/E<0.5=15|0.5-1.5=9|>1.5=3 | Liquidity(10): CR>1.5=10|1-1.5=6|<1=2 | CashFlow(15): OCF>PAT=15|~PAT=9|<PAT=3|NotAvailable=9 | Governance(15): Clean=15|Minor=9|Major=3 | Industry(10): Leader=10|Avg=6|Lag=2
 health_label: >=80=Excellent|60-79=Good|40-59=Fair|20-39=Poor|<20=Critical
 investment_label: Strong Buy/Buy/Hold/Reduce/Avoid
 
