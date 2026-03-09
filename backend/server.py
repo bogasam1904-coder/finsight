@@ -1600,6 +1600,45 @@ def _normalize_result(result: dict) -> dict:
                 for c in components if isinstance(c, dict)
             ]
 
+    # Normalize cash_flow_deep_dive — shorten cash_conversion_quality for color logic
+    cfd = result.get("cash_flow_deep_dive", {})
+    if isinstance(cfd, dict):
+        ccq = cfd.get("cash_conversion_quality", "")
+        if isinstance(ccq, str):
+            ccq_lower = ccq.lower()
+            if "strong" in ccq_lower:
+                cfd["cash_conversion_quality_label"] = "Strong"
+            elif "moderate" in ccq_lower:
+                cfd["cash_conversion_quality_label"] = "Moderate"
+            elif "weak" in ccq_lower:
+                cfd["cash_conversion_quality_label"] = "Weak"
+            else:
+                cfd["cash_conversion_quality_label"] = ""
+        result["cash_flow_deep_dive"] = cfd
+
+    # ── Auto-fix health_score and health_score_breakdown.total if AI left them 0 ──
+    hsd_fix = result.get("health_score_breakdown", {})
+    components = hsd_fix.get("components", [])
+    if components:
+        computed_total = sum(
+            int(c.get("score", 0)) for c in components if isinstance(c, dict)
+        )
+        if computed_total > 0:
+            # Always trust sum of components over AI-provided total/health_score
+            hsd_fix["total"] = computed_total
+            result["health_score_breakdown"] = hsd_fix
+            # Only override health_score if it's 0 or missing
+            if not result.get("health_score"):
+                result["health_score"] = computed_total
+            # Fix health_label if missing or mismatched
+            hs = result["health_score"]
+            if not result.get("health_label") or result["health_label"] in ("", "N/A"):
+                if hs >= 80:   result["health_label"] = "Excellent"
+                elif hs >= 65: result["health_label"] = "Good"
+                elif hs >= 45: result["health_label"] = "Fair"
+                elif hs >= 25: result["health_label"] = "Poor"
+                else:          result["health_label"] = "Critical"
+
     # Safe defaults for every field the frontend may access
     result.setdefault("company_name", "")
     result.setdefault("statement_type", "")
@@ -2604,6 +2643,7 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
         "symbol": symbol.upper(), "url": url, "consolidated": consolidated,
         "company_name": "", "ratios": {},
         "quarterly_results": [], "annual_results": [], "balance_sheet": [],
+        "cash_flow_data": [],
         "raw_text": "",
     }
 
@@ -2641,7 +2681,8 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
     # Parse financial table sections
     for section_id, target in [("quarters", "quarterly_results"),
                                 ("profit-loss", "annual_results"),
-                                ("balance-sheet", "balance_sheet")]:
+                                ("balance-sheet", "balance_sheet"),
+                                ("cash-flow", "cash_flow_data")]:
         section_html = _extract_section(html, section_id)
         if section_html:
             result[target] = _parse_screener_table(section_html)
@@ -2658,7 +2699,7 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
     result["raw_text"] = _screener_to_text(result)
     logger.info(
         f"Screener.in {symbol}: qtr={len(result['quarterly_results'])}, "
-        f"annual={len(result['annual_results'])}, ratios={list(result['ratios'].keys())}"
+        f"annual={len(result['annual_results'])}, cf={len(result['cash_flow_data'])}, ratios={list(result['ratios'].keys())}"
     )
     return result
 
@@ -2870,6 +2911,45 @@ def _screener_to_text(data: dict) -> str:
         if hdrs:
             L.append("  Years: " + " | ".join(hdrs))
         for row in data["balance_sheet"]:
+            L.append(f"  {row['label']}: {' | '.join(row['values'])}")
+        L.append("")
+
+    if data.get("cash_flow_data"):
+        cf_rows = data["cash_flow_data"]
+        hdrs = cf_rows[0].get("headers", []) if cf_rows else []
+        # Pin latest year values
+        period_hdrs = hdrs[1:] if hdrs else []
+        if period_hdrs and "ttm" in period_hdrs[-1].lower():
+            period_hdrs = period_hdrs[:-1]
+        latest_idx = len(period_hdrs) - 1
+        prior_idx  = latest_idx - 1 if latest_idx >= 1 else None
+        latest_yr  = period_hdrs[latest_idx] if latest_idx >= 0 else "Latest Year"
+        prior_yr   = period_hdrs[prior_idx]  if prior_idx is not None else "Prior Year"
+
+        L.append(f"╔══════════════════════════════════════════════════╗")
+        L.append(f"║  CASH FLOW STATEMENT — {latest_yr:<26} ║")
+        L.append(f"╚══════════════════════════════════════════════════╝")
+        L.append(f"  [Latest Year: {latest_yr}  |  Prior Year: {prior_yr}]")
+        L.append(f"  [AI INSTRUCTION: Use OCF, Investing CF, Financing CF for cash flow analysis.]")
+        L.append(f"  [Compute FCF = Cash from Operating - abs(Capex from Investing)]")
+        L.append(f"  [Compute OCF/PAT ratio for earnings quality assessment.]")
+        L.append("")
+
+        for row in cf_rows:
+            vals = row["values"]
+            cur_val  = vals[latest_idx] if latest_idx < len(vals) else ""
+            pri_val  = vals[prior_idx]  if prior_idx is not None and prior_idx < len(vals) else ""
+            if cur_val and cur_val not in ("-", ""):
+                line = f"  {row['label']}: {cur_val}"
+                if pri_val and pri_val not in ("-", ""):
+                    line += f"  [Prior year: {pri_val}]"
+                L.append(line)
+        L.append("")
+
+        L.append("--- FULL CASH FLOW TREND ---")
+        if hdrs:
+            L.append("  " + " | ".join(hdrs))
+        for row in cf_rows:
             L.append(f"  {row['label']}: {' | '.join(row['values'])}")
         L.append("")
 
