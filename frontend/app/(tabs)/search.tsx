@@ -46,6 +46,7 @@ export default function SearchTab() {
   const [filings, setFilings] = useState<any[]>([]);
   const [loadingFilings, setLoadingFilings] = useState(false);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [screenerAnalyzing, setScreenerAnalyzing] = useState(false);
   const [notFound, setNotFound] = useState(false);
   const debounceRef = useRef<any>(null);
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -141,6 +142,28 @@ export default function SearchTab() {
     } finally { setAnalyzingId(null); }
   };
 
+  const analyzeFromScreener = async (company: any) => {
+    setScreenerAnalyzing(true);
+    try {
+      const token = await AsyncStorage.getItem('token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const res = await fetch(`${BACKEND}/api/analyze-from-screener`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ symbol: company.symbol, consolidated: true }),
+      });
+      const data = await res.json();
+      if (data.status === 'completed' && data.analysis_id) {
+        router.push(`/analysis/${data.analysis_id}`);
+      } else {
+        throw new Error(data.message || 'Screener analysis failed');
+      }
+    } catch (e: any) {
+      Alert.alert('Analysis Failed', e.message || 'Could not fetch data from Screener.in. Try analysing a PDF instead.');
+    } finally { setScreenerAnalyzing(false); }
+  };
+
   const displayCompanies = query.trim() ? companies : popular;
   const sc = (sector: string) => SECTOR_COLORS[sector] || '#4F8AFF';
 
@@ -229,6 +252,28 @@ export default function SearchTab() {
                     {/* Filings expanded panel */}
                     {isSelected && (
                       <View style={s.filingsPanel}>
+                        {/* ── Screener.in Quick Analyse ── */}
+                        <TouchableOpacity
+                          style={[s.screenerBtn, screenerAnalyzing && { opacity: 0.7 }]}
+                          onPress={() => analyzeFromScreener(company)}
+                          disabled={screenerAnalyzing || analyzingId !== null}
+                        >
+                          {screenerAnalyzing ? (
+                            <View style={s.screenerBtnInner}>
+                              <ActivityIndicator size="small" color="#fff" />
+                              <Text style={s.screenerBtnText}>Fetching live data...</Text>
+                            </View>
+                          ) : (
+                            <View style={s.screenerBtnInner}>
+                              <Text style={s.screenerBtnIcon}>⚡</Text>
+                              <View>
+                                <Text style={s.screenerBtnText}>Quick Analyse — Latest Results</Text>
+                                <Text style={s.screenerBtnSub}>Live data from Screener.in · No PDF needed</Text>
+                              </View>
+                            </View>
+                          )}
+                        </TouchableOpacity>
+
                         {loadingFilings ? (
                           <View style={s.filingsLoading}>
                             <ActivityIndicator color="#4F8AFF" />
@@ -239,9 +284,9 @@ export default function SearchTab() {
                         ) : filings.length === 0 ? (
                           <View style={s.filingsEmpty}>
                             <Text style={s.filingsEmptyIcon}>📭</Text>
-                            <Text style={s.filingsEmptyTitle}>No filings found</Text>
+                            <Text style={s.filingsEmptyTitle}>No PDF filings found</Text>
                             <Text style={s.filingsEmptyText}>
-                              NSE/BSE didn't return filings for {company.symbol} right now. Try again or upload a PDF manually.
+                              Use Quick Analyse above, or upload a PDF manually.
                             </Text>
                           </View>
                         ) : (
@@ -414,4 +459,9 @@ const s = StyleSheet.create({
   howStepInfo: { flex: 1 },
   howStepTitle: { color: '#fff', fontSize: 14, fontWeight: '700', marginBottom: 2 },
   howStepDesc: { color: 'rgba(255,255,255,0.35)', fontSize: 12, lineHeight: 18 },
+  screenerBtn: { backgroundColor: '#1a2f1a', borderRadius: 14, padding: 14, marginBottom: 14, borderWidth: 1.5, borderColor: '#22c55e40' },
+  screenerBtnInner: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  screenerBtnIcon: { fontSize: 22, width: 36, height: 36, textAlign: 'center', lineHeight: 36, backgroundColor: 'rgba(34,197,94,0.15)', borderRadius: 10 },
+  screenerBtnText: { color: '#22c55e', fontSize: 14, fontWeight: '800' },
+  screenerBtnSub: { color: 'rgba(34,197,94,0.55)', fontSize: 11, marginTop: 2 },
 });

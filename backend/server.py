@@ -379,6 +379,184 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
     return []
 
 
+
+# ─── SCREENER.IN INTEGRATION ─────────────────────────────────────────────────
+# Fetches clean structured financials from screener.in as an alternative to
+# unreliable PDF extraction. This is the preferred data source when users
+# supply a company symbol rather than uploading a PDF.
+
+SCREENER_HEADERS = {
+    **BROWSER_HEADERS,
+    "Referer": "https://www.screener.in/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
+    """Fetch financial data from Screener.in for a given NSE/BSE symbol."""
+    url_type = "consolidated" if consolidated else "standalone"
+    url = f"https://www.screener.in/company/{symbol.upper()}/{url_type}/"
+    logger.info(f"Fetching Screener.in: {url}")
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(url, headers=SCREENER_HEADERS)
+            if r.status_code == 404 and consolidated:
+                # Fall back to standalone
+                url = f"https://www.screener.in/company/{symbol.upper()}/"
+                r = await c.get(url, headers=SCREENER_HEADERS)
+            if r.status_code != 200:
+                raise Exception(f"Screener.in returned HTTP {r.status_code} for '{symbol}'")
+            html = r.text
+    except Exception as e:
+        raise Exception(f"Could not fetch Screener.in: {e}")
+
+    result = {
+        "symbol": symbol.upper(), "url": url, "consolidated": consolidated,
+        "company_name": "", "ratios": {},
+        "quarterly_results": [], "annual_results": [], "balance_sheet": [],
+        "raw_text": "",
+    }
+
+    # Company name
+    name_m = re.search(r'<h1[^>]*class="[^"]*company-name[^"]*"[^>]*>(.*?)</h1>', html, re.S)
+    if not name_m:
+        name_m = re.search(r'<title>(.*?)(?:\s*[-|].*)?</title>', html)
+    if name_m:
+        result["company_name"] = re.sub(r'<[^>]+>', '', name_m.group(1)).strip()
+
+    # Key ratios from top bar
+    ratio_defs = {
+        "market_cap":     r'Market Cap[^<]*</span>[^<]*<span[^>]*>\s*([\d,\.]+)',
+        "pe_ratio":       r'Stock P/E[^<]*</span>[^<]*<span[^>]*>\s*([\d,\.]+)',
+        "book_value":     r'Book Value[^<]*</span>[^<]*<span[^>]*>\s*([\d,\.]+)',
+        "dividend_yield": r'Dividend Yield[^<]*</span>[^<]*<span[^>]*>\s*([\d,\.]+)',
+        "roce":           r'ROCE[^<]*</span>[^<]*<span[^>]*>\s*([\d,\.]+)',
+        "roe":            r'ROE[^<]*</span>[^<]*<span[^>]*>\s*([\d,\.]+)',
+    }
+    for key, pat in ratio_defs.items():
+        m = re.search(pat, html, re.S)
+        if m:
+            result["ratios"][key] = m.group(1).strip().replace(",", "")
+
+    # Parse all financial table sections
+    for section_id, target in [("quarters", "quarterly_results"),
+                                ("profit-loss", "annual_results"),
+                                ("balance-sheet", "balance_sheet")]:
+        sec = re.findall(f'<section[^>]*id="{section_id}"[^>]*>(.*?)</section>', html, re.S)
+        if sec:
+            result[target] = _parse_screener_table(sec[0])
+
+    result["raw_text"] = _screener_to_text(result)
+    logger.info(f"Screener.in done: {symbol} | qtr={len(result['quarterly_results'])} | annual={len(result['annual_results'])}")
+    return result
+
+
+def _parse_screener_table(html_section: str) -> list:
+    """Parse a Screener.in HTML table into list of {label, values, headers} dicts."""
+    rows = []
+    headers = []
+    for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', html_section, re.S):
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', tr, re.S)
+        cells = [re.sub(r'<[^>]+>', '', c).replace('\xa0', ' ').strip() for c in cells]
+        cells = [re.sub(r'\s+', ' ', c).strip() for c in cells]
+        if not cells or not any(cells):
+            continue
+        # Detect header row: empty first cell or starts with month abbreviation
+        if not cells[0] or re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b', cells[0].lower()):
+            headers = cells
+            continue
+        if cells[0] and any(cells[1:]):
+            rows.append({"label": cells[0], "values": cells[1:], "headers": headers})
+    return rows
+
+
+def _screener_to_text(data: dict) -> str:
+    """Build clean text block for AI analysis from Screener.in data."""
+    L = []
+    L.append(f"COMPANY: {data['company_name']}")
+    L.append(f"SOURCE: Screener.in ({'Consolidated' if data['consolidated'] else 'Standalone'}) — {data['url']}")
+    L.append("CURRENCY: INR Crores (unless stated)")
+    L.append("")
+    if data["ratios"]:
+        L.append("=== KEY RATIOS (live from Screener.in) ===")
+        for k, v in data["ratios"].items():
+            L.append(f"  {k.replace('_', ' ').title()}: {v}")
+        L.append("")
+    if data["quarterly_results"]:
+        L.append("=== QUARTERLY RESULTS (INR Cr) ===")
+        if data["quarterly_results"][0].get("headers"):
+            L.append("  Periods: " + " | ".join(data["quarterly_results"][0]["headers"]))
+        for row in data["quarterly_results"]:
+            L.append(f"  {row['label']}: {chr(124).join(row['values'])}")
+        L.append("")
+    if data["annual_results"]:
+        L.append("=== ANNUAL P&L (INR Cr) ===")
+        if data["annual_results"][0].get("headers"):
+            L.append("  Periods: " + " | ".join(data["annual_results"][0]["headers"]))
+        for row in data["annual_results"]:
+            L.append(f"  {row['label']}: {chr(124).join(row['values'])}")
+        L.append("")
+    if data["balance_sheet"]:
+        L.append("=== BALANCE SHEET (INR Cr) ===")
+        if data["balance_sheet"][0].get("headers"):
+            L.append("  Periods: " + " | ".join(data["balance_sheet"][0]["headers"]))
+        for row in data["balance_sheet"]:
+            L.append(f"  {row['label']}: {chr(124).join(row['values'])}")
+        L.append("")
+    return "\n".join(L)
+
+
+class ScreenerAnalyzeRequest(BaseModel):
+    symbol: str
+    consolidated: bool = True
+
+
+@app.post("/api/analyze-from-screener")
+async def analyze_from_screener(req: ScreenerAnalyzeRequest, user=Depends(get_optional_user)):
+    """
+    Analyze a company using Screener.in data instead of a PDF upload.
+    More reliable: no PDF font-encoding issues, always gets the latest results.
+    Frontend can call this with just a stock symbol (e.g. RELIANCE, TCS, INFY).
+    """
+    analysis_id = str(uuid.uuid4())
+    user_id = user["user_id"] if user else f"guest_{str(uuid.uuid4())[:8]}"
+    await analyses_col.insert_one({
+        "analysis_id": analysis_id, "user_id": user_id, "is_guest": user is None,
+        "filename": f"{req.symbol}_screener", "source": "screener",
+        "status": "processing", "created_at": datetime.utcnow().isoformat(), "result": None,
+    })
+    try:
+        data = await fetch_screener_data(req.symbol, req.consolidated)
+        if not data["raw_text"] or len(data["raw_text"].strip()) < 150:
+            raise Exception(f"Screener.in returned insufficient data for '{req.symbol}'.")
+        result = await run_analysis(data["raw_text"])
+        meta = {"company_name": data["company_name"], "url": data["url"], "ratios": data["ratios"]}
+        await analyses_col.update_one(
+            {"analysis_id": analysis_id},
+            {"$set": {"status": "completed", "result": result, "screener_meta": meta}},
+        )
+        return {"analysis_id": analysis_id, "status": "completed",
+                "result": result, "screener_meta": meta}
+    except Exception as e:
+        msg = str(e)
+        logger.error(f"Screener analysis error {analysis_id}: {msg}")
+        await analyses_col.update_one(
+            {"analysis_id": analysis_id}, {"$set": {"status": "failed", "message": msg}}
+        )
+        return {"analysis_id": analysis_id, "status": "failed", "message": msg}
+
+
+@app.get("/api/screener/{symbol}")
+async def get_screener_preview(symbol: str, consolidated: bool = True):
+    """Return raw Screener.in financial data for a symbol (no AI, useful for preview/debug)."""
+    try:
+        data = await fetch_screener_data(symbol, consolidated)
+        data.pop("raw_text", None)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # ─── PDF PAGE CLASSIFICATION ─────────────────────────────────────────────────
 
 # Pages in Indian quarterly filings that must be EXCLUDED from data extraction:
@@ -493,15 +671,6 @@ def _score_page_for_extraction(page_text: str) -> dict:
         (poison_hits >= 4 and table_hits < 3)
     )
 
-    # NEVER exclude pages that are the actual P&L table header — these are the real financials
-    is_actual_financial_table = (
-        "unaudited consolidated financial results for the quarter" in t or
-        "unaudited standalone financial results for the quarter" in t or
-        ("revenue from operations" in t and "profit before tax" in t and "profit after tax" in t)
-    )
-    if is_actual_financial_table:
-        is_auditor_narrative = False
-
     return {
         "poison_hits": poison_hits,
         "table_hits": table_hits,
@@ -550,11 +719,9 @@ def _select_financial_pages(raw_bytes: bytes) -> list:
             selected.add(i)
             logger.info(f"Page {i+1}: SELECTED (net_score={info['net_score']}, table_hits={info['table_hits']}, consol={info['consol_hits']})")
 
-    # Safety cap: limit to first 20 pages for large filings
-    # NOTE: Reliance and other large multi-subsidiary filings have auditor pages 1-9
-    # and actual P&L tables starting at page 10+. The old cap of 12 was too tight.
-    if total > 20:
-        selected = {i for i in selected if i < 20}
+    # Safety cap: limit to first 12 pages for large filings
+    if total > 12:
+        selected = {i for i in selected if i < 12}
 
     result = sorted(selected)
     logger.info(f"PDF: {total} pages, consolidated={has_consolidated}, selected: {[p+1 for p in result]}")
@@ -903,6 +1070,9 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
     result = {}
 
     # ── Pass 1: Row-by-row (label + values same line or lookahead) ────────────
+    # Indian quarterly filing column order: [Dec'25 | Sep'25 | Dec'24 | 9M FY26 | 9M FY25]
+    # _get_large_nums_with_fallback returns (current_qtr, sep_qtr, prior_yr_same_qtr)
+    # "prior" for YoY display = prior_yr (Dec'24), which is index 2 in the raw line
     all_patterns = PL_ORDERED + ATTR_ROWS + EPS_ROWS
     for i, line in enumerate(lines):
         ll = line.lower().strip()
@@ -911,20 +1081,25 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
                 continue
             if not any(p in ll for p in patterns):
                 continue
-            # Try same line, then next 2 lines
-            nums = _get_large_nums(line)
+            # Use fallback-aware extraction (detects font-corruption in col 1)
+            cur, sep_q, prior_yr = _get_large_nums_with_fallback(line)
             for offset in [1, 2]:
-                if nums:
+                if cur:
                     break
                 if i + offset < len(lines):
-                    nums = _get_large_nums(lines[i + offset])
-            if nums:
+                    cur, sep_q, prior_yr = _get_large_nums_with_fallback(lines[i + offset])
+            # If col-1 is still corrupted/empty, use sep_q (col-2) as best estimate
+            if not cur and sep_q:
+                cur = sep_q
+                log.append(f"[{key}] col-1 font-corrupted, falling back to col-2 @ P{page_num}L{i+1}")
+            if cur:
                 result[key] = {
-                    "current": nums[0],
-                    "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
+                    "current": cur,
+                    # Use prior_yr (same quarter last year) for meaningful YoY comparison
+                    "prior": prior_yr if prior_yr else sep_q,
                     "source": f"Page {page_num}, Line {i + 1} (row-by-row)",
                 }
-                log.append(f"[{key}] = {nums[0]} @ P{page_num}L{i+1} (row-by-row)")
+                log.append(f"[{key}] = {cur} @ P{page_num}L{i+1} (row-by-row)")
             break
 
     if len([k for k in result if k in dict(PL_ORDERED)]) >= 4:
@@ -958,7 +1133,9 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
             nums, val_idx = value_rows[pos]
             result_p2[key] = {
                 "current": nums[0],
-                "prior": nums[2] if len(nums) > 2 else "",
+                # nums layout: [Dec'25, Sep'25, Dec'24, 9M-cur, 9M-prior]
+                # Use Dec'24 (index 2) as prior for YoY comparison
+                "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
                 "source": f"Page {page_num}, Label L{label_idx+1}→Values L{val_idx+1} (col-first)",
             }
             log.append(f"[{key}] = {nums[0]} @ col-first L{label_idx+1}→{val_idx+1}")
@@ -1094,9 +1271,7 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                         break
 
     # ── Net Worth ─────────────────────────────────────────────────────────────
-    # Look in all available pages (not just P&L pages) since Net Worth / EPS
-    # appear on the ratios page as well. Take the FIRST (current quarter) value.
-    for page_idx in list(page_texts.keys()):
+    for page_idx in pl_pages:
         lines = page_texts[page_idx].split("\n")
         for i, line in enumerate(lines):
             ll = line.lower()
@@ -1107,15 +1282,12 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                     if i+offset < len(lines):
                         nums = _get_large_nums(lines[i+offset])
                 if nums:
-                    # nums[0] = current quarter, nums[1] = prior quarter, nums[2] = prior year
                     result["balance_sheet"]["net_worth"] = {
-                        "current": nums[0], "prior": nums[1] if len(nums) > 1 else "",
+                        "current": nums[0], "prior": nums[2] if len(nums)>2 else "",
                         "source": f"Page {page_idx+1}, Line {i+1}"
                     }
                     log.append(f"[net_worth] = {nums[0]}")
                     break
-        if "net_worth" in result["balance_sheet"]:
-            break
 
     # ── Ratios ────────────────────────────────────────────────────────────────
     RATIO_ROWS = [
@@ -1149,18 +1321,10 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                     continue
                 if any(p in ll for p in patterns):
                     nums = _extract_line_values(line)
-                    if not nums:
-                        # Try next line (column-first layout)
-                        for offset in [1, 2]:
-                            if i + offset < len(lines):
-                                nums = _extract_line_values(lines[i + offset])
-                                if nums:
-                                    break
                     if nums:
                         result["ratios"][key] = {
                             "current": nums[0],
-                            # nums[1] = prior quarter (Sep'25), nums[2] = prior year same quarter
-                            "prior": nums[1] if len(nums) > 1 else "",
+                            "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
                             "source": f"Page {page_idx+1}, Line {i+1}",
                         }
                         log.append(f"ratio [{key}] = {nums[0]}")
@@ -1264,14 +1428,11 @@ def _build_verified_block(extracted: dict) -> str:
     lines.append(fmt("depreciation",   pl, "Depreciation & Amortisation"))
     lines.append(fmt("finance_costs",  pl, "Finance Costs"))
     lines.append(fmt("pbt",            pl, "Profit Before Tax"))
-    lines.append(fmt("pat_total",      pl, "PAT (Total incl. Minority Interest)"))
-    lines.append(fmt("pat_owners",     pl, "PAT Attributable to Owners ← THIS IS NET PROFIT (use for Net Profit metric)"))
-    lines.append(fmt("pat_minority",   pl, "PAT Attributable to Non-Controlling Interest (minority only, NOT Net Profit)"))
+    lines.append(fmt("pat_total",      pl, "PAT (Total incl. Minority)"))
+    lines.append(fmt("pat_owners",     pl, "PAT Attributable to Owners ← USE THIS AS NET PROFIT"))
+    lines.append(fmt("pat_minority",   pl, "PAT Attributable to Minority"))
     lines.append(fmt("eps_basic",      pl, "Basic EPS"))
     lines.append(fmt("eps_diluted",    pl, "Diluted EPS"))
-    lines.append("")
-    lines.append("  ⚠ IMPORTANT: 'Net Profit' in key_metrics = PAT Attributable to Owners (pat_owners above).")
-    lines.append("  ⚠ DO NOT use PAT Total (which includes minority interest) as Net Profit.")
     lines.append("")
 
     lines.append("━━━ RATIOS (as printed in filing — DO NOT RECALCULATE) ━━━")
@@ -1296,8 +1457,6 @@ def _build_verified_block(extracted: dict) -> str:
 
     if segments:
         lines.append("━━━ SEGMENT EBITDA ━━━")
-        total_ebitda = 0.0
-        has_total = False
         for seg_name, seg_data in segments.items():
             src = seg_data.get("source", "")
             cur = seg_data.get("ebitda", "")
@@ -1308,13 +1467,6 @@ def _build_verified_block(extracted: dict) -> str:
             if src:
                 line += f"  [SOURCE: {src}]"
             lines.append(line)
-            try:
-                total_ebitda += float(str(cur).replace(",", ""))
-                has_total = True
-            except:
-                pass
-        if has_total and total_ebitda > 0:
-            lines.append(f"  TOTAL Segment EBITDA: {total_ebitda:,.0f}  ← USE THIS for EBITDA Margin calculation")
         lines.append("")
 
     if is_quarterly:
@@ -1331,12 +1483,6 @@ def _build_verified_block(extracted: dict) -> str:
     lines.append("4. Net Profit = PAT Attributable to Owners (not total PAT including minority interest).")
     lines.append("5. Ratios are already computed by the company — use them directly, never recalculate.")
     lines.append("6. Your job is to WRITE COMMENTARY on these verified numbers, not find new ones.")
-    lines.append("7. ROE: If 'Return on Equity %' is 'Not found in filing', write 'Not disclosed in filing'.")
-    lines.append("   DO NOT calculate ROE yourself. The filing may not publish it as a separate ratio.")
-    lines.append("8. EBITDA Margin = Total Segment EBITDA ÷ Gross Revenue from Operations × 100.")
-    lines.append("   Use only numbers from the SEGMENT EBITDA section above.")
-    lines.append("9. For key_metrics 'previous' field: use the PRIOR YEAR SAME PERIOD value (YoY comparison),")
-    lines.append("   not the prior quarter. This gives a meaningful growth comparison.")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("")
 
@@ -1680,17 +1826,10 @@ These are SUBSIDIARY-SCOPE figures cited for audit disclosure only — NOT the c
 
 RULE 2 — THE P&L TABLE:
 Find the table "UNAUDITED CONSOLIDATED FINANCIAL RESULTS FOR THE QUARTER / NINE MONTHS ENDED..."
-Column headers (left to right): 31st Dec'25 | 30th Sep'25 | 31st Dec'24 | 31st Dec'25 (9M) | 31st Dec'24 (9M) | Year Ended Mar'25
+Column headers: 31st Dec'25 | 30th Sep'25 | 31st Dec'24 | 31st Dec'25 (9M) | 31st Dec'24 (9M)
 The FIRST data column (31st Dec'25) = current quarter. Use this column for all current metrics.
-The SECOND data column (30th Sep'25) = previous quarter. Use for QoQ comparison.
-The THIRD data column (31st Dec'24) = same quarter prior year. Use for YoY comparison.
 Row names to find: "Revenue from Operations", "Profit Before Tax", "Profit After Tax", "Finance Costs", etc.
-The number in the cell at the intersection of the row and FIRST data column = the current quarter value.
-
-NOTE ON NET PROFIT: The filing shows TWO profit figures after PAT:
-  a) Net Profit attributable to Owners of the Company  ← USE THIS as "Net Profit"
-  b) Non-Controlling Interest  ← this is minority share, do NOT use as Net Profit
-For Reliance Q3 FY26: PAT Owners = ₹18,645 Cr, NOT ₹22,167 Cr (which includes minority)
+The number in the cell at the intersection of the row and current quarter column = the value.
 
 NOTE ON PDF RENDERING: Some PDFs have font encoding issues where a number in column 1 may appear
 garbled (e.g. "J,912" instead of "7,912", or "-Aoa,245:" instead of "2,93,829").
@@ -1702,16 +1841,6 @@ If the document begins with a [PRINTED RATIOS FROM FILING] block, those are the 
 from the filing's printed Ratios section. USE THOSE EXACT VALUES.
 Do NOT recalculate D/E, Current Ratio, Interest Coverage, Operating Margin, Net Profit Margin.
 The printed values are already correct — recalculation introduces errors.
-
-RULE 3b — ROE:
-If ROE is not in the printed ratios section, write "Not disclosed in this filing" — do NOT calculate it.
-The Reliance filing does NOT publish ROE as a standalone ratio row.
-
-RULE 3c — EBITDA MARGIN:
-EBITDA = Total Segment EBITDA (from the Segment Results table, labeled "Total Segment Profit before
-Interest, Tax and Depreciation"). Divide by Gross Revenue (Value of Sales & Services) × 100.
-For Reliance Q3 FY26: Total EBITDA = ₹50,355 Cr, Revenue = ₹2,93,829 Cr → EBITDA Margin ≈ 17.1%
-Do NOT use Net Profit Margin as EBITDA Margin — they are different metrics.
 
 RULE 4 — CONSOLIDATED ONLY:
 Use "UNAUDITED CONSOLIDATED" tables. Ignore standalone tables that appear later.
