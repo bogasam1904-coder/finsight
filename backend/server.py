@@ -381,14 +381,6 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
 
 # ─── PDF PAGE CLASSIFICATION ─────────────────────────────────────────────────
 
-# Pages in Indian quarterly filings that must be EXCLUDED from data extraction:
-# - Auditor review report pages: contain phrases like "total revenues of Rs. X crore"
-#   which are NARRATIVE references to subsidiary numbers, NOT the actual P&L totals.
-#   The AI consistently mistakes these auditor-quoted numbers for consolidated figures.
-# - Cover letter pages
-# - Ratio formula explanation pages
-# - Subsidiaries/JV/Associates list pages
-
 AUDITOR_POISON_PHRASES = [
     "total revenues of rs",
     "total revenues of ₹",
@@ -470,11 +462,6 @@ STANDALONE_MARKERS = [
 
 
 def _score_page_for_extraction(page_text: str) -> dict:
-    """
-    Returns a detailed score dict for a page.
-    Pages with high auditor_poison scores must be excluded.
-    Only pages with financial_table scores should be used.
-    """
     t = page_text.lower()
 
     poison_hits = sum(1 for p in AUDITOR_POISON_PHRASES if p in t)
@@ -482,8 +469,6 @@ def _score_page_for_extraction(page_text: str) -> dict:
     consol_hits = sum(1 for p in CONSOLIDATED_MARKERS if p in t)
     standalone_hits = sum(1 for p in STANDALONE_MARKERS if p in t)
 
-    # A page is "poisoned" if it has many auditor phrases and few actual table rows
-    # Key signal: auditor pages mention specific numbers in prose sentences
     is_auditor_narrative = (
         ("reflect total revenues" in t or "total revenues of rs" in t) or
         ("udin:" in t) or
@@ -504,12 +489,6 @@ def _score_page_for_extraction(page_text: str) -> dict:
 
 
 def _select_financial_pages(raw_bytes: bytes) -> list:
-    """
-    Select only pages containing actual financial tables.
-    CRITICAL: Exclude auditor review report pages which contain
-    narrative references to numbers (e.g. "total revenues of Rs. 3,04,299 crore")
-    that are NOT the consolidated P&L totals.
-    """
     reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
     total  = len(reader.pages)
 
@@ -526,22 +505,18 @@ def _select_financial_pages(raw_bytes: bytes) -> list:
     selected = set()
 
     for i, info in page_scores:
-        # ALWAYS skip auditor narrative pages — they poison AI with wrong numbers
         if info["is_auditor_narrative"]:
             logger.info(f"Page {i+1}: EXCLUDED (auditor narrative, poison_hits={info['poison_hits']})")
             continue
 
-        # Skip standalone when consolidated exists
         if has_consolidated and info["standalone_hits"] > 0 and info["consol_hits"] == 0:
             logger.info(f"Page {i+1}: EXCLUDED (standalone, consolidated exists)")
             continue
 
-        # Include pages with meaningful financial table content
         if info["net_score"] >= 3 or (info["table_hits"] >= 3 and not info["is_auditor_narrative"]):
             selected.add(i)
             logger.info(f"Page {i+1}: SELECTED (net_score={info['net_score']}, table_hits={info['table_hits']}, consol={info['consol_hits']})")
 
-    # Safety cap: BSE filings have auditor pages 1-9, real data from page 10
     if total > 20:
         selected = {i for i in selected if i < 20}
 
@@ -579,10 +554,6 @@ def _parse_period_header(row: list) -> list:
 
 
 def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> tuple:
-    """
-    Parse financial tables with column-aware extraction.
-    Returns (structured_text, currency).
-    """
     import pdfplumber
 
     result_sections = []
@@ -685,11 +656,7 @@ def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> tuple:
 
 
 # ─── DETERMINISTIC EXTRACTOR ─────────────────────────────────────────────────
-# Philosophy: AI does interpretation + writing. NOT data extraction.
-# Every number shown to a user must be traceable to a specific row/table in the filing.
-# If we can't find it deterministically → mark as "Not available" rather than let AI guess.
 
-# P&L row labels to look for (case-insensitive partial match)
 _PL_ROW_MAP = {
     "revenue":          ["revenue from operations", "net revenue", "total revenue", "revenue from operation"],
     "total_income":     ["total income"],
@@ -707,7 +674,6 @@ _PL_ROW_MAP = {
     "eps_diluted":      ["diluted eps", "diluted earnings per share", "earnings per share - diluted"],
 }
 
-# Ratios section row labels
 _RATIO_ROW_MAP = {
     "debt_service_coverage":     ["debt service coverage"],
     "interest_coverage":         ["interest service coverage", "interest coverage"],
@@ -725,10 +691,8 @@ _RATIO_ROW_MAP = {
     "return_on_capital":         ["return on capital employed", "roce"],
 }
 
-# Segment EBITDA section
 _SEGMENT_KEYWORDS = ["segment", "ebitda", "segment result", "profit from segment"]
 
-# Balance sheet rows
 _BS_ROW_MAP = {
     "total_assets":     ["total assets"],
     "total_equity":     ["total equity", "equity attributable", "shareholders equity", "total equity and liabilities"],
@@ -739,7 +703,6 @@ _BS_ROW_MAP = {
 
 
 def _clean_num(val: str) -> str:
-    """Clean a cell value — strip whitespace, handle parentheses as negative."""
     if not val:
         return ""
     v = str(val).strip().replace(",", "").replace(" ", "")
@@ -749,7 +712,6 @@ def _clean_num(val: str) -> str:
 
 
 def _parse_float(val: str):
-    """Parse a cell value to float, return None if unparseable."""
     v = _clean_num(val)
     try:
         return float(v)
@@ -758,13 +720,11 @@ def _parse_float(val: str):
 
 
 def _match_row_label(label: str, patterns: list) -> bool:
-    """Check if a row label matches any of the given patterns (case-insensitive)."""
     label_lower = label.lower().strip()
     return any(p in label_lower for p in patterns)
 
 
 def _extract_line_values(line: str) -> list:
-    """Extract all numeric values from a text line (handles Indian comma formatting & negatives)."""
     nums = re.findall(r'\([\d,]+(?:\.\d+)?\)|[\d,]+(?:\.\d+)?', line)
     result = []
     for n in nums:
@@ -775,7 +735,6 @@ def _extract_line_values(line: str) -> list:
 
 
 def _get_large_nums(line: str) -> list:
-    """Extract numbers > 100 (financial figures, not ratios)."""
     result = []
     for n in _extract_line_values(line):
         try:
@@ -787,29 +746,14 @@ def _get_large_nums(line: str) -> list:
 
 
 def _fix_font_encoded_number(s: str) -> str:
-    """
-    Fix font-encoding corruption common in BSE filing PDFs.
-    e.g. "J,912" -> "7,912"  (J is encoded as digit 7)
-         "22;1s1" -> "22,161" (semicolon for comma, s for 6)
-         "-Aoa,245:" -> likely garbage, return empty
-    """
-    # Replace known glyph substitutions
     s = s.replace(';', ',').replace('J', '7').replace('s', '6').replace('l', '1')
     s = s.strip(':').strip()
-    # If it still contains non-numeric chars (other than . , - () ), it's garbled
     if re.search(r'[A-Za-z]', s):
         return ''
     return s
 
 
 def _get_large_nums_with_fallback(line: str) -> tuple:
-    """
-    Extract large numbers from a line with sanity checking.
-    Returns (current_q_val, prior_q_val, sep_q_val).
-    current_q_val is empty if first column appears corrupted/fragmented.
-    Detects font-encoding corruption where first column is dramatically smaller
-    than second column (a telltale sign of partial/garbled extraction).
-    """
     tokens = re.findall(r'\([\d,;Jsl]+(?:\.\d+)?\)|[\d,;Jsl]+(?:\.\d+)?', line)
     clean_nums = []
     for t in tokens:
@@ -831,13 +775,11 @@ def _get_large_nums_with_fallback(line: str) -> tuple:
     sep_q   = clean_nums[1] if len(clean_nums) > 1 else ''
     prior   = clean_nums[2] if len(clean_nums) > 2 else ''
 
-    # Sanity check: if current is < 30% of sep_q on a large-value line, 
-    # it's likely a corrupted fragment (font encoding issue)
     if current and sep_q:
         try:
             c, s = abs(float(current)), abs(float(sep_q))
             if s > 1000 and c < s * 0.30:
-                return '', prior, sep_q  # current unreliable
+                return '', prior, sep_q
         except:
             pass
 
@@ -845,12 +787,6 @@ def _get_large_nums_with_fallback(line: str) -> tuple:
 
 
 def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
-    """
-    Extract P&L handling both row-by-row and font-encoding-corrupted layouts.
-    BSE filings often have font encoding issues in column 1 (current quarter).
-    Falls back to prior quarter (Sep'25) when current quarter column is unreadable.
-    """
-    # Ordered P&L rows as they appear in Indian quarterly filings
     PL_ORDERED = [
         ("gross_revenue",  ["value of sales & services", "value of sales and services"]),
         ("gst_recovered",  ["less: gst recovered", "less:gst"]),
@@ -873,7 +809,6 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
         ("pat_total",      ["profit after tax"]),
     ]
 
-    # Attribution rows appear AFTER pat_total - handle separately
     ATTR_ROWS = [
         ("pat_owners",   ["a) owners of the company", "owners of the company",
                           "a)\towners", "attributable to owners"]),
@@ -881,7 +816,6 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
                           "b)\tnon-controlling", "minority interest"]),
     ]
 
-    # EPS rows
     EPS_ROWS = [
         ("eps_basic",   ["a) basic (in", "basic (in ₹", "basic (in rs",
                          "a)\tbasic", "basic earnings per"]),
@@ -891,10 +825,6 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
 
     result = {}
 
-    # ── Pass 1: Row-by-row ─────────────────────────────────────────────────────
-    # BSE filing column order (pypdf text): Dec25 | Sep25 | Dec24 | 9M-cur | 9M-prior
-    # _get_large_nums_with_fallback returns (current, sep_qtr, prior_yr_same_qtr)
-    # "prior" for YoY display = prior_yr_same_qtr (index 2 in raw line)
     all_patterns = PL_ORDERED + ATTR_ROWS + EPS_ROWS
     for i, line in enumerate(lines):
         ll = line.lower().strip()
@@ -922,13 +852,12 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
             break
 
     if len([k for k in result if k in dict(PL_ORDERED)]) >= 4:
-        return result  # Row-by-row gave enough rows
+        return result
 
     log.append(f"Row-by-row yielded only {len(result)} rows, trying column-first layout")
 
-    # ── Pass 2: Column-first (all labels then all values) ─────────────────────
-    matched_keys = []   # [(key, line_idx), ...] in document order
-    value_rows = []     # [(nums_list, line_idx), ...] in document order
+    matched_keys = []
+    value_rows = []
 
     for i, line in enumerate(lines):
         ll = line.lower().strip()
@@ -940,12 +869,11 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
 
     for i, line in enumerate(lines):
         nums = _get_large_nums(line)
-        if len(nums) >= 3:  # Real value row has ≥3 columns
+        if len(nums) >= 3:
             value_rows.append((nums, i))
 
     log.append(f"Column-first: {len(matched_keys)} label matches, {len(value_rows)} value rows")
 
-    # Zip by position
     result_p2 = {}
     for pos, (key, label_idx) in enumerate(matched_keys):
         if pos < len(value_rows):
@@ -957,7 +885,6 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
             }
             log.append(f"[{key}] = {nums[0]} @ col-first L{label_idx+1}→{val_idx+1}")
 
-    # Also try attribution rows with lookahead after pat_total
     pat_line = next((i for i, l in enumerate(lines) if "profit after tax" in l.lower()), None)
     if pat_line is not None:
         for i in range(pat_line, min(pat_line + 10, len(lines))):
@@ -979,17 +906,12 @@ def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
                             "source": f"Page {page_num}, Line {i+1} (attr)",
                         }
 
-    # Return whichever pass got more results
     if len(result_p2) >= len(result):
         return result_p2
     return result
 
 
 def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
-    """
-    Deterministically extract key financial numbers from a BSE/NSE filing PDF.
-    Handles both row-by-row and column-first pypdf extraction layouts.
-    """
     result = {
         "company_name": "",
         "currency": "INR Crores",
@@ -1005,7 +927,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     }
     log = result["extraction_log"]
 
-    # ── Read pages ────────────────────────────────────────────────────────────
     page_texts = {}
     try:
         reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
@@ -1019,7 +940,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
 
     all_text = "\n".join(page_texts.values())
 
-    # ── Meta ──────────────────────────────────────────────────────────────────
     result["currency"] = _detect_currency_unit(all_text)
     result["company_name"] = _extract_company_name_v2(all_text)
 
@@ -1037,7 +957,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     if period_m:
         result["period"] = period_m.group(1).strip()
 
-    # ── Categorise pages ──────────────────────────────────────────────────────
     consolidated_pl_pages = []
     ratio_pages = []
     segment_pages = []
@@ -1057,7 +976,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
 
     pl_pages = consolidated_pl_pages or list(page_texts.keys())
 
-    # ── Extract P&L ───────────────────────────────────────────────────────────
     for page_idx in pl_pages:
         lines = page_texts[page_idx].split("\n")
         pl_result = _extract_pl_any_layout(lines, page_idx + 1, log)
@@ -1065,8 +983,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
             if k not in result["pl"]:
                 result["pl"][k] = v
 
-    # ── Revenue fallback from segment page (always clean) ────────────────────
-    # BSE filings have font encoding issues in P&L col 1; segment page is cleaner
     if "revenue" not in result["pl"] or result["pl"]["revenue"].get("source","").endswith("[Sep25-fallback]"):
         seg_pages = segment_pages or list(page_texts.keys())
         for page_idx in seg_pages:
@@ -1087,7 +1003,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                         log.append(f"[revenue] = {current} from segment page")
                         break
 
-    # ── Net Worth ─────────────────────────────────────────────────────────────
     for page_idx in pl_pages:
         lines = page_texts[page_idx].split("\n")
         for i, line in enumerate(lines):
@@ -1106,7 +1021,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                     log.append(f"[net_worth] = {nums[0]}")
                     break
 
-    # ── Ratios ────────────────────────────────────────────────────────────────
     RATIO_ROWS = [
         ("debt_service_coverage", ["debt service coverage"]),
         ("interest_coverage",     ["interest service coverage", "interest coverage ratio"]),
@@ -1147,7 +1061,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
                         log.append(f"ratio [{key}] = {nums[0]}")
                     break
 
-    # ── Segment EBITDA ────────────────────────────────────────────────────────
     SEGMENT_ROWS = [
         ("O2C",             ["oil to chemicals", "- oil to chemicals"]),
         ("Oil & Gas",       ["oil and gas", "- oil and gas"]),
@@ -1191,11 +1104,6 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
 
 
 def _build_verified_block(extracted: dict) -> str:
-    """
-    Build the VERIFIED DATA BLOCK from deterministically extracted numbers.
-    This block is placed at the top of every AI prompt.
-    Numbers here are sourced directly from the filing tables — AI must use them as ground truth.
-    """
     currency = extracted.get("currency", "INR Crores")
     pl = extracted.get("pl", {})
     ratios = extracted.get("ratios", {})
@@ -1307,7 +1215,6 @@ def _build_verified_block(extracted: dict) -> str:
 
 
 def _extract_company_name_v2(text: str) -> str:
-    """Extract company name from top of filing text."""
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     company_keywords = [
         "limited", "ltd", "ltd.", "corporation", "industries", "technologies",
@@ -1359,8 +1266,6 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
             company_line +
             f"\n[DOCUMENT CURRENCY UNIT: {currency}]\n"
             f"[ALL NUMBERS ARE IN {currency} — DO NOT CHANGE THIS UNIT]\n\n"
-
-            # ── CRITICAL: Anti-hallucination guard for Indian filings ──────────
             f"[CRITICAL EXTRACTION RULES FOR INDIAN QUARTERLY FILINGS]\n"
             f"[RULE A — AUDITOR NARRATIVE TRAP: Indian audit reports contain sentences like\n"
             f"  '247 subsidiaries reflect total revenues of Rs. X crore and net profit of Rs. Y crore'\n"
@@ -1373,7 +1278,6 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
             f"  use ONLY consolidated figures. Standalone values will be significantly lower.]\n"
             f"[RULE D — USE STATED RATIOS: For D/E ratio, Current Ratio, Interest Coverage —\n"
             f"  use the printed Ratios section values. Do not recalculate.]\n\n"
-
             f"[CONSOLIDATION: Use CONSOLIDATED figures only (labeled 'Unaudited Consolidated').\n"
             f"Standalone figures appear later in the document and must be IGNORED.]\n\n"
         )
@@ -1390,44 +1294,29 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
 
 
 def _extract_company_name(text: str) -> str:
-    """Extract company name from the top of a BSE/NSE quarterly filing."""
     import re
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    # Look in first 30 lines for company name patterns
     skip_words = {"unaudited", "consolidated", "standalone", "financial", "results",
                   "quarter", "ended", "statement", "limited", "bse", "nse", "page",
                   "pursuant", "regulation", "sebi", "crore", "lakhs", "rs.", "inr"}
     for line in lines[:30]:
-        # Lines in ALL CAPS or Title Case that look like company names
         clean = line.strip("*-–—|_ \t")
         if len(clean) < 5 or len(clean) > 80:
             continue
         words = clean.split()
         if len(words) < 2:
             continue
-        # Must contain "Limited" or "Ltd" or "Corporation" or "Industries" etc.
         company_keywords = ["limited", "ltd", "corporation", "industries", "technologies",
                             "bank", "finance", "energy", "infosys", "wipro", "tcs",
                             "reliance", "hdfc", "icici", "bharti", "airtel", "tata"]
         line_lower = clean.lower()
         if any(kw in line_lower for kw in company_keywords):
-            # Filter out lines that are mostly metadata
             if not any(w in line_lower for w in ["quarter ended", "financial results", "pursuant to"]):
                 return clean
     return ""
 
 
 def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
-    """
-    Extract text from PDF and return it for AI analysis.
-    Strategy:
-      1. Select the right pages (consolidated P&L, ratios, segment) — up to page 20
-      2. Run deterministic extractor to get verified numbers with source citations
-      3. Extract structured text via pdfplumber (table-aware) with pypdf fallback
-      4. Prepend VERIFIED DATA BLOCK (deterministic numbers) + PRINTED RATIOS
-         so AI uses ground-truth numbers, not hallucinated ones
-    """
-    # Guard: reject FinSight reports
     try:
         import pdfplumber as _plumber
         with _plumber.open(io.BytesIO(raw_bytes)) as _chk:
@@ -1447,14 +1336,12 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
         logger.warning("No financial pages selected — falling back to first 8 pages")
         page_indices = list(range(min(8, pypdf.PdfReader(io.BytesIO(raw_bytes)).pages.__len__())))
 
-    # ── Also scan ALL pages for ratios (ratios section may be page 5-8, excluded by page filter) ──
     try:
         all_page_count = len(pypdf.PdfReader(io.BytesIO(raw_bytes)).pages)
         ratios_scan_pages = sorted(set(page_indices) | set(range(min(all_page_count, 20))))
     except Exception:
         ratios_scan_pages = page_indices
 
-    # ── Step 1: Deterministic extraction — verified numbers with source citations ──
     try:
         det = _extract_deterministic(raw_bytes, ratios_scan_pages)
         verified_block = _build_verified_block(det)
@@ -1463,7 +1350,6 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
         logger.warning(f"Deterministic extraction failed: {e}")
         verified_block = ""
 
-    # ── Step 2: Extract full document text via pdfplumber ────────────────────
     text = _extract_with_pdfplumber(raw_bytes, page_indices)
     if not text.strip():
         logger.info("pdfplumber empty, falling back to pypdf")
@@ -1474,12 +1360,8 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
             if pt.strip():
                 text += f"\n--- PAGE {i+1} ---\n{pt}\n"
 
-    # ── Step 3: Ratios cheat-sheet (scans wider page range than page_indices) ──
     ratios_hint = _extract_ratios_hint(raw_bytes, ratios_scan_pages)
 
-    # ── Step 4: Assemble final prompt input ──────────────────────────────────
-    # Order: VERIFIED BLOCK (ground truth) → RATIOS HINT → DOCUMENT TEXT
-    # AI must use verified block numbers; document text provides context
     parts = []
     if verified_block:
         parts.append(verified_block)
@@ -1508,11 +1390,6 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
 
 
 def _extract_ratios_hint(raw_bytes: bytes, page_indices: list) -> str:
-    """
-    Extract the printed Ratios table values and return as a pinned hint block.
-    These values extract cleanly (no font encoding issues) and are critical
-    to prevent AI from recalculating ratios incorrectly.
-    """
     RATIO_ROWS = [
         ("Debt Service Coverage Ratio",   ["debt service coverage"]),
         ("Interest Service Coverage",     ["interest service coverage", "interest coverage ratio"]),
@@ -1538,7 +1415,6 @@ def _extract_ratios_hint(raw_bytes: bytes, page_indices: list) -> str:
             page_text = reader.pages[page_idx].extract_text() or ""
             tl = page_text.lower()
 
-            # Only process pages that have a ratios section
             if "ratios" not in tl:
                 continue
             if "debt equity" not in tl and "operating margin" not in tl:
@@ -1548,21 +1424,18 @@ def _extract_ratios_hint(raw_bytes: bytes, page_indices: list) -> str:
             for line in lines:
                 ll = line.lower().strip()
 
-                # Net worth
                 if "net worth" in ll and ("including" in ll or "retained" in ll):
                     nums = re.findall(r"[\d,]+", line)
                     nums = [n.replace(",","") for n in nums if len(n.replace(",","")) >= 4]
                     if nums and not net_worth_val:
                         net_worth_val = nums[0]
 
-                # EPS
                 if "basic (in" in ll or "basic (in ₹" in ll:
                     nums = re.findall(r"\d+\.\d+|\d+", line)
                     nums = [n for n in nums if 0 < float(n) < 1000]
                     if nums:
                         found["EPS Basic (₹)"] = nums[0]
 
-                # Ratios
                 for label, patterns in RATIO_ROWS:
                     if label in found:
                         continue
@@ -1650,6 +1523,171 @@ def _repair_json(s: str) -> str:
     return s
 
 
+# ─── RESULT NORMALIZER ───────────────────────────────────────────────────────
+def _normalize_result(result: dict) -> dict:
+    """
+    Flatten any nested objects/dicts that the AI returns where strings are expected.
+    Prevents React error #31 (rendering objects as React children).
+    Groq/Gemini occasionally return structured objects inside lists instead of plain strings.
+    """
+    def _flatten_list(lst) -> list:
+        """Convert a list of anything into a list of plain strings."""
+        if not isinstance(lst, list):
+            return []
+        out = []
+        for item in lst:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict):
+                out.append(" — ".join(str(v) for v in item.values() if v))
+            else:
+                out.append(str(item))
+        return out
+
+    def _safe_str(val) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, dict):
+            return " — ".join(str(v) for v in val.values() if v)
+        return str(val)
+
+    # Top-level string lists
+    for key in ["highlights", "risks", "what_to_watch", "red_flags",
+                "strengths_and_moats", "key_monitorables"]:
+        if key in result:
+            result[key] = _flatten_list(result[key])
+
+    # growth_quality nested lists
+    gq = result.get("growth_quality", {})
+    if isinstance(gq, dict):
+        gq["catalysts"] = _flatten_list(gq.get("catalysts", []))
+        gq["headwinds"] = _flatten_list(gq.get("headwinds", []))
+
+    # industry_context nested lists
+    ic = result.get("industry_context", {})
+    if isinstance(ic, dict):
+        ic["sector_tailwinds"] = _flatten_list(ic.get("sector_tailwinds", []))
+        ic["sector_headwinds"] = _flatten_list(ic.get("sector_headwinds", []))
+
+    # investor_faq — ensure question/answer are strings
+    faq = result.get("investor_faq", [])
+    if isinstance(faq, list):
+        result["investor_faq"] = [
+            {
+                "question": _safe_str(item.get("question", "")),
+                "answer":   _safe_str(item.get("answer", ""))
+            }
+            for item in faq if isinstance(item, dict)
+        ]
+
+    # key_metrics — ensure all fields are strings
+    metrics = result.get("key_metrics", [])
+    if isinstance(metrics, list):
+        result["key_metrics"] = [
+            {k: _safe_str(v) if isinstance(v, (dict, list)) else (v if v is not None else "")
+             for k, v in m.items()}
+            for m in metrics if isinstance(m, dict)
+        ]
+
+    # health_score_breakdown components — ensure reasoning is a string
+    hsd = result.get("health_score_breakdown", {})
+    if isinstance(hsd, dict):
+        components = hsd.get("components", [])
+        if isinstance(components, list):
+            hsd["components"] = [
+                {k: (_safe_str(v) if k == "reasoning" else v)
+                 for k, v in c.items()}
+                for c in components if isinstance(c, dict)
+            ]
+
+    # Safe defaults for every field the frontend may access
+    result.setdefault("company_name", "")
+    result.setdefault("statement_type", "")
+    result.setdefault("period", "")
+    result.setdefault("currency", "INR Crore")
+    result.setdefault("health_score", 0)
+    result.setdefault("health_label", "N/A")
+    result.setdefault("investment_label", "")
+    result.setdefault("headline", "")
+    result.setdefault("executive_summary", "")
+    result.setdefault("investor_verdict", "")
+    result.setdefault("bottom_line", "")
+    result.setdefault("for_long_term_investors", "")
+    result.setdefault("for_short_term_traders", "")
+    result.setdefault("highlights", [])
+    result.setdefault("risks", [])
+    result.setdefault("what_to_watch", [])
+    result.setdefault("red_flags", [])
+    result.setdefault("strengths_and_moats", [])
+    result.setdefault("key_monitorables", [])
+    result.setdefault("key_metrics", [])
+    result.setdefault("investor_faq", [])
+    result.setdefault("cash_flow_deep_dive", {
+        "operating_cf": "Not available",
+        "investing_cf": "Not available",
+        "financing_cf": "Not available",
+        "free_cash_flow": "Not available",
+        "capex": "Not available",
+        "cash_conversion_quality": "Not available",
+        "ocf_vs_pat_insight": "Not available"
+    })
+    result.setdefault("balance_sheet_deep_dive", {
+        "asset_quality": "",
+        "debt_profile": "",
+        "working_capital_insight": "",
+        "total_debt": "",
+        "net_worth": "",
+        "debt_to_equity": "",
+        "interest_coverage": "",
+        "debt_comfort_level": ""
+    })
+    result.setdefault("growth_quality", {
+        "revenue_growth_context": "",
+        "profit_growth_context": "",
+        "margin_trend": "",
+        "growth_outlook": "",
+        "catalysts": [],
+        "headwinds": []
+    })
+    result.setdefault("industry_context", {
+        "sector_tailwinds": [],
+        "sector_headwinds": [],
+        "competitive_position": "",
+        "peer_benchmarks": "",
+        "regulatory_environment": ""
+    })
+    result.setdefault("profitability", {
+        "analysis": "",
+        "net_margin_current": "",
+        "ebitda_margin_current": "",
+        "roe": "",
+        "roa": ""
+    })
+    result.setdefault("liquidity", {
+        "analysis": "",
+        "current_ratio": "",
+        "quick_ratio": "",
+        "cash_position": "",
+        "operating_cash_flow": "",
+        "free_cash_flow": ""
+    })
+    result.setdefault("health_score_breakdown", {"total": 0, "components": []})
+
+    # Ensure nested lists inside defaults are always lists
+    gq2 = result.get("growth_quality", {})
+    gq2.setdefault("catalysts", [])
+    gq2.setdefault("headwinds", [])
+
+    ic2 = result.get("industry_context", {})
+    ic2.setdefault("sector_tailwinds", [])
+    ic2.setdefault("sector_headwinds", [])
+
+    hsd2 = result.get("health_score_breakdown", {})
+    hsd2.setdefault("components", [])
+
+    return result
+
+
 # ─── AI PROMPTS ──────────────────────────────────────────────────────────────
 
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
@@ -1689,6 +1727,12 @@ Every analysis field MUST cite actual numbers. Vague commentary is waste.
 ✅ ACCEPTED: "Revenue ₹2,69,496 Cr, up 10.5% YoY from ₹2,43,865 Cr — Jio +17%, Retail +8%"
 ❌ REJECTED: "Company has maintained strong profitability metrics"
 ✅ ACCEPTED: "Net margin 6.9% (₹18,645 Cr PAT on ₹2,69,496 Cr revenue), expanded 140bps YoY"
+
+RULE 7 — STRING ARRAYS ONLY:
+All arrays (highlights, risks, what_to_watch, red_flags, strengths_and_moats, key_monitorables,
+growth_quality.catalysts, growth_quality.headwinds, industry_context.sector_tailwinds,
+industry_context.sector_headwinds) MUST contain plain strings only.
+NEVER put objects or dicts inside these arrays. Each item must be a single string.
 
 ━━━ SCORING ━━━
 Profitability(20): ROE>20%+Margin>15%=20|12-20%=14|else=7
@@ -1769,27 +1813,27 @@ Return ONLY this JSON (all fields required, no nulls, no markdown fences):
     "profit_growth_context": "PAT growth drivers — margin expansion, lower tax, one-offs? Cite figures.",
     "margin_trend": "Operating margin expansion/contraction vs last year in exact bps",
     "growth_outlook": "Next 2-4 quarters based on guidance or sector momentum",
-    "catalysts": ["Specific catalyst 1 with expected magnitude", "Specific catalyst 2"],
-    "headwinds": ["Specific headwind 1 with context and magnitude", "Specific headwind 2"]
+    "catalysts": ["Specific catalyst string 1 with expected magnitude", "Specific catalyst string 2"],
+    "headwinds": ["Specific headwind string 1 with context and magnitude", "Specific headwind string 2"]
   }},
   "industry_context": {{
-    "sector_tailwinds": ["Tailwind 1 specific to this sector/company", "Tailwind 2"],
-    "sector_headwinds": ["Headwind 1", "Headwind 2"],
+    "sector_tailwinds": ["Tailwind string 1 specific to this sector/company", "Tailwind string 2"],
+    "sector_headwinds": ["Headwind string 1", "Headwind string 2"],
     "competitive_position": "Market position vs named peers — leader, challenger, or niche?",
     "peer_benchmarks": "Margins/growth/D/E vs named peers in same sector",
     "regulatory_environment": "Relevant regulatory tailwinds or headwinds"
   }},
-  "red_flags": ["Specific red flag with evidence from filing", "Specific red flag 2 — not generic"],
-  "strengths_and_moats": ["Specific moat — e.g. 430M subscriber base, pricing power, brand", "Specific moat 2"],
+  "red_flags": ["Specific red flag string with evidence from filing", "Specific red flag string 2 — not generic"],
+  "strengths_and_moats": ["Specific moat string — e.g. 430M subscriber base, pricing power, brand", "Specific moat string 2"],
   "investor_faq": [
     {{"question":"Is this company a good investment right now?","answer":"3-4 sentences: investment case with numbers, valuation context, key risk."}},
     {{"question":"What is the biggest risk to monitor?","answer":"3-4 sentences: specific, evidence-based, not generic."}},
     {{"question":"How sustainable is the current growth rate?","answer":"3-4 sentences: segment drivers, market opportunity, structural constraints."}}
   ],
   "key_monitorables": [
-    "Specific metric with threshold — e.g. Watch Jio ARPU: needs to sustain above ₹195 to justify Digital valuation",
-    "Monitorable 2 with context and threshold",
-    "Monitorable 3"
+    "Specific metric string with threshold — e.g. Watch Jio ARPU: needs to sustain above ₹195 to justify Digital valuation",
+    "Monitorable string 2 with context and threshold",
+    "Monitorable string 3"
   ],
   "profitability": {{
     "analysis": "3-4 sentences: margin quality, what drives them, sustainability, trend vs historical and peers",
@@ -1807,19 +1851,19 @@ Return ONLY this JSON (all fields required, no nulls, no markdown fences):
     "free_cash_flow": ""
   }},
   "highlights": [
-    "Number-led — e.g. PAT up 38.7% YoY to ₹18,645 Cr, strongest quarter in last 6",
-    "Number-led highlight 2",
-    "Number-led highlight 3"
+    "Number-led string — e.g. PAT up 38.7% YoY to ₹18,645 Cr, strongest quarter in last 6",
+    "Number-led highlight string 2",
+    "Number-led highlight string 3"
   ],
   "risks": [
-    "Specific risk with magnitude — e.g. O2C under pressure: GRMs at $8.4/bbl vs $10.1/bbl YoY, -17%",
-    "Specific risk 2 with evidence",
-    "Specific risk 3"
+    "Specific risk string with magnitude — e.g. O2C under pressure: GRMs at $8.4/bbl vs $10.1/bbl YoY, -17%",
+    "Specific risk string 2 with evidence",
+    "Specific risk string 3"
   ],
   "what_to_watch": [
-    "Specific trigger for next quarter with clear threshold",
-    "What to watch 2",
-    "What to watch 3"
+    "Specific trigger string for next quarter with clear threshold",
+    "What to watch string 2",
+    "What to watch string 3"
   ]
 }}
 
@@ -1839,6 +1883,9 @@ RULES:
 5. CASH FLOW QUARTERLY: No CF in Q1/Q2/Q3 filings. All CF fields = "Not available — quarterly filing". CF score = 9.
 6. CASH FLOW ANNUAL/SCREENER: If annual data present, analyse OCF, FCF. Compute OCF/PAT ratio.
 7. CONSOLIDATED ONLY. USE PRINTED RATIOS exactly — never recalculate.
+8. STRING ARRAYS ONLY: highlights, risks, what_to_watch, red_flags, strengths_and_moats,
+   key_monitorables, catalysts, headwinds, sector_tailwinds, sector_headwinds must ALL be
+   plain string arrays. NEVER put objects or dicts inside these arrays.
 
 SCORING: Profitability(20):ROE>20%+Margin>15%=20|12-20%=14|else=7 | Growth(15):Rev>15%+PAT>20%=15|8-15%=10|else=4 | BalSheet(15):D/E<0.5=15|0.5-1.0=11|1.0-1.5=7|>1.5=3 | Liquidity(10):CR>2=10|1.5-2=8|1-1.5=5|<1=2 | CF(15):OCF>PAT=15|≈PAT=10|<PAT=4|NA=9 | Gov(15):Clean=15|Minor=9|Major=3 | Industry(10):Leader=10|Strong=7|Avg=4|Lag=2
 health_label: >=80=Excellent|65-79=Good|45-64=Fair|25-44=Poor|<25=Critical
@@ -1872,21 +1919,21 @@ Return ONLY this JSON:
   ],
   "cash_flow_deep_dive":{{"operating_cf":"Figure or not available","investing_cf":"","financing_cf":"","free_cash_flow":"OCF-Capex or not available","capex":"","cash_conversion_quality":"Strong(OCF Xx PAT)/Moderate/Weak with ratio; or not available reason","ocf_vs_pat_insight":"Earnings quality analysis with numbers, or quarterly limitation"}},
   "balance_sheet_deep_dive":{{"asset_quality":"Asset base with figures","debt_profile":"Total debt, LT vs ST","working_capital_insight":"Debtor/inventory days if available","total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":"Comfortable/Elevated/Stressed with D/E+ICR rationale"}},
-  "growth_quality":{{"revenue_growth_context":"WHY revenue changed — segments and figures","profit_growth_context":"PAT drivers with numbers","margin_trend":"Exact bps expansion/contraction","growth_outlook":"Next 2-4 quarters","catalysts":["Catalyst 1 with magnitude","Catalyst 2"],"headwinds":["Headwind 1 with context","Headwind 2"]}},
-  "industry_context":{{"sector_tailwinds":["Tailwind 1","Tailwind 2"],"sector_headwinds":["Headwind 1","Headwind 2"],"competitive_position":"Position vs named peers","peer_benchmarks":"Margins/growth/D/E vs named peers","regulatory_environment":"Relevant factors"}},
-  "red_flags":["Red flag with evidence from filing","Red flag 2 specific not generic"],
-  "strengths_and_moats":["Specific moat 1 — scale/brand/network/pricing power","Specific moat 2"],
+  "growth_quality":{{"revenue_growth_context":"WHY revenue changed — segments and figures","profit_growth_context":"PAT drivers with numbers","margin_trend":"Exact bps expansion/contraction","growth_outlook":"Next 2-4 quarters","catalysts":["Catalyst string 1 with magnitude","Catalyst string 2"],"headwinds":["Headwind string 1 with context","Headwind string 2"]}},
+  "industry_context":{{"sector_tailwinds":["Tailwind string 1","Tailwind string 2"],"sector_headwinds":["Headwind string 1","Headwind string 2"],"competitive_position":"Position vs named peers","peer_benchmarks":"Margins/growth/D/E vs named peers","regulatory_environment":"Relevant factors"}},
+  "red_flags":["Red flag string with evidence from filing","Red flag string 2 specific not generic"],
+  "strengths_and_moats":["Specific moat string 1 — scale/brand/network/pricing power","Specific moat string 2"],
   "investor_faq":[
     {{"question":"Is this company a good investment right now?","answer":"3-4 sentences: investment case + numbers + valuation + risk"}},
     {{"question":"What is the biggest risk to monitor?","answer":"3-4 sentences: specific risk with evidence"}},
     {{"question":"How sustainable is the current growth rate?","answer":"3-4 sentences: segments + opportunity + constraints"}}
   ],
-  "key_monitorables":["Specific metric with threshold — e.g. Watch ARPU sustain above ₹195","Monitorable 2 with threshold","Monitorable 3"],
+  "key_monitorables":["Specific metric string with threshold — e.g. Watch ARPU sustain above ₹195","Monitorable string 2 with threshold","Monitorable string 3"],
   "profitability":{{"analysis":"3-4 sentences on margin quality, drivers, sustainability, trend","net_margin_current":"","ebitda_margin_current":"","roe":"","roa":""}},
   "liquidity":{{"analysis":"2-3 sentences with specific ratios and liquidity assessment","current_ratio":"","quick_ratio":"","cash_position":"","operating_cash_flow":"","free_cash_flow":""}},
-  "highlights":["Number-led highlight 1 — e.g. PAT up 38.7% YoY to ₹18,645 Cr","Highlight 2","Highlight 3"],
-  "risks":["Specific risk with magnitude and evidence","Risk 2","Risk 3"],
-  "what_to_watch":["Specific trigger with threshold for next quarter","Watch 2","Watch 3"]
+  "highlights":["Number-led highlight string 1 — e.g. PAT up 38.7% YoY to ₹18,645 Cr","Highlight string 2","Highlight string 3"],
+  "risks":["Specific risk string with magnitude and evidence","Risk string 2","Risk string 3"],
+  "what_to_watch":["Specific trigger string with threshold for next quarter","Watch string 2","Watch string 3"]
 }}
 
 FINANCIAL DATA:
@@ -2139,7 +2186,7 @@ async def run_analysis(text: str) -> dict:
             logger.info(f"Trying {provider_name} with {len(full_text):,} chars...")
             result = await loop.run_in_executor(executor, func, full_text)
             logger.info(f"{provider_name} succeeded!")
-            return result
+            return _normalize_result(result)   # ← NORMALIZER APPLIED HERE
         except Exception as e:
             error_msg = str(e)[:200]
             logger.warning(f"{provider_name} failed: {error_msg}")
@@ -2560,7 +2607,7 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
         "raw_text": "",
     }
 
-    # Company name — try multiple selectors
+    # Company name
     for pat in [r'<h1[^>]*class="[^"]*company-name[^"]*"[^>]*>(.*?)</h1>',
                 r'<h1[^>]*>(.*?)</h1>',
                 r'<title>([^<|]+)']:
@@ -2571,7 +2618,7 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
                 result["company_name"] = name
                 break
 
-    # Key ratios — multiple patterns per ratio for robustness
+    # Key ratios
     ratio_defs = [
         ("market_cap",     [r'Market Cap\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
         ("pe_ratio",       [r'Stock P/E\s*</span>[^<]*<span[^>]*>\s*([\d,\.]+)']),
@@ -2592,8 +2639,6 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
                     break
 
     # Parse financial table sections
-    # Use a robust extractor that handles nested tags by finding the section start
-    # and scanning forward to the matching </section> — non-greedy regex fails on large pages
     for section_id, target in [("quarters", "quarterly_results"),
                                 ("profit-loss", "annual_results"),
                                 ("balance-sheet", "balance_sheet")]:
@@ -2619,12 +2664,7 @@ async def fetch_screener_data(symbol: str, consolidated: bool = True) -> dict:
 
 
 def _extract_section(html: str, section_id: str) -> str:
-    """
-    Robustly extract a <section id="..."> block from HTML.
-    Handles nested tags by counting open/close section tags rather than
-    using non-greedy regex (which stops at the first </section> found).
-    """
-    # Find the opening tag
+    """Robustly extract a <section id="..."> block from HTML."""
     import re as _re
     pattern = f'<section[^>]*\\bid="{_re.escape(section_id)}"[^>]*>'
     m = _re.search(pattern, html, _re.S)
@@ -2650,21 +2690,15 @@ def _extract_section(html: str, section_id: str) -> str:
 
 
 def _parse_screener_table(html_section: str) -> list:
-    """
-    Parse a Screener.in HTML table into [{label, values, headers}] list.
-    Screener uses <th> for header rows and <td> for data rows.
-    Header row has empty first cell followed by period labels (Mar 2025, TTM, etc).
-    """
+    """Parse a Screener.in HTML table into [{label, values, headers}] list."""
     rows = []
     headers = []
 
     for tr in re.findall(r'<tr[^>]*>(.*?)</tr>', html_section, re.S):
-        # Detect if this is a header row (contains <th> tags)
         has_th = bool(re.search(r'<th[\s>]', tr, re.S))
         cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', tr, re.S)
 
         def clean(c):
-            # Strip HTML tags, decode nbsp, normalise whitespace
             c = re.sub(r'<[^>]+>', '', c)
             c = c.replace('\xa0', ' ').replace('&nbsp;', ' ').replace('\n', ' ')
             return re.sub(r'\s+', ' ', c).strip()
@@ -2675,10 +2709,6 @@ def _parse_screener_table(html_section: str) -> list:
 
         first = cells[0].lower().strip()
 
-        # Header row detection:
-        # 1. Row uses <th> tags, OR
-        # 2. First cell empty and rest look like period labels, OR
-        # 3. First cell is a period label itself (Mar 2025, Dec 2022, TTM...)
         is_period = bool(re.match(
             r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|20\d\d|ttm|fy\d|yr)',
             first
@@ -2686,13 +2716,11 @@ def _parse_screener_table(html_section: str) -> list:
         is_header = has_th or not first or is_period
 
         if is_header:
-            # Only update headers if this row has actual period content
             period_cells = [c for c in cells[1:] if c]
             if period_cells or not first:
                 headers = list(cells)
             continue
 
-        # Data row: must have a label and at least one numeric value
         if cells[0] and any(v for v in cells[1:] if v):
             rows.append({"label": cells[0], "values": cells[1:], "headers": list(headers)})
 
@@ -2700,31 +2728,18 @@ def _parse_screener_table(html_section: str) -> list:
 
 
 def _screener_to_text(data: dict) -> str:
-    """
-    Convert Screener.in data to clean text optimised for AI analysis.
-    Explicitly pins the latest quarter and YoY comparison values so the AI
-    doesn't have to guess which column to use from a 13-column table.
-    """
+    """Convert Screener.in data to clean text optimised for AI analysis."""
     import re as _re
 
     def _pin_quarterly(rows: list) -> tuple:
-        """
-        Extract pinned values for the latest quarter and the same quarter last year.
-        Screener quarterly table: columns are quarters in chronological order, LAST column = most recent.
-        Returns (latest_period, yoy_period, pinned_lines).
-        """
         if not rows:
             return "", "", []
         hdrs = rows[0].get("headers", [])
-        # headers[0] is empty label cell, so actual period headers start at index 1
-        # but values list starts at index 0 (no label cell in values)
-        # So values[0] = hdrs[1], values[-1] = hdrs[-1] = most recent quarter
         if len(hdrs) < 2:
             return "", "", []
 
-        period_hdrs = hdrs[1:]  # strip empty label cell → list of period strings
-        latest_idx  = len(period_hdrs) - 1   # rightmost = most recent
-        # Find same-quarter prior year: same month name, ~4 quarters back
+        period_hdrs = hdrs[1:]
+        latest_idx  = len(period_hdrs) - 1
         latest_label = period_hdrs[latest_idx].lower()
         month_m = _re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', latest_label)
         cur_month = month_m.group(1) if month_m else ""
@@ -2756,19 +2771,12 @@ def _screener_to_text(data: dict) -> str:
         return latest_period, yoy_period, pinned
 
     def _pin_annual(rows: list) -> tuple:
-        """
-        Extract pinned values for the latest 2 full years.
-        Screener annual table: columns in chronological order, LAST = most recent full year.
-        Returns (latest_yr, prior_yr, pinned_lines).
-        """
         if not rows:
             return "", "", []
         hdrs = rows[0].get("headers", [])
         period_hdrs = hdrs[1:] if hdrs else []
-        # Skip TTM column (last) if present — use last full year
         if period_hdrs and "ttm" in period_hdrs[-1].lower():
             period_hdrs = period_hdrs[:-1]
-            # adjust values index accordingly
             latest_idx = len(period_hdrs) - 1
             ttm_present = True
         else:
@@ -2779,10 +2787,7 @@ def _screener_to_text(data: dict) -> str:
         latest_yr = period_hdrs[latest_idx] if latest_idx < len(period_hdrs) else "Latest Year"
         prior_yr  = period_hdrs[prior_idx]  if prior_idx is not None and prior_idx < len(period_hdrs) else "Prior Year"
 
-        # values list doesn't include TTM column if we stripped it — but actually
-        # values come from the raw HTML so TTM IS in values[-1] if present
-        # We need to use correct index into the values list (which includes TTM)
-        hdrs_full = rows[0].get("headers", [])[1:]  # full header list including TTM
+        hdrs_full = rows[0].get("headers", [])[1:]
         lat_idx_full  = len(hdrs_full) - 1 if not ttm_present else len(hdrs_full) - 2
         pri_idx_full  = lat_idx_full - 1 if lat_idx_full >= 1 else None
 
@@ -2819,7 +2824,6 @@ def _screener_to_text(data: dict) -> str:
             L.append(f"  {ratio_labels.get(k, k)}: {v}")
         L.append("")
 
-    # ── PINNED QUARTERLY SECTION ──────────────────────────────────────────────
     if data["quarterly_results"]:
         latest_qtr, yoy_qtr, pinned_qtr = _pin_quarterly(data["quarterly_results"])
         L.append(f"╔══════════════════════════════════════════════════╗")
@@ -2832,7 +2836,6 @@ def _screener_to_text(data: dict) -> str:
         L.extend(pinned_qtr)
         L.append("")
 
-        # Also include full quarterly table for trend analysis
         L.append("--- FULL QUARTERLY TREND (for multi-quarter context) ---")
         hdrs = data["quarterly_results"][0].get("headers", [])
         if hdrs:
@@ -2841,7 +2844,6 @@ def _screener_to_text(data: dict) -> str:
             L.append(f"  {row['label']}: {' | '.join(row['values'])}")
         L.append("")
 
-    # ── PINNED ANNUAL SECTION ─────────────────────────────────────────────────
     if data["annual_results"]:
         latest_yr, prior_yr, pinned_ann = _pin_annual(data["annual_results"])
         L.append(f"╔══════════════════════════════════════════════════╗")
@@ -2854,7 +2856,6 @@ def _screener_to_text(data: dict) -> str:
         L.extend(pinned_ann)
         L.append("")
 
-        # Full annual table for trend analysis
         L.append("--- FULL ANNUAL TREND (for multi-year context) ---")
         hdrs = data["annual_results"][0].get("headers", [])
         if hdrs:
@@ -2892,10 +2893,7 @@ class ScreenerAnalyzeRequest(BaseModel):
 
 @app.post("/api/analyze-from-screener")
 async def analyze_from_screener(req: ScreenerAnalyzeRequest, user=Depends(get_optional_user)):
-    """
-    Fetch live data from Screener.in and run full AI analysis.
-    More reliable than PDF: no font-encoding issues, always latest annual data with cash flows.
-    """
+    """Fetch live data from Screener.in and run full AI analysis."""
     analysis_id = str(uuid.uuid4())
     user_id = user["user_id"] if user else f"guest_{str(uuid.uuid4())[:8]}"
 
