@@ -1713,8 +1713,8 @@ key_monitorables: specific metrics with thresholds, not generic watchpoints
 Return ONLY this JSON (all fields required, no nulls, no markdown fences):
 {{
   "company_name": "",
-  "statement_type": "Quarterly Results or Annual Report",
-  "period": "e.g. Q3 FY26 or FY2025",
+  "statement_type": "Quarterly + Annual (Screener.in) or Quarterly Results or Annual Report",
+  "period": "e.g. Q3 FY26 (Dec 2025) + FY2025 Annual — cover both",
   "currency": "e.g. INR Crore",
   "health_score": 0,
   "health_label": "",
@@ -1731,7 +1731,7 @@ Return ONLY this JSON (all fields required, no nulls, no markdown fences):
     ]
   }},
   "headline": "One punchy line ≤15 words with the single most important number from this result",
-  "executive_summary": "5 sentences: (1) top-line revenue+PAT with exact numbers (2) biggest positive driver with figures (3) biggest concern with figures (4) balance sheet/CF status (5) forward outlook",
+  "executive_summary": "5-6 sentences covering BOTH latest quarter AND latest full year: (1) Latest quarter top-line with exact numbers (2) Full year revenue+PAT with figures (3) Key positive driver (4) Key concern with figures (5) Cash flow quality from annual data (6) Forward outlook",
   "investment_label": "",
   "investor_verdict": "2 sentences: rating + core rationale with numbers + single biggest risk",
   "for_long_term_investors": "3-4 sentences: compounding thesis, 2-3 year catalysts, entry context with specifics",
@@ -2634,18 +2634,116 @@ def _parse_screener_table(html_section: str) -> list:
 
 
 def _screener_to_text(data: dict) -> str:
-    """Convert Screener.in data to clean text optimised for AI analysis."""
+    """
+    Convert Screener.in data to clean text optimised for AI analysis.
+    Explicitly pins the latest quarter and YoY comparison values so the AI
+    doesn't have to guess which column to use from a 13-column table.
+    """
+    import re as _re
+
+    def _pin_quarterly(rows: list) -> tuple:
+        """
+        Extract pinned values for the latest quarter and the same quarter last year.
+        Screener quarterly table: columns are quarters in chronological order, LAST column = most recent.
+        Returns (latest_period, yoy_period, pinned_lines).
+        """
+        if not rows:
+            return "", "", []
+        hdrs = rows[0].get("headers", [])
+        # headers[0] is empty label cell, so actual period headers start at index 1
+        # but values list starts at index 0 (no label cell in values)
+        # So values[0] = hdrs[1], values[-1] = hdrs[-1] = most recent quarter
+        if len(hdrs) < 2:
+            return "", "", []
+
+        period_hdrs = hdrs[1:]  # strip empty label cell → list of period strings
+        latest_idx  = len(period_hdrs) - 1   # rightmost = most recent
+        # Find same-quarter prior year: same month name, ~4 quarters back
+        latest_label = period_hdrs[latest_idx].lower()
+        month_m = _re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', latest_label)
+        cur_month = month_m.group(1) if month_m else ""
+        yoy_idx = None
+        if cur_month:
+            for i in range(latest_idx - 3, max(latest_idx - 6, -1), -1):
+                if i >= 0 and cur_month in period_hdrs[i].lower():
+                    yoy_idx = i
+                    break
+        if yoy_idx is None and latest_idx >= 4:
+            yoy_idx = latest_idx - 4
+
+        latest_period = period_hdrs[latest_idx] if latest_idx < len(period_hdrs) else "Latest Quarter"
+        yoy_period    = period_hdrs[yoy_idx] if yoy_idx is not None else "Prior Year Same Quarter"
+
+        pinned = []
+        pinned.append(f"  LATEST QUARTER: {latest_period}")
+        pinned.append(f"  YoY COMPARISON: {yoy_period}")
+        pinned.append("")
+        for row in rows:
+            vals = row["values"]
+            cur_val = vals[latest_idx] if latest_idx < len(vals) else ""
+            yoy_val = vals[yoy_idx] if yoy_idx is not None and yoy_idx < len(vals) else ""
+            if cur_val and cur_val not in ("-", ""):
+                line = f"  {row['label']}: {cur_val}"
+                if yoy_val and yoy_val not in ("-", ""):
+                    line += f"  [YoY same qtr: {yoy_val}]"
+                pinned.append(line)
+        return latest_period, yoy_period, pinned
+
+    def _pin_annual(rows: list) -> tuple:
+        """
+        Extract pinned values for the latest 2 full years.
+        Screener annual table: columns in chronological order, LAST = most recent full year.
+        Returns (latest_yr, prior_yr, pinned_lines).
+        """
+        if not rows:
+            return "", "", []
+        hdrs = rows[0].get("headers", [])
+        period_hdrs = hdrs[1:] if hdrs else []
+        # Skip TTM column (last) if present — use last full year
+        if period_hdrs and "ttm" in period_hdrs[-1].lower():
+            period_hdrs = period_hdrs[:-1]
+            # adjust values index accordingly
+            latest_idx = len(period_hdrs) - 1
+            ttm_present = True
+        else:
+            latest_idx = len(period_hdrs) - 1
+            ttm_present = False
+        prior_idx = latest_idx - 1 if latest_idx >= 1 else None
+
+        latest_yr = period_hdrs[latest_idx] if latest_idx < len(period_hdrs) else "Latest Year"
+        prior_yr  = period_hdrs[prior_idx]  if prior_idx is not None and prior_idx < len(period_hdrs) else "Prior Year"
+
+        # values list doesn't include TTM column if we stripped it — but actually
+        # values come from the raw HTML so TTM IS in values[-1] if present
+        # We need to use correct index into the values list (which includes TTM)
+        hdrs_full = rows[0].get("headers", [])[1:]  # full header list including TTM
+        lat_idx_full  = len(hdrs_full) - 1 if not ttm_present else len(hdrs_full) - 2
+        pri_idx_full  = lat_idx_full - 1 if lat_idx_full >= 1 else None
+
+        pinned = []
+        pinned.append(f"  LATEST FULL YEAR: {latest_yr}")
+        pinned.append(f"  PRIOR YEAR: {prior_yr}")
+        pinned.append("")
+        for row in rows:
+            vals = row["values"]
+            cur_val = vals[lat_idx_full] if lat_idx_full < len(vals) else ""
+            pri_val = vals[pri_idx_full] if pri_idx_full is not None and pri_idx_full < len(vals) else ""
+            if cur_val and cur_val not in ("-", ""):
+                line = f"  {row['label']}: {cur_val}"
+                if pri_val and pri_val not in ("-", ""):
+                    line += f"  [Prior year: {pri_val}]"
+                pinned.append(line)
+        return latest_yr, prior_yr, pinned
+
     L = []
     L.append(f"COMPANY: {data['company_name']}")
     L.append(f"SYMBOL: {data['symbol']}")
     L.append(f"SOURCE: Screener.in {'Consolidated' if data['consolidated'] else 'Standalone'} — {data['url']}")
     L.append("CURRENCY: INR Crores unless stated otherwise")
-    L.append("DATA TYPE: Annual financial data — Cash Flow Statement IS available. Analyse it fully.")
-    L.append("IMPORTANT: Use the most recent quarter from QUARTERLY RESULTS for current period metrics.")
     L.append("")
 
     if data["ratios"]:
-        L.append("=== LIVE KEY RATIOS (current, from Screener.in) ===")
+        L.append("=== LIVE KEY RATIOS (current market data from Screener.in) ===")
         ratio_labels = {
             "market_cap": "Market Cap (Cr)", "pe_ratio": "Stock P/E",
             "book_value": "Book Value per share (₹)", "dividend_yield": "Dividend Yield (%)",
@@ -2655,22 +2753,46 @@ def _screener_to_text(data: dict) -> str:
             L.append(f"  {ratio_labels.get(k, k)}: {v}")
         L.append("")
 
+    # ── PINNED QUARTERLY SECTION ──────────────────────────────────────────────
     if data["quarterly_results"]:
-        L.append("=== QUARTERLY RESULTS (INR Cr) — USE MOST RECENT QUARTER FOR CURRENT METRICS ===")
+        latest_qtr, yoy_qtr, pinned_qtr = _pin_quarterly(data["quarterly_results"])
+        L.append(f"╔══════════════════════════════════════════════════╗")
+        L.append(f"║  LATEST QUARTERLY RESULTS — {latest_qtr:<20} ║")
+        L.append(f"╚══════════════════════════════════════════════════╝")
+        L.append(f"  [Current Quarter: {latest_qtr}  |  YoY Comparison: {yoy_qtr}]")
+        L.append(f"  [AI INSTRUCTION: Use '{latest_qtr}' values as CURRENT QUARTER metrics]")
+        L.append(f"  [AI INSTRUCTION: Use '{yoy_qtr}' values for Year-on-Year growth calculation]")
+        L.append("")
+        L.extend(pinned_qtr)
+        L.append("")
+
+        # Also include full quarterly table for trend analysis
+        L.append("--- FULL QUARTERLY TREND (for multi-quarter context) ---")
         hdrs = data["quarterly_results"][0].get("headers", [])
         if hdrs:
-            L.append("  Periods: " + " | ".join(hdrs))
+            L.append("  " + " | ".join(hdrs))
         for row in data["quarterly_results"]:
             L.append(f"  {row['label']}: {' | '.join(row['values'])}")
         L.append("")
 
+    # ── PINNED ANNUAL SECTION ─────────────────────────────────────────────────
     if data["annual_results"]:
-        L.append("=== ANNUAL P&L — USE FOR CASH FLOW ANALYSIS (INR Cr) ===")
-        L.append("  Find: Cash from Operations, Cash from Investing, Cash from Financing, Capex rows")
-        L.append("  Compute: OCF/PAT ratio to assess cash conversion quality")
+        latest_yr, prior_yr, pinned_ann = _pin_annual(data["annual_results"])
+        L.append(f"╔══════════════════════════════════════════════════╗")
+        L.append(f"║  LATEST ANNUAL RESULTS — {latest_yr:<24} ║")
+        L.append(f"╚══════════════════════════════════════════════════╝")
+        L.append(f"  [Latest Full Year: {latest_yr}  |  Prior Year: {prior_yr}]")
+        L.append(f"  [AI INSTRUCTION: For cash flow — find 'Cash from Operations', 'Cash from Investing',")
+        L.append(f"   'Cash from Financing', 'Capex' rows. Compute OCF/PAT ratio for earnings quality.]")
+        L.append("")
+        L.extend(pinned_ann)
+        L.append("")
+
+        # Full annual table for trend analysis
+        L.append("--- FULL ANNUAL TREND (for multi-year context) ---")
         hdrs = data["annual_results"][0].get("headers", [])
         if hdrs:
-            L.append("  Years: " + " | ".join(hdrs))
+            L.append("  " + " | ".join(hdrs))
         for row in data["annual_results"]:
             L.append(f"  {row['label']}: {' | '.join(row['values'])}")
         L.append("")
@@ -2683,6 +2805,16 @@ def _screener_to_text(data: dict) -> str:
         for row in data["balance_sheet"]:
             L.append(f"  {row['label']}: {' | '.join(row['values'])}")
         L.append("")
+
+    L.append("=== ANALYSIS INSTRUCTIONS ===")
+    L.append("1. QUARTERLY ANALYSIS: Use the pinned LATEST QUARTERLY RESULTS block above.")
+    L.append("   Report: Revenue, Operating Profit, OPM%, Net Profit, EPS for latest quarter vs YoY.")
+    L.append("2. ANNUAL ANALYSIS: Use the pinned LATEST ANNUAL RESULTS block above.")
+    L.append("   Report: Full year revenue, PAT, margins, cash flow quality (OCF/PAT ratio).")
+    L.append("3. The analysis must cover BOTH latest quarter AND latest full year — not just one.")
+    L.append("4. LIVE RATIOS: Use ROE, ROCE, P/E from the live ratios block — these are current values.")
+    L.append("5. CASH FLOW: Annual data has cash flow rows. Find them and compute FCF = OCF - Capex.")
+    L.append("6. SPECIFICITY: Every sentence needs actual numbers. No vague statements.")
 
     return "\n".join(L)
 
