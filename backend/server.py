@@ -764,24 +764,30 @@ def _match_row_label(label: str, patterns: list) -> bool:
 
 
 def _extract_line_values(line: str) -> list:
-    """Extract all numeric values from a text line (handles Indian comma formatting)."""
-    # Match numbers like 269,496 or 22,167 or 13.78 or (22,167) for negatives
+    """Extract all numeric values from a text line (handles Indian comma formatting & negatives)."""
+    import re
     nums = re.findall(r'\([\d,]+(?:\.\d+)?\)|[\d,]+(?:\.\d+)?', line)
     result = []
     for n in nums:
         clean = n.strip('()').replace(',', '')
-        if clean and clean != '':
-            # negative if in parens
-            val = '-' + clean if n.startswith('(') else clean
-            result.append(val)
+        if clean:
+            result.append('-' + clean if n.startswith('(') else clean)
     return result
+
+
+def _is_large_financial_figure(s: str) -> bool:
+    """Returns True if value looks like a P&L/BS figure (>100) rather than a ratio."""
+    try:
+        return abs(float(s.replace(',', ''))) > 100
+    except:
+        return False
 
 
 def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     """
-    Deterministically extract key financial numbers using regex on raw text lines.
-    This approach is more robust than table extraction for complex multi-column layouts.
-    Every extracted value is tagged with its source page.
+    Deterministically extract key financial numbers using line-by-line regex with lookahead.
+    Works for both same-line (ratios) and label+next-line (P&L tables) layouts.
+    Tags every value with its source page and line number.
     """
     result = {
         "company_name": "",
@@ -798,243 +804,215 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     }
     log = result["extraction_log"]
 
-    # Collect raw text per page
-    all_text = ""
+    # ── Read all pages ────────────────────────────────────────────────────────
     page_texts = {}
     try:
         reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
         for page_idx in page_indices:
             if page_idx >= len(reader.pages):
                 continue
-            text = reader.pages[page_idx].extract_text() or ""
-            page_texts[page_idx] = text
-            all_text += f"\n--- PAGE {page_idx+1} ---\n" + text
+            page_texts[page_idx] = reader.pages[page_idx].extract_text() or ""
     except Exception as e:
-        log.append(f"✗ PDF read error: {e}")
+        log.append(f"PDF read error: {e}")
         return result
 
-    # ── Currency ─────────────────────────────────────────────────────────────
-    result["currency"] = _detect_currency_unit(all_text)
+    all_text = "\n".join(page_texts.values())
 
-    # ── Company name ──────────────────────────────────────────────────────────
+    # ── Meta ──────────────────────────────────────────────────────────────────
+    result["currency"] = _detect_currency_unit(all_text)
     result["company_name"] = _extract_company_name_v2(all_text)
 
-    # ── Filing type ───────────────────────────────────────────────────────────
     text_lower = all_text.lower()
-    if "year ended" in text_lower and "annual" in text_lower:
+    if "nine months" in text_lower:
+        result["filing_type"] = "Quarterly (Nine Months YTD)"
+    elif "year ended" in text_lower and "nine months" not in text_lower:
         result["is_quarterly"] = False
         result["filing_type"] = "Annual"
-    elif "nine months" in text_lower:
-        result["filing_type"] = "Quarterly (Nine Months YTD)"
 
-    # ── Period detection ──────────────────────────────────────────────────────
-    period_match = re.search(
-        r"(?:quarter|nine months|year)[\s\w]*ended[\s\w]*(3[01](?:st|nd|rd|th)?\s+(?:dec|sep|mar|jun)['\s]*\d{2,4})",
+    period_m = re.search(
+        r"(?:quarter|nine months|year)[\s\w]*ended[\s\w]*(3[01](?:st|nd|rd|th)?\s+(?:dec|sep|mar|jun)['\.\s]*\d{2,4})",
         all_text, re.IGNORECASE
     )
-    if period_match:
-        result["period"] = period_match.group(1).strip()
+    if period_m:
+        result["period"] = period_m.group(1).strip()
 
-    # ── Line-by-line extraction ───────────────────────────────────────────────
-    # For each page, scan lines and match against known row patterns.
-    # Column 1 (index 0 in extracted nums) = current quarter
-    # Column 3 (index 2 in extracted nums) = same quarter prior year (YoY comparison)
-    # The Reliance filing has 6 value columns: Q_cur | Q_prev | Q_prior_yr | 9M_cur | 9M_prior_yr | FY
-
-    # P&L row definitions: (key, [label patterns])
+    # ── Row definitions ───────────────────────────────────────────────────────
+    # P&L rows: (result_key, [label substrings to match])
     PL_ROWS = [
-        ("revenue",         ["revenue from operations"]),
-        ("total_income",    ["total income"]),
-        ("other_income",    ["other income"]),
-        ("total_expenses",  ["total expenses"]),
-        ("depreciation",    ["depreciation", "amortisation", "amortization"]),
-        ("finance_costs",   ["finance costs"]),
-        ("pbt",             ["profit before tax"]),
-        ("current_tax",     ["current tax"]),
-        ("deferred_tax",    ["deferred tax"]),
-        ("pat_total",       ["profit after tax"]),
-        ("eps_basic",       ["basic (in"]),
-        ("eps_diluted",     ["diluted (in"]),
+        ("revenue",           ["revenue from operations"]),
+        ("gross_revenue",     ["value of sales & services", "value of sales and services"]),
+        ("other_income",      ["other income"]),
+        ("total_income",      ["total income"]),
+        ("cost_materials",    ["cost of materials consumed"]),
+        ("employee_costs",    ["employee benefits expense"]),
+        ("finance_costs",     ["finance costs"]),
+        ("depreciation",      ["depreciation / amortisation", "depreciation/amortisation",
+                               "depreciation and amortisation", "depreciation / amortization"]),
+        ("other_expenses",    ["other expenses"]),
+        ("total_expenses",    ["total expenses"]),
+        ("pbt",               ["profit before tax"]),
+        ("current_tax",       ["current tax"]),
+        ("deferred_tax",      ["deferred tax"]),
+        ("pat_total",         ["profit after tax"]),
+        ("pat_owners",        ["owners of the company", "owners of the parent",
+                               "a)\towners", "a) owners"]),
+        ("pat_minority",      ["non-controlling interest", "b)\tnon-controlling",
+                               "b) non-controlling"]),
+        ("eps_basic",         ["basic (in", "a)\tbasic", "a) basic (in"]),
+        ("eps_diluted",       ["diluted (in", "b)\tdiluted", "b) diluted (in"]),
     ]
 
-    # PAT attribution rows — special handling (label has a) / b) prefix)
-    PAT_ATTR_ROWS = [
-        ("pat_owners",   ["owners of the company", "owners of the parent"]),
-        ("pat_minority", ["non-controlling interest", "minority interest"]),
-    ]
-
-    # Ratios rows (from the Ratios section, labeled a) b) c) etc.)
     RATIO_ROWS = [
         ("debt_service_coverage", ["debt service coverage"]),
         ("interest_coverage",     ["interest service coverage", "interest coverage ratio"]),
         ("debt_equity",           ["debt equity ratio"]),
         ("current_ratio",         ["current ratio"]),
-        ("long_term_debt_wc",     ["long-term debt to working capital", "long term debt to working"]),
+        ("long_term_debt_wc",     ["long-term debt to working capital",
+                                   "long term debt to working"]),
         ("current_liability",     ["current liability ratio"]),
-        ("total_debt_assets",     ["total debts to total assets", "total debt to total assets"]),
+        ("total_debt_assets",     ["total debts to total assets",
+                                   "total debt to total assets"]),
         ("debtors_turnover",      ["debtors turnover"]),
         ("inventory_turnover",    ["inventory turnover"]),
         ("operating_margin",      ["operating margin"]),
         ("net_profit_margin",     ["net profit margin"]),
     ]
 
-    # Segment EBITDA rows
-    SEGMENT_ROWS = [
-        ("O2C",              ["oil to chemicals", "o2c", "o 2c"]),
-        ("Oil & Gas",        ["oil and gas", "oil & gas"]),
-        ("Retail",           ["- retail", "retail*"]),
-        ("Digital Services", ["digital services"]),
-        ("Others",           ["- others"]),
+    SEGMENT_EBITDA_ROWS = [
+        ("O2C",              ["oil to chemicals", "- oil to chemicals", "o2c"]),
+        ("Oil & Gas",        ["oil and gas", "- oil and gas"]),
+        ("Retail",           ["- retail", "retail*", "• retail"]),
+        ("Digital Services", ["digital services", "- digital services"]),
+        ("Others",           ["- others", "• others"]),
         ("Total EBITDA",     ["total segment profit before interest, tax and depreciation",
                               "total segment profit before interest, tax"]),
     ]
 
-    # Net Worth / balance sheet
     NET_WORTH_ROWS = [
         ("net_worth", ["net worth including", "net worth (including"]),
     ]
 
-    # We need to know which pages are consolidated vs standalone
-    # Reliance: pages 10-11 = consolidated, pages 20-21 = standalone
-    # Strategy: prefer consolidated (earlier pages with "consolidated" in header)
-    consolidated_pages = []
-    standalone_pages = []
+    # ── Core extraction with lookahead ────────────────────────────────────────
+    def extract_rows(lines, row_defs, target_dict, page_num,
+                     section_start=None, section_end=None,
+                     require_large=True):
+        """
+        Scan lines for label matches. For each match:
+        - If same line has numbers → use those
+        - Else look at next 1-2 lines for numbers
+        section_start/end: optional keywords to gate extraction
+        """
+        in_section = (section_start is None)
+        section_end_hit = False
+
+        for i, line in enumerate(lines):
+            ll = line.lower().strip()
+            if not ll:
+                continue
+
+            # Section gating
+            if section_start and section_start.lower() in ll:
+                in_section = True
+                continue
+            if section_end and section_end.lower() in ll and in_section:
+                section_end_hit = True
+                break
+            if not in_section:
+                continue
+
+            for key, patterns in row_defs:
+                if key in target_dict:
+                    continue
+                if not any(p in ll for p in patterns):
+                    continue
+
+                # Found label — get values
+                nums = _extract_line_values(line)
+
+                # Filter to only large financial figures if required
+                if require_large:
+                    nums = [n for n in nums if _is_large_financial_figure(n)]
+
+                if not nums and i + 1 < len(lines):
+                    # Look ahead 1 line
+                    nums = _extract_line_values(lines[i + 1])
+                    if require_large:
+                        nums = [n for n in nums if _is_large_financial_figure(n)]
+                if not nums and i + 2 < len(lines):
+                    # Look ahead 2 lines
+                    nums = _extract_line_values(lines[i + 2])
+                    if require_large:
+                        nums = [n for n in nums if _is_large_financial_figure(n)]
+
+                if nums:
+                    current = nums[0]
+                    # For 6-column tables: col[0]=Q_cur, col[1]=Q_prev, col[2]=Q_prior_yr
+                    prior_yr = nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else "")
+                    target_dict[key] = {
+                        "current": current,
+                        "prior": prior_yr,
+                        "label": ll[:60],
+                        "source": f"Page {page_num}, Line {i+1}",
+                    }
+                    log.append(
+                        f"[{key}] = {current} (prior={prior_yr}) "
+                        f"@ Page {page_num} L{i+1}: '{ll[:45]}'"
+                    )
+                break
+
+    # ── Identify consolidated vs standalone pages ─────────────────────────────
+    consolidated_pl_pages = []
+    ratio_pages = []
+    segment_pages = []
+
     for page_idx, text in page_texts.items():
-        t_lower = text.lower()
-        if "unaudited consolidated" in t_lower and "segment" not in t_lower[:200]:
-            consolidated_pages.append(page_idx)
-        elif "unaudited standalone" in t_lower and "segment" not in t_lower[:200]:
-            standalone_pages.append(page_idx)
+        t = text.lower()
+        is_segment = "segment" in t[:200] or "segment value of sales" in t
+        is_consolidated = "unaudited consolidated" in t
+        is_standalone = "unaudited standalone" in t
 
-    log.append(f"Consolidated pages: {[p+1 for p in consolidated_pages]}")
-    log.append(f"Standalone pages: {[p+1 for p in standalone_pages]}")
+        if is_consolidated and not is_segment:
+            consolidated_pl_pages.append(page_idx)
+        if "ratios" in t and ("debt equity" in t or "operating margin" in t):
+            ratio_pages.append(page_idx)
+        if is_segment and ("ebitda" in t or "segment results" in t):
+            segment_pages.append(page_idx)
 
-    # Use consolidated pages first, fall back to all pages
-    search_pages = consolidated_pages if consolidated_pages else list(page_texts.keys())
+    log.append(f"Consolidated P&L pages: {[p+1 for p in consolidated_pl_pages]}")
+    log.append(f"Ratio pages: {[p+1 for p in ratio_pages]}")
+    log.append(f"Segment pages: {[p+1 for p in segment_pages]}")
 
-    def extract_from_pages(pages, row_defs, target_dict, section_keyword=None):
-        for page_idx in pages:
-            text = page_texts.get(page_idx, "")
-            lines = text.split("\n")
-            in_section = (section_keyword is None)
-
-            for line_num, line in enumerate(lines):
-                line_stripped = line.strip()
-                line_lower = line_stripped.lower()
-
-                # Section detection
-                if section_keyword and section_keyword.lower() in line_lower:
-                    in_section = True
-                    continue
-
-                if not in_section:
-                    continue
-
-                for key, patterns in row_defs:
-                    if key in target_dict:
-                        continue  # already found
-                    if any(p in line_lower for p in patterns):
-                        nums = _extract_line_values(line_stripped)
-                        if len(nums) >= 1:
-                            current = nums[0]
-                            prior_yr = nums[2] if len(nums) > 2 else ""
-                            target_dict[key] = {
-                                "current": current,
-                                "prior": prior_yr,
-                                "label": line_stripped[:60].strip(),
-                                "source": f"Page {page_idx+1}, Line {line_num+1}",
-                            }
-                            log.append(f"✓ [{key}] = {current} (prior={prior_yr}) from Page {page_idx+1}: '{line_stripped[:50]}'")
-                            break
+    # Fall back to all pages if categorisation failed
+    pl_pages = consolidated_pl_pages or list(page_texts.keys())
 
     # ── Extract P&L ───────────────────────────────────────────────────────────
-    extract_from_pages(search_pages, PL_ROWS, result["pl"])
-    extract_from_pages(search_pages, PAT_ATTR_ROWS, result["pl"])
+    for page_idx in pl_pages:
+        lines = page_texts[page_idx].split("\n")
+        extract_rows(lines, PL_ROWS, result["pl"], page_idx + 1, require_large=True)
+        extract_rows(lines, NET_WORTH_ROWS, result["balance_sheet"], page_idx + 1, require_large=True)
 
     # ── Extract Ratios ────────────────────────────────────────────────────────
-    # Ratios section: look for "Ratios" header, then extract labeled rows
-    for page_idx in search_pages:
-        text = page_texts.get(page_idx, "")
-        lines = text.split("\n")
-        in_ratios = False
-        for line_num, line in enumerate(lines):
-            ll = line.strip().lower()
-            if ll == "ratios" or ll.startswith("ratios"):
-                in_ratios = True
-                continue
-            # Also detect by ratio label pattern: "a) Debt Service..." 
-            if re.match(r'^[a-l]\)', ll.strip()):
-                in_ratios = True
-
-            if not in_ratios:
-                continue
-
-            # Stop at next section
-            if any(x in ll for x in ["notes", "registered office", "page ", "segment"]) and len(ll) < 30:
-                in_ratios = False
-                continue
-
-            for key, patterns in RATIO_ROWS:
-                if key in result["ratios"]:
-                    continue
-                if any(p in ll for p in patterns):
-                    nums = _extract_line_values(line.strip())
-                    if nums:
-                        # Ratios have fewer columns - first value is current quarter
-                        result["ratios"][key] = {
-                            "current": nums[0],
-                            "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
-                            "label": line.strip()[:60],
-                            "source": f"Page {page_idx+1}, Line {line_num+1}",
-                        }
-                        log.append(f"✓ ratio [{key}] = {nums[0]} from Page {page_idx+1}: '{line.strip()[:50]}'")
-                    break
+    for page_idx in (ratio_pages or list(page_texts.keys())):
+        lines = page_texts[page_idx].split("\n")
+        extract_rows(lines, RATIO_ROWS, result["ratios"], page_idx + 1,
+                     section_start="Ratios", require_large=False)
 
     # ── Extract Segment EBITDA ────────────────────────────────────────────────
-    # Segment section: look for "Segment Results (EBITDA)" 
-    for page_idx in list(page_texts.keys()):  # segment pages
-        text = page_texts.get(page_idx, "")
-        lines = text.split("\n")
-        in_seg = False
-        past_ebitda_header = False
+    for page_idx in (segment_pages or list(page_texts.keys())):
+        lines = page_texts[page_idx].split("\n")
+        extract_rows(lines, SEGMENT_EBITDA_ROWS, result["segments"], page_idx + 1,
+                     section_start="Segment Results (EBITDA)",
+                     section_end="Segment Results (EBIT)",
+                     require_large=True)
 
-        for line_num, line in enumerate(lines):
-            ll = line.strip().lower()
-
-            if "segment results (ebitda)" in ll:
-                in_seg = True
-                past_ebitda_header = True
-                continue
-
-            if not in_seg:
-                continue
-
-            if "segment results (ebit)" in ll or "total segment profit before interest and tax" in ll:
-                in_seg = False
-                continue
-
-            for seg_name, patterns in SEGMENT_ROWS:
-                if seg_name in result["segments"]:
-                    continue
-                if any(p in ll for p in patterns):
-                    nums = _extract_line_values(line.strip())
-                    if nums:
-                        result["segments"][seg_name] = {
-                            "ebitda": nums[0],
-                            "prior": nums[2] if len(nums) > 2 else "",
-                            "source": f"Page {page_idx+1}, Line {line_num+1}",
-                        }
-                        log.append(f"✓ segment [{seg_name}] = {nums[0]} from Page {page_idx+1}")
-                    break
-
-    # ── Extract Net Worth ─────────────────────────────────────────────────────
-    extract_from_pages(search_pages, NET_WORTH_ROWS, result["balance_sheet"])
-
-    logger.info(f"Deterministic extraction complete: {len(result['pl'])} P&L, "
-                f"{len(result['ratios'])} ratios, {len(result['segments'])} segments, "
-                f"company='{result['company_name']}'")
+    logger.info(
+        f"Extraction done: {len(result['pl'])} P&L, "
+        f"{len(result['ratios'])} ratios, "
+        f"{len(result['segments'])} segments, "
+        f"company='{result['company_name']}'"
+    )
     for entry in log:
-        logger.info(f"  {entry}")
+        logger.debug(f"  {entry}")
     return result
 
 
@@ -2372,3 +2350,38 @@ async def generate_pdf(req: PDFRequest):
             last_error = str(e)
         if attempt < 3: await asyncio.sleep(3)
     raise HTTPException(504, f"PDF generation failed after 3 attempts. {last_error}")
+
+
+@app.post("/api/debug/extract")
+async def debug_extract(file: UploadFile = File(...)):
+    """Debug endpoint: returns raw pypdf text + extraction results for a PDF."""
+    raw = await file.read()
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(raw))
+        pages_text = {}
+        for i, page in enumerate(reader.pages[:20]):
+            t = page.extract_text() or ""
+            if t.strip():
+                pages_text[f"page_{i+1}"] = t[:3000]
+
+        page_indices = _select_financial_pages(raw)
+        extracted = _extract_deterministic(raw, page_indices)
+
+        return {
+            "page_count": len(reader.pages),
+            "selected_pages": [p+1 for p in page_indices],
+            "raw_text_per_page": pages_text,
+            "extraction_result": {
+                "company_name": extracted["company_name"],
+                "period": extracted["period"],
+                "filing_type": extracted["filing_type"],
+                "pl_keys_found": list(extracted["pl"].keys()),
+                "ratio_keys_found": list(extracted["ratios"].keys()),
+                "segment_keys_found": list(extracted["segments"].keys()),
+                "pl_details": extracted["pl"],
+                "ratio_details": extracted["ratios"],
+                "extraction_log": extracted["extraction_log"],
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
