@@ -1679,14 +1679,6 @@ RULE 4 — CASH FLOW:
 - Annual report or Screener.in data: analyse cash flow figures actually present.
   Compute OCF/PAT ratio. State earnings quality (Strong if OCF>PAT, Moderate if ≈PAT, Weak if <PAT).
 
-RULE 7 — DUAL PERIOD MANDATORY (SCREENER DATA):
-The data contains BOTH quarterly and annual results. You MUST populate BOTH:
-- quarterly_snapshot: Use the LATEST QUARTERLY RESULTS pinned block (rightmost quarter, e.g. Dec 2025)
-- annual_snapshot: Use the LATEST ANNUAL RESULTS pinned block (e.g. FY2025 / Mar 2025 from Profit & Loss)
-If annual_snapshot fields are left empty or say "Not available" when annual data IS present → CRITICAL FAILURE.
-The annual P&L figures (Sales, Net Profit, OPM%) for FY2025 are in the LATEST ANNUAL RESULTS block.
-USE THEM. Do not skip annual analysis.
-
 RULE 5 — HALLUCINATION BAN (CRITICAL):
 If a number is NOT explicitly in the document or verified block → write "Not available in this filing".
 NEVER invent, estimate, or calculate values not shown. One wrong number destroys user trust.
@@ -1739,7 +1731,7 @@ Return ONLY this JSON (all fields required, no nulls, no markdown fences):
     ]
   }},
   "headline": "One punchy line ≤15 words with the single most important number from this result",
-  "executive_summary": "6 sentences — MANDATORY: (1) Latest quarter revenue+PAT with exact numbers e.g. 'Q3 FY26: Revenue ₹X Cr, up Y% YoY; Net Profit ₹X Cr' (2) Full year FY2025 revenue+PAT from annual P&L e.g. 'FY2025 full year: Revenue ₹X Cr, Net Profit ₹X Cr' (3) Key positive driver with figures (4) Key concern with figures (5) Cash flow quality from annual data (6) Forward outlook",
+  "executive_summary": "5-6 sentences covering BOTH latest quarter AND latest full year: (1) Latest quarter top-line with exact numbers (2) Full year revenue+PAT with figures (3) Key positive driver (4) Key concern with figures (5) Cash flow quality from annual data (6) Forward outlook",
   "investment_label": "",
   "investor_verdict": "2 sentences: rating + core rationale with numbers + single biggest risk",
   "for_long_term_investors": "3-4 sentences: compounding thesis, 2-3 year catalysts, entry context with specifics",
@@ -1753,29 +1745,6 @@ Return ONLY this JSON (all fields required, no nulls, no markdown fences):
     {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
     {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}}
   ],
-  "quarterly_snapshot": {{
-    "period": "e.g. Dec 2025 (Q3 FY26)",
-    "revenue": "Exact figure from quarterly results",
-    "revenue_yoy_change": "e.g. +10.5% from Dec 2024",
-    "operating_profit": "Exact figure",
-    "opm_percent": "e.g. 17%",
-    "net_profit": "Exact figure",
-    "net_profit_yoy_change": "e.g. +1.6% from Dec 2024",
-    "eps": "Exact EPS figure",
-    "key_observation": "2-3 sentences: what stands out in this quarter with specific numbers"
-  }},
-  "annual_snapshot": {{
-    "period": "e.g. FY2025 (Mar 2025)",
-    "revenue": "Exact full-year revenue from Profit & Loss table — e.g. ₹9,62,820 Cr",
-    "revenue_yoy_change": "e.g. +9.6% from FY2024",
-    "operating_profit": "Exact full-year operating profit",
-    "opm_percent": "Full year OPM%",
-    "net_profit": "Exact full-year net profit",
-    "net_profit_yoy_change": "e.g. +4.2% from FY2024",
-    "eps": "Full year EPS",
-    "dividend_payout": "Dividend payout % if available",
-    "key_observation": "2-3 sentences: full year performance assessment with specific numbers and multi-year trend"
-  }},
   "cash_flow_deep_dive": {{
     "operating_cf": "Exact figure with period, or 'Not available — quarterly filing'",
     "investing_cf": "Exact figure or not available",
@@ -1901,8 +1870,6 @@ Return ONLY this JSON:
     {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}},
     {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"up/down/stable","signal":"Positive/Negative/Neutral","comment":""}}
   ],
-  "quarterly_snapshot":{{"period":"e.g. Dec 2025","revenue":"Exact quarterly revenue","revenue_yoy_change":"% change YoY","operating_profit":"Exact figure","opm_percent":"OPM%","net_profit":"Exact quarterly net profit","net_profit_yoy_change":"% YoY","eps":"EPS","key_observation":"2-3 sentences on quarter highlights with numbers"}},
-  "annual_snapshot":{{"period":"e.g. FY2025 Mar 2025","revenue":"MUST USE full-year revenue from Profit & Loss table","revenue_yoy_change":"% change YoY","operating_profit":"Full year op profit","opm_percent":"Annual OPM%","net_profit":"Full year net profit","net_profit_yoy_change":"% YoY","eps":"Annual EPS","dividend_payout":"Dividend payout %","key_observation":"2-3 sentences on full year performance with numbers and trend"}},
   "cash_flow_deep_dive":{{"operating_cf":"Figure or not available","investing_cf":"","financing_cf":"","free_cash_flow":"OCF-Capex or not available","capex":"","cash_conversion_quality":"Strong(OCF Xx PAT)/Moderate/Weak with ratio; or not available reason","ocf_vs_pat_insight":"Earnings quality analysis with numbers, or quarterly limitation"}},
   "balance_sheet_deep_dive":{{"asset_quality":"Asset base with figures","debt_profile":"Total debt, LT vs ST","working_capital_insight":"Debtor/inventory days if available","total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":"Comfortable/Elevated/Stressed with D/E+ICR rationale"}},
   "growth_quality":{{"revenue_growth_context":"WHY revenue changed — segments and figures","profit_growth_context":"PAT drivers with numbers","margin_trend":"Exact bps expansion/contraction","growth_outlook":"Next 2-4 quarters","catalysts":["Catalyst 1 with magnitude","Catalyst 2"],"headwinds":["Headwind 1 with context","Headwind 2"]}},
