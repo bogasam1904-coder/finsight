@@ -21,21 +21,6 @@ const SECTOR_COLORS: Record<string, string> = {
   'Fintech': '#4F8AFF', 'Services': '#64748b',
 };
 
-const TYPE_CONFIG: Record<string, { color: string; icon: string }> = {
-  'Annual Report':    { color: '#4F8AFF', icon: '📗' },
-  'Q1 Results':       { color: '#22c55e', icon: '📊' },
-  'Q2 Results':       { color: '#22c55e', icon: '📊' },
-  'Q3 Results':       { color: '#22c55e', icon: '📊' },
-  'Q4 Results':       { color: '#22c55e', icon: '📊' },
-  'Half-Year Results':{ color: '#f59e0b', icon: '📈' },
-  'Financial Results':{ color: '#f59e0b', icon: '📈' },
-  'Filing':           { color: '#94a3b8', icon: '📄' },
-};
-
-function getTypeConfig(type: string) {
-  return TYPE_CONFIG[type] || { color: '#4F8AFF', icon: '📄' };
-}
-
 export default function SearchTab() {
   const router = useRouter();
   const [query, setQuery] = useState('');
@@ -43,14 +28,10 @@ export default function SearchTab() {
   const [popular, setPopular] = useState<any[]>([]);
   const [searching, setSearching] = useState(false);
   const [selectedCompany, setSelectedCompany] = useState<any>(null);
-  const [filings, setFilings] = useState<any[]>([]);
-  const [loadingFilings, setLoadingFilings] = useState(false);
-  const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [screenerAnalyzing, setScreenerAnalyzing] = useState(false);
   const [notFound, setNotFound] = useState(false);
   const debounceRef = useRef<any>(null);
   const fadeAnim = useRef(new Animated.Value(0)).current;
-  const filingsFadeAnim = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
     Animated.timing(fadeAnim, { toValue: 1, duration: 600, useNativeDriver: true }).start();
@@ -68,7 +49,7 @@ export default function SearchTab() {
   const handleQueryChange = (text: string) => {
     setQuery(text);
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    if (!text.trim()) { setCompanies([]); setNotFound(false); setSelectedCompany(null); setFilings([]); return; }
+    if (!text.trim()) { setCompanies([]); setNotFound(false); setSelectedCompany(null); return; }
     debounceRef.current = setTimeout(() => searchCompanies(text), 300);
   };
 
@@ -84,62 +65,12 @@ export default function SearchTab() {
     finally { setSearching(false); }
   };
 
-  const selectCompany = async (company: any) => {
+  const selectCompany = (company: any) => {
     if (selectedCompany?.symbol === company.symbol) {
-      setSelectedCompany(null); setFilings([]); return;
+      setSelectedCompany(null);
+    } else {
+      setSelectedCompany(company);
     }
-    setSelectedCompany(company);
-    setFilings([]);
-    setLoadingFilings(true);
-    filingsFadeAnim.setValue(0);
-    
-    try {
-      const res = await fetch(`${BACKEND}/api/filings/${company.symbol}`);
-      if (!res.ok) throw new Error('Failed to fetch filings');
-      const data = await res.json();
-      setFilings(data.filings || []);
-      Animated.timing(filingsFadeAnim, { toValue: 1, duration: 400, useNativeDriver: true }).start();
-    } catch (e) {
-      setFilings([]);
-      Alert.alert('Could not fetch filings', 'NSE/BSE may be temporarily unavailable. Try again shortly.');
-    } finally { setLoadingFilings(false); }
-  };
-
-  const analyzeFromUrl = async (filing: any) => {
-    const key = `${filing.source}_${filing.title.substring(0,20)}`;
-    setAnalyzingId(key);
-    
-    try {
-      const token = await AsyncStorage.getItem('token');
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-      
-      const res = await fetch(`${BACKEND}/api/analyze-from-url`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          pdf_url: filing.pdf_url,
-          filename: `${selectedCompany?.symbol}_${filing.type.replace(/\s/g,'_')}.pdf`,
-          source: filing.source.toLowerCase(),
-        }),
-      });
-      
-      const text = await res.text();
-      let data: any;
-      try { data = JSON.parse(text); } catch { throw new Error('Server error'); }
-      
-      if (data.status === 'completed' && data.analysis_id) {
-        router.push(`/analysis/${data.analysis_id}`);
-      } else {
-        throw new Error(data.message || 'Analysis failed');
-      }
-    } catch (e: any) {
-      Alert.alert(
-        'Analysis Failed',
-        e.message || 'Could not analyse this filing. The PDF may be password-protected or inaccessible.',
-        [{ text: 'OK' }]
-      );
-    } finally { setAnalyzingId(null); }
   };
 
   const analyzeFromScreener = async (company: any) => {
@@ -179,7 +110,7 @@ export default function SearchTab() {
         {/* Header */}
         <View style={s.header}>
           <Text style={s.title}>Search & Analyse</Text>
-          <Text style={s.subtitle}>Find any NSE-listed company and analyse their filings directly</Text>
+          <Text style={s.subtitle}>Find any NSE-listed company and get an instant AI analysis</Text>
         </View>
 
         {/* Search bar */}
@@ -197,7 +128,7 @@ export default function SearchTab() {
             />
             {searching && <ActivityIndicator size="small" color="#4F8AFF" style={{ marginRight: 4 }} />}
             {query.length > 0 && !searching && (
-              <TouchableOpacity onPress={() => { setQuery(''); setCompanies([]); setSelectedCompany(null); setFilings([]); setNotFound(false); }}>
+              <TouchableOpacity onPress={() => { setQuery(''); setCompanies([]); setSelectedCompany(null); setNotFound(false); }}>
                 <Text style={s.clearBtn}>✕</Text>
               </TouchableOpacity>
             )}
@@ -249,14 +180,13 @@ export default function SearchTab() {
                       </View>
                     </TouchableOpacity>
 
-                    {/* Filings expanded panel */}
+                    {/* Expanded panel — Quick Analyse only */}
                     {isSelected && (
                       <View style={s.filingsPanel}>
-                        {/* ── Screener.in Quick Analyse ── */}
                         <TouchableOpacity
                           style={[s.screenerBtn, screenerAnalyzing && { opacity: 0.7 }]}
                           onPress={() => analyzeFromScreener(company)}
-                          disabled={screenerAnalyzing || analyzingId !== null}
+                          disabled={screenerAnalyzing}
                         >
                           {screenerAnalyzing ? (
                             <View style={s.screenerBtnInner}>
@@ -273,71 +203,6 @@ export default function SearchTab() {
                             </View>
                           )}
                         </TouchableOpacity>
-
-                        {loadingFilings ? (
-                          <View style={s.filingsLoading}>
-                            <ActivityIndicator color="#4F8AFF" />
-                            <Text style={s.filingsLoadingText}>
-                              Fetching latest filings from NSE & BSE...
-                            </Text>
-                          </View>
-                        ) : filings.length === 0 ? (
-                          <View style={s.filingsEmpty}>
-                            <Text style={s.filingsEmptyIcon}>📭</Text>
-                            <Text style={s.filingsEmptyTitle}>No PDF filings found</Text>
-                            <Text style={s.filingsEmptyText}>
-                              Use Quick Analyse above, or upload a PDF manually.
-                            </Text>
-                          </View>
-                        ) : (
-                          <Animated.View style={{ opacity: filingsFadeAnim }}>
-                            <Text style={s.filingsHeader}>
-                              📂 {filings.length} filings found — tap to analyse instantly
-                            </Text>
-                            {filings.map((filing, fi) => {
-                              const typeConf = getTypeConfig(filing.type);
-                              const isAnalyzing = analyzingId === `${filing.source}_${filing.title.substring(0,20)}`;
-                              return (
-                                <View key={fi} style={s.filingCard}>
-                                  <View style={s.filingCardLeft}>
-                                    {/* Type badge */}
-                                    <View style={[s.typeBadge, { backgroundColor: typeConf.color + '20' }]}>
-                                      <Text style={s.typeBadgeIcon}>{typeConf.icon}</Text>
-                                      <Text style={[s.typeBadgeText, { color: typeConf.color }]}>{filing.type}</Text>
-                                    </View>
-                                    {/* Title */}
-                                    <Text style={s.filingTitle} numberOfLines={2}>{filing.title}</Text>
-                                    {/* Meta */}
-                                    <View style={s.filingMeta}>
-                                      <View style={[s.sourceTag, { backgroundColor: filing.source === 'BSE' ? 'rgba(178,34,34,0.15)' : 'rgba(0,82,255,0.15)' }]}>
-                                        <Text style={[s.sourceTagText, { color: filing.source === 'BSE' ? '#ff6b6b' : '#4F8AFF' }]}>{filing.source}</Text>
-                                      </View>
-                                      {filing.date ? <Text style={s.filingDate}>{filing.date}</Text> : null}
-                                    </View>
-                                  </View>
-                                  {/* Analyse button */}
-                                  <TouchableOpacity
-                                    style={[s.analyzeBtn, isAnalyzing && s.analyzeBtnLoading]}
-                                    onPress={() => analyzeFromUrl(filing)}
-                                    disabled={isAnalyzing || analyzingId !== null}
-                                  >
-                                    {isAnalyzing ? (
-                                      <ActivityIndicator size="small" color="#fff" />
-                                    ) : (
-                                      <>
-                                        <Text style={s.analyzeBtnIcon}>⚡</Text>
-                                        <Text style={s.analyzeBtnText}>Analyse</Text>
-                                      </>
-                                    )}
-                                  </TouchableOpacity>
-                                </View>
-                              );
-                            })}
-                            <Text style={s.filingsTip}>
-                              💡 Tap Analyse to fetch and analyse the PDF directly — no download needed
-                            </Text>
-                          </Animated.View>
-                        )}
                       </View>
                     )}
                   </View>
@@ -353,8 +218,8 @@ export default function SearchTab() {
               <Text style={s.emptyHeroTitle}>Search any NSE company</Text>
               <Text style={s.emptyHeroSub}>
                 Type a company name or NSE symbol above{'\n'}
-                Get their annual reports & quarterly results{'\n'}
-                Analyse directly — no download needed
+                Get instant AI analysis powered by live Screener.in data{'\n'}
+                No PDF download needed
               </Text>
               <View style={s.exampleChips}>
                 {['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'SBIN'].map(sym => (
@@ -371,10 +236,9 @@ export default function SearchTab() {
             <View style={s.howItWorks}>
               <Text style={s.howTitle}>How It Works</Text>
               {[
-                { icon: '🔍', step: 'Search', desc: 'Type any company name or symbol' },
-                { icon: '📂', step: 'Browse', desc: 'See latest annual reports & results from NSE/BSE' },
-                { icon: '⚡', step: 'Analyse', desc: 'Tap Analyse — AI fetches & analyses the PDF for you' },
-                { icon: '📊', step: 'Results', desc: 'Get full analysis with score, metrics & verdict' },
+                { icon: '🔍', step: 'Search', desc: 'Type any company name or NSE symbol' },
+                { icon: '⚡', step: 'Quick Analyse', desc: 'Tap to instantly fetch live data from Screener.in' },
+                { icon: '📊', step: 'Results', desc: 'Full AI analysis — score, metrics, verdict & more' },
               ].map((h, i) => (
                 <View key={i} style={s.howStep}>
                   <View style={s.howStepIcon}><Text style={{ fontSize: 20 }}>{h.icon}</Text></View>
@@ -423,28 +287,6 @@ const s = StyleSheet.create({
   rowRight: { flexShrink: 0 },
   chevron: { fontSize: 12, fontWeight: '800' },
   filingsPanel: { backgroundColor: '#0A1220', borderWidth: 1, borderTopWidth: 0, borderColor: 'rgba(79,138,255,0.2)', borderBottomLeftRadius: 18, borderBottomRightRadius: 18, padding: 16, marginBottom: 10 },
-  filingsLoading: { alignItems: 'center', paddingVertical: 28, gap: 12 },
-  filingsLoadingText: { color: 'rgba(255,255,255,0.35)', fontSize: 13 },
-  filingsEmpty: { alignItems: 'center', paddingVertical: 24 },
-  filingsEmptyIcon: { fontSize: 36, marginBottom: 10 },
-  filingsEmptyTitle: { color: '#fff', fontSize: 15, fontWeight: '700', marginBottom: 6 },
-  filingsEmptyText: { color: 'rgba(255,255,255,0.35)', fontSize: 12, textAlign: 'center', lineHeight: 18 },
-  filingsHeader: { color: '#4F8AFF', fontSize: 12, fontWeight: '700', marginBottom: 12 },
-  filingCard: { backgroundColor: '#0D1426', borderRadius: 14, padding: 14, marginBottom: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderColor: 'rgba(255,255,255,0.06)', gap: 10 },
-  filingCardLeft: { flex: 1 },
-  typeBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, alignSelf: 'flex-start', marginBottom: 6 },
-  typeBadgeIcon: { fontSize: 12 },
-  typeBadgeText: { fontSize: 10, fontWeight: '800' },
-  filingTitle: { color: '#fff', fontSize: 13, fontWeight: '600', lineHeight: 18, marginBottom: 6 },
-  filingMeta: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  sourceTag: { borderRadius: 5, paddingHorizontal: 6, paddingVertical: 2 },
-  sourceTagText: { fontSize: 9, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 0.5 },
-  filingDate: { color: 'rgba(255,255,255,0.25)', fontSize: 11 },
-  analyzeBtn: { backgroundColor: '#4F8AFF', borderRadius: 12, paddingVertical: 10, paddingHorizontal: 14, alignItems: 'center', flexShrink: 0, minWidth: 78 },
-  analyzeBtnLoading: { backgroundColor: '#2563EB', opacity: 0.8 },
-  analyzeBtnIcon: { fontSize: 16, marginBottom: 2 },
-  analyzeBtnText: { color: '#fff', fontSize: 11, fontWeight: '800' },
-  filingsTip: { color: 'rgba(255,255,255,0.2)', fontSize: 11, textAlign: 'center', marginTop: 4, fontStyle: 'italic' },
   emptyHero: { alignItems: 'center', paddingTop: 60, paddingHorizontal: 32 },
   emptyHeroEmoji: { fontSize: 64, marginBottom: 20 },
   emptyHeroTitle: { color: '#fff', fontSize: 22, fontWeight: '900', marginBottom: 12, letterSpacing: -0.5 },
@@ -459,9 +301,9 @@ const s = StyleSheet.create({
   howStepInfo: { flex: 1 },
   howStepTitle: { color: '#fff', fontSize: 14, fontWeight: '700', marginBottom: 2 },
   howStepDesc: { color: 'rgba(255,255,255,0.35)', fontSize: 12, lineHeight: 18 },
-  screenerBtn: { backgroundColor: '#1a2f1a', borderRadius: 14, padding: 14, marginBottom: 14, borderWidth: 1.5, borderColor: '#22c55e40' },
+  screenerBtn: { backgroundColor: '#1a2f1a', borderRadius: 14, padding: 16, borderWidth: 1.5, borderColor: '#22c55e40' },
   screenerBtnInner: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  screenerBtnIcon: { fontSize: 22, width: 36, height: 36, textAlign: 'center', lineHeight: 36, backgroundColor: 'rgba(34,197,94,0.15)', borderRadius: 10 },
+  screenerBtnIcon: { fontSize: 22, width: 40, height: 40, textAlign: 'center', lineHeight: 40, backgroundColor: 'rgba(34,197,94,0.15)', borderRadius: 10 },
   screenerBtnText: { color: '#22c55e', fontSize: 14, fontWeight: '800' },
   screenerBtnSub: { color: 'rgba(34,197,94,0.55)', fontSize: 11, marginTop: 2 },
 });
