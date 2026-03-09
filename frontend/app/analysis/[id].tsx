@@ -284,6 +284,15 @@ export default function AnalysisScreen() {
       const html = buildPDF(analysis.result, dark);
 
       if (Platform.OS === 'web') {
+        // Helper: trigger blob download — works on mobile browsers, no popup needed
+        const triggerBlobDownload = (blob: Blob, filename: string) => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = filename; a.style.display = 'none';
+          document.body.appendChild(a); a.click();
+          setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 500);
+        };
+
         // Try backend PDF generation first
         try {
           const resp = await fetch(`${BACKEND}/api/generate-pdf`, {
@@ -294,27 +303,15 @@ export default function AnalysisScreen() {
           if (resp.ok) {
             const blob = await resp.blob();
             if (blob.size > 1000) {
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = `${company}_FinSight_Analysis.pdf`;
-              document.body.appendChild(a);
-              a.click();
-              setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 200);
+              triggerBlobDownload(blob, `${company}_FinSight_Analysis.pdf`);
               return;
             }
           }
-        } catch { /* fall through to print */ }
+        } catch { /* fall through to HTML fallback */ }
 
-        // Fallback: open print dialog
-        const win = window.open('', '_blank');
-        if (win) {
-          win.document.write(html);
-          win.document.close();
-          win.onload = () => { win.focus(); win.print(); };
-        } else {
-          Alert.alert('PDF', 'Please allow popups to download the PDF, or use the print shortcut (Ctrl+P / Cmd+P).');
-        }
+        // Fallback: download as self-contained HTML (works on all mobile browsers, no popup)
+        const htmlBlob = new Blob([html], { type: 'text/html;charset=utf-8' });
+        triggerBlobDownload(htmlBlob, `${company}_FinSight_Analysis.html`);
       } else {
         const [P, S] = await Promise.all([import('expo-print'), import('expo-sharing')]);
         const { uri } = await P.printToFileAsync({ html, base64: false });
@@ -331,7 +328,7 @@ export default function AnalysisScreen() {
     }
   };
 
-  const shareUrl = `https://finsight-vert.vercel.app/share/${id}`;
+  const shareUrl = `https://finsight-vert.vercel.app/analysis/${id}`;
 
   const handleCopyLink = async () => {
     if (Platform.OS === 'web' && navigator?.clipboard) {
