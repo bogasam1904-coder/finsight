@@ -765,7 +765,6 @@ def _match_row_label(label: str, patterns: list) -> bool:
 
 def _extract_line_values(line: str) -> list:
     """Extract all numeric values from a text line (handles Indian comma formatting & negatives)."""
-    import re
     nums = re.findall(r'\([\d,]+(?:\.\d+)?\)|[\d,]+(?:\.\d+)?', line)
     result = []
     for n in nums:
@@ -775,19 +774,216 @@ def _extract_line_values(line: str) -> list:
     return result
 
 
-def _is_large_financial_figure(s: str) -> bool:
-    """Returns True if value looks like a P&L/BS figure (>100) rather than a ratio."""
-    try:
-        return abs(float(s.replace(',', ''))) > 100
-    except:
-        return False
+def _get_large_nums(line: str) -> list:
+    """Extract numbers > 100 (financial figures, not ratios)."""
+    result = []
+    for n in _extract_line_values(line):
+        try:
+            if abs(float(n)) > 100:
+                result.append(n)
+        except:
+            pass
+    return result
+
+
+def _fix_font_encoded_number(s: str) -> str:
+    """
+    Fix font-encoding corruption common in BSE filing PDFs.
+    e.g. "J,912" -> "7,912"  (J is encoded as digit 7)
+         "22;1s1" -> "22,161" (semicolon for comma, s for 6)
+         "-Aoa,245:" -> likely garbage, return empty
+    """
+    # Replace known glyph substitutions
+    s = s.replace(';', ',').replace('J', '7').replace('s', '6').replace('l', '1')
+    s = s.strip(':').strip()
+    # If it still contains non-numeric chars (other than . , - () ), it's garbled
+    if re.search(r'[A-Za-z]', s):
+        return ''
+    return s
+
+
+def _get_large_nums_with_fallback(line: str) -> tuple:
+    """
+    Extract large numbers from a line with sanity checking.
+    Returns (current_q_val, prior_q_val, sep_q_val).
+    current_q_val is empty if first column appears corrupted/fragmented.
+    Detects font-encoding corruption where first column is dramatically smaller
+    than second column (a telltale sign of partial/garbled extraction).
+    """
+    tokens = re.findall(r'\([\d,;Jsl]+(?:\.\d+)?\)|[\d,;Jsl]+(?:\.\d+)?', line)
+    clean_nums = []
+    for t in tokens:
+        is_neg = t.startswith('(')
+        raw = t.strip('()')
+        direct = raw.replace(',', '').replace(';', '')
+        try:
+            val = float(direct)
+            if abs(val) > 100:
+                clean_nums.append(('-' if is_neg else '') + str(int(val)))
+                continue
+        except:
+            pass
+
+    if not clean_nums:
+        return '', '', ''
+
+    current = clean_nums[0]
+    sep_q   = clean_nums[1] if len(clean_nums) > 1 else ''
+    prior   = clean_nums[2] if len(clean_nums) > 2 else ''
+
+    # Sanity check: if current is < 30% of sep_q on a large-value line, 
+    # it's likely a corrupted fragment (font encoding issue)
+    if current and sep_q:
+        try:
+            c, s = abs(float(current)), abs(float(sep_q))
+            if s > 1000 and c < s * 0.30:
+                return '', prior, sep_q  # current unreliable
+        except:
+            pass
+
+    return current, prior, sep_q
+
+
+def _extract_pl_any_layout(lines: list, page_num: int, log: list) -> dict:
+    """
+    Extract P&L handling both row-by-row and font-encoding-corrupted layouts.
+    BSE filings often have font encoding issues in column 1 (current quarter).
+    Falls back to prior quarter (Sep'25) when current quarter column is unreadable.
+    """
+    # Ordered P&L rows as they appear in Indian quarterly filings
+    PL_ORDERED = [
+        ("gross_revenue",  ["value of sales & services", "value of sales and services"]),
+        ("gst_recovered",  ["less: gst recovered", "less:gst"]),
+        ("revenue",        ["revenue from operations"]),
+        ("other_income",   ["other income"]),
+        ("total_income",   ["total income"]),
+        ("cost_materials", ["cost of materials consumed"]),
+        ("stock_purchases",["purchases of stock-in-trade"]),
+        ("inv_changes",    ["changes in inventories"]),
+        ("excise_duty",    ["excise duty"]),
+        ("employee_costs", ["employee benefits expense"]),
+        ("finance_costs",  ["finance costs"]),
+        ("depreciation",   ["depreciation / amortisation", "depreciation/amortisation",
+                            "depreciation and amortisation", "depreciation / amortization"]),
+        ("other_expenses", ["other expenses"]),
+        ("total_expenses", ["total expenses"]),
+        ("pbt",            ["profit before tax"]),
+        ("current_tax",    ["current tax"]),
+        ("deferred_tax",   ["deferred tax"]),
+        ("pat_total",      ["profit after tax"]),
+    ]
+
+    # Attribution rows appear AFTER pat_total - handle separately
+    ATTR_ROWS = [
+        ("pat_owners",   ["a) owners of the company", "owners of the company",
+                          "a)\towners", "attributable to owners"]),
+        ("pat_minority", ["b) non-controlling interest", "non-controlling interest",
+                          "b)\tnon-controlling", "minority interest"]),
+    ]
+
+    # EPS rows
+    EPS_ROWS = [
+        ("eps_basic",   ["a) basic (in", "basic (in ₹", "basic (in rs",
+                         "a)\tbasic", "basic earnings per"]),
+        ("eps_diluted", ["b) diluted (in", "diluted (in ₹", "diluted (in rs",
+                         "b)\tdiluted", "diluted earnings per"]),
+    ]
+
+    result = {}
+
+    # ── Pass 1: Row-by-row (label + values same line or lookahead) ────────────
+    all_patterns = PL_ORDERED + ATTR_ROWS + EPS_ROWS
+    for i, line in enumerate(lines):
+        ll = line.lower().strip()
+        for key, patterns in all_patterns:
+            if key in result:
+                continue
+            if not any(p in ll for p in patterns):
+                continue
+            # Try same line, then next 2 lines
+            nums = _get_large_nums(line)
+            for offset in [1, 2]:
+                if nums:
+                    break
+                if i + offset < len(lines):
+                    nums = _get_large_nums(lines[i + offset])
+            if nums:
+                result[key] = {
+                    "current": nums[0],
+                    "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
+                    "source": f"Page {page_num}, Line {i + 1} (row-by-row)",
+                }
+                log.append(f"[{key}] = {nums[0]} @ P{page_num}L{i+1} (row-by-row)")
+            break
+
+    if len([k for k in result if k in dict(PL_ORDERED)]) >= 4:
+        return result  # Row-by-row gave enough rows
+
+    log.append(f"Row-by-row yielded only {len(result)} rows, trying column-first layout")
+
+    # ── Pass 2: Column-first (all labels then all values) ─────────────────────
+    matched_keys = []   # [(key, line_idx), ...] in document order
+    value_rows = []     # [(nums_list, line_idx), ...] in document order
+
+    for i, line in enumerate(lines):
+        ll = line.lower().strip()
+        for key, patterns in PL_ORDERED:
+            if any(p in ll for p in patterns):
+                if not any(mk == key for mk, _ in matched_keys):
+                    matched_keys.append((key, i))
+                break
+
+    for i, line in enumerate(lines):
+        nums = _get_large_nums(line)
+        if len(nums) >= 3:  # Real value row has ≥3 columns
+            value_rows.append((nums, i))
+
+    log.append(f"Column-first: {len(matched_keys)} label matches, {len(value_rows)} value rows")
+
+    # Zip by position
+    result_p2 = {}
+    for pos, (key, label_idx) in enumerate(matched_keys):
+        if pos < len(value_rows):
+            nums, val_idx = value_rows[pos]
+            result_p2[key] = {
+                "current": nums[0],
+                "prior": nums[2] if len(nums) > 2 else "",
+                "source": f"Page {page_num}, Label L{label_idx+1}→Values L{val_idx+1} (col-first)",
+            }
+            log.append(f"[{key}] = {nums[0]} @ col-first L{label_idx+1}→{val_idx+1}")
+
+    # Also try attribution rows with lookahead after pat_total
+    pat_line = next((i for i, l in enumerate(lines) if "profit after tax" in l.lower()), None)
+    if pat_line is not None:
+        for i in range(pat_line, min(pat_line + 10, len(lines))):
+            ll = lines[i].lower().strip()
+            for key, patterns in ATTR_ROWS + EPS_ROWS:
+                if key in result_p2:
+                    continue
+                if any(p in ll for p in patterns):
+                    nums = _get_large_nums(lines[i])
+                    for offset in [1, 2]:
+                        if nums:
+                            break
+                        if i + offset < len(lines):
+                            nums = _get_large_nums(lines[i + offset])
+                    if nums:
+                        result_p2[key] = {
+                            "current": nums[0],
+                            "prior": nums[2] if len(nums) > 2 else "",
+                            "source": f"Page {page_num}, Line {i+1} (attr)",
+                        }
+
+    # Return whichever pass got more results
+    if len(result_p2) >= len(result):
+        return result_p2
+    return result
 
 
 def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     """
-    Deterministically extract key financial numbers using line-by-line regex with lookahead.
-    Works for both same-line (ratios) and label+next-line (P&L tables) layouts.
-    Tags every value with its source page and line number.
+    Deterministically extract key financial numbers from a BSE/NSE filing PDF.
+    Handles both row-by-row and column-first pypdf extraction layouts.
     """
     result = {
         "company_name": "",
@@ -804,7 +1000,7 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     }
     log = result["extraction_log"]
 
-    # ── Read all pages ────────────────────────────────────────────────────────
+    # ── Read pages ────────────────────────────────────────────────────────────
     page_texts = {}
     try:
         reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
@@ -822,10 +1018,10 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     result["currency"] = _detect_currency_unit(all_text)
     result["company_name"] = _extract_company_name_v2(all_text)
 
-    text_lower = all_text.lower()
-    if "nine months" in text_lower:
+    t_lower = all_text.lower()
+    if "nine months" in t_lower:
         result["filing_type"] = "Quarterly (Nine Months YTD)"
-    elif "year ended" in text_lower and "nine months" not in text_lower:
+    elif "year ended" in t_lower and "nine months" not in t_lower:
         result["is_quarterly"] = False
         result["filing_type"] = "Annual"
 
@@ -836,180 +1032,153 @@ def _extract_deterministic(raw_bytes: bytes, page_indices: list) -> dict:
     if period_m:
         result["period"] = period_m.group(1).strip()
 
-    # ── Row definitions ───────────────────────────────────────────────────────
-    # P&L rows: (result_key, [label substrings to match])
-    PL_ROWS = [
-        ("revenue",           ["revenue from operations"]),
-        ("gross_revenue",     ["value of sales & services", "value of sales and services"]),
-        ("other_income",      ["other income"]),
-        ("total_income",      ["total income"]),
-        ("cost_materials",    ["cost of materials consumed"]),
-        ("employee_costs",    ["employee benefits expense"]),
-        ("finance_costs",     ["finance costs"]),
-        ("depreciation",      ["depreciation / amortisation", "depreciation/amortisation",
-                               "depreciation and amortisation", "depreciation / amortization"]),
-        ("other_expenses",    ["other expenses"]),
-        ("total_expenses",    ["total expenses"]),
-        ("pbt",               ["profit before tax"]),
-        ("current_tax",       ["current tax"]),
-        ("deferred_tax",      ["deferred tax"]),
-        ("pat_total",         ["profit after tax"]),
-        ("pat_owners",        ["owners of the company", "owners of the parent",
-                               "a)\towners", "a) owners"]),
-        ("pat_minority",      ["non-controlling interest", "b)\tnon-controlling",
-                               "b) non-controlling"]),
-        ("eps_basic",         ["basic (in", "a)\tbasic", "a) basic (in"]),
-        ("eps_diluted",       ["diluted (in", "b)\tdiluted", "b) diluted (in"]),
-    ]
-
-    RATIO_ROWS = [
-        ("debt_service_coverage", ["debt service coverage"]),
-        ("interest_coverage",     ["interest service coverage", "interest coverage ratio"]),
-        ("debt_equity",           ["debt equity ratio"]),
-        ("current_ratio",         ["current ratio"]),
-        ("long_term_debt_wc",     ["long-term debt to working capital",
-                                   "long term debt to working"]),
-        ("current_liability",     ["current liability ratio"]),
-        ("total_debt_assets",     ["total debts to total assets",
-                                   "total debt to total assets"]),
-        ("debtors_turnover",      ["debtors turnover"]),
-        ("inventory_turnover",    ["inventory turnover"]),
-        ("operating_margin",      ["operating margin"]),
-        ("net_profit_margin",     ["net profit margin"]),
-    ]
-
-    SEGMENT_EBITDA_ROWS = [
-        ("O2C",              ["oil to chemicals", "- oil to chemicals", "o2c"]),
-        ("Oil & Gas",        ["oil and gas", "- oil and gas"]),
-        ("Retail",           ["- retail", "retail*", "• retail"]),
-        ("Digital Services", ["digital services", "- digital services"]),
-        ("Others",           ["- others", "• others"]),
-        ("Total EBITDA",     ["total segment profit before interest, tax and depreciation",
-                              "total segment profit before interest, tax"]),
-    ]
-
-    NET_WORTH_ROWS = [
-        ("net_worth", ["net worth including", "net worth (including"]),
-    ]
-
-    # ── Core extraction with lookahead ────────────────────────────────────────
-    def extract_rows(lines, row_defs, target_dict, page_num,
-                     section_start=None, section_end=None,
-                     require_large=True):
-        """
-        Scan lines for label matches. For each match:
-        - If same line has numbers → use those
-        - Else look at next 1-2 lines for numbers
-        section_start/end: optional keywords to gate extraction
-        """
-        in_section = (section_start is None)
-        section_end_hit = False
-
-        for i, line in enumerate(lines):
-            ll = line.lower().strip()
-            if not ll:
-                continue
-
-            # Section gating
-            if section_start and section_start.lower() in ll:
-                in_section = True
-                continue
-            if section_end and section_end.lower() in ll and in_section:
-                section_end_hit = True
-                break
-            if not in_section:
-                continue
-
-            for key, patterns in row_defs:
-                if key in target_dict:
-                    continue
-                if not any(p in ll for p in patterns):
-                    continue
-
-                # Found label — get values
-                nums = _extract_line_values(line)
-
-                # Filter to only large financial figures if required
-                if require_large:
-                    nums = [n for n in nums if _is_large_financial_figure(n)]
-
-                if not nums and i + 1 < len(lines):
-                    # Look ahead 1 line
-                    nums = _extract_line_values(lines[i + 1])
-                    if require_large:
-                        nums = [n for n in nums if _is_large_financial_figure(n)]
-                if not nums and i + 2 < len(lines):
-                    # Look ahead 2 lines
-                    nums = _extract_line_values(lines[i + 2])
-                    if require_large:
-                        nums = [n for n in nums if _is_large_financial_figure(n)]
-
-                if nums:
-                    current = nums[0]
-                    # For 6-column tables: col[0]=Q_cur, col[1]=Q_prev, col[2]=Q_prior_yr
-                    prior_yr = nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else "")
-                    target_dict[key] = {
-                        "current": current,
-                        "prior": prior_yr,
-                        "label": ll[:60],
-                        "source": f"Page {page_num}, Line {i+1}",
-                    }
-                    log.append(
-                        f"[{key}] = {current} (prior={prior_yr}) "
-                        f"@ Page {page_num} L{i+1}: '{ll[:45]}'"
-                    )
-                break
-
-    # ── Identify consolidated vs standalone pages ─────────────────────────────
+    # ── Categorise pages ──────────────────────────────────────────────────────
     consolidated_pl_pages = []
     ratio_pages = []
     segment_pages = []
 
     for page_idx, text in page_texts.items():
         t = text.lower()
-        is_segment = "segment" in t[:200] or "segment value of sales" in t
-        is_consolidated = "unaudited consolidated" in t
-        is_standalone = "unaudited standalone" in t
-
-        if is_consolidated and not is_segment:
+        is_segment_page = "segment" in t[:300] or "segment value of sales" in t
+        if "unaudited consolidated" in t and not is_segment_page:
             consolidated_pl_pages.append(page_idx)
         if "ratios" in t and ("debt equity" in t or "operating margin" in t):
             ratio_pages.append(page_idx)
-        if is_segment and ("ebitda" in t or "segment results" in t):
+        if is_segment_page and ("ebitda" in t or "segment results" in t):
             segment_pages.append(page_idx)
 
-    log.append(f"Consolidated P&L pages: {[p+1 for p in consolidated_pl_pages]}")
+    log.append(f"Consol P&L pages: {[p+1 for p in consolidated_pl_pages]}")
     log.append(f"Ratio pages: {[p+1 for p in ratio_pages]}")
-    log.append(f"Segment pages: {[p+1 for p in segment_pages]}")
 
-    # Fall back to all pages if categorisation failed
     pl_pages = consolidated_pl_pages or list(page_texts.keys())
 
     # ── Extract P&L ───────────────────────────────────────────────────────────
     for page_idx in pl_pages:
         lines = page_texts[page_idx].split("\n")
-        extract_rows(lines, PL_ROWS, result["pl"], page_idx + 1, require_large=True)
-        extract_rows(lines, NET_WORTH_ROWS, result["balance_sheet"], page_idx + 1, require_large=True)
+        pl_result = _extract_pl_any_layout(lines, page_idx + 1, log)
+        for k, v in pl_result.items():
+            if k not in result["pl"]:
+                result["pl"][k] = v
 
-    # ── Extract Ratios ────────────────────────────────────────────────────────
+    # ── Revenue fallback from segment page (always clean) ────────────────────
+    # BSE filings have font encoding issues in P&L col 1; segment page is cleaner
+    if "revenue" not in result["pl"] or result["pl"]["revenue"].get("source","").endswith("[Sep25-fallback]"):
+        seg_pages = segment_pages or list(page_texts.keys())
+        for page_idx in seg_pages:
+            lines = page_texts[page_idx].split("\n")
+            for i, line in enumerate(lines):
+                ll = line.lower().strip()
+                if "revenue from operations" in ll:
+                    current, prior, sep25 = _get_large_nums_with_fallback(line)
+                    for offset in [1, 2]:
+                        if current: break
+                        if i+offset < len(lines):
+                            current, prior, sep25 = _get_large_nums_with_fallback(lines[i+offset])
+                    if current:
+                        result["pl"]["revenue"] = {
+                            "current": current, "prior": prior,
+                            "source": f"Page {page_idx+1}, Line {i+1} (from segment page)"
+                        }
+                        log.append(f"[revenue] = {current} from segment page")
+                        break
+
+    # ── Net Worth ─────────────────────────────────────────────────────────────
+    for page_idx in pl_pages:
+        lines = page_texts[page_idx].split("\n")
+        for i, line in enumerate(lines):
+            ll = line.lower()
+            if "net worth" in ll and ("including" in ll or "retained" in ll):
+                nums = _get_large_nums(line)
+                for offset in [1, 2]:
+                    if nums: break
+                    if i+offset < len(lines):
+                        nums = _get_large_nums(lines[i+offset])
+                if nums:
+                    result["balance_sheet"]["net_worth"] = {
+                        "current": nums[0], "prior": nums[2] if len(nums)>2 else "",
+                        "source": f"Page {page_idx+1}, Line {i+1}"
+                    }
+                    log.append(f"[net_worth] = {nums[0]}")
+                    break
+
+    # ── Ratios ────────────────────────────────────────────────────────────────
+    RATIO_ROWS = [
+        ("debt_service_coverage", ["debt service coverage"]),
+        ("interest_coverage",     ["interest service coverage", "interest coverage ratio"]),
+        ("debt_equity",           ["debt equity ratio"]),
+        ("current_ratio",         ["current ratio"]),
+        ("long_term_debt_wc",     ["long-term debt to working capital", "long term debt to working"]),
+        ("current_liability",     ["current liability ratio"]),
+        ("total_debt_assets",     ["total debts to total assets", "total debt to total assets"]),
+        ("debtors_turnover",      ["debtors turnover"]),
+        ("inventory_turnover",    ["inventory turnover"]),
+        ("operating_margin",      ["operating margin"]),
+        ("net_profit_margin",     ["net profit margin"]),
+    ]
+
     for page_idx in (ratio_pages or list(page_texts.keys())):
         lines = page_texts[page_idx].split("\n")
-        extract_rows(lines, RATIO_ROWS, result["ratios"], page_idx + 1,
-                     section_start="Ratios", require_large=False)
+        in_ratios = False
+        for i, line in enumerate(lines):
+            ll = line.lower().strip()
+            if ll == "ratios" or re.match(r'^[a-l]\)\s', ll):
+                in_ratios = True
+            if not in_ratios:
+                continue
+            if any(x in ll for x in ["notes", "registered office", "segment"]) and len(ll) < 30:
+                in_ratios = False
+                continue
+            for key, patterns in RATIO_ROWS:
+                if key in result["ratios"]:
+                    continue
+                if any(p in ll for p in patterns):
+                    nums = _extract_line_values(line)
+                    if nums:
+                        result["ratios"][key] = {
+                            "current": nums[0],
+                            "prior": nums[2] if len(nums) > 2 else (nums[1] if len(nums) > 1 else ""),
+                            "source": f"Page {page_idx+1}, Line {i+1}",
+                        }
+                        log.append(f"ratio [{key}] = {nums[0]}")
+                    break
 
-    # ── Extract Segment EBITDA ────────────────────────────────────────────────
-    for page_idx in (segment_pages or list(page_texts.keys())):
+    # ── Segment EBITDA ────────────────────────────────────────────────────────
+    SEGMENT_ROWS = [
+        ("O2C",             ["oil to chemicals", "- oil to chemicals"]),
+        ("Oil & Gas",       ["oil and gas", "- oil and gas"]),
+        ("Retail",          ["- retail", "retail*"]),
+        ("Digital Services",["digital services", "- digital services"]),
+        ("Others",          ["- others"]),
+    ]
+    for page_idx in (segment_pages or []):
         lines = page_texts[page_idx].split("\n")
-        extract_rows(lines, SEGMENT_EBITDA_ROWS, result["segments"], page_idx + 1,
-                     section_start="Segment Results (EBITDA)",
-                     section_end="Segment Results (EBIT)",
-                     require_large=True)
+        in_ebitda = False
+        for i, line in enumerate(lines):
+            ll = line.lower().strip()
+            if "segment results (ebitda)" in ll:
+                in_ebitda = True
+                continue
+            if "segment results (ebit)" in ll:
+                in_ebitda = False
+                continue
+            if not in_ebitda:
+                continue
+            for seg, patterns in SEGMENT_ROWS:
+                if seg in result["segments"]:
+                    continue
+                if any(p in ll for p in patterns):
+                    nums = _get_large_nums(line)
+                    if nums:
+                        result["segments"][seg] = {
+                            "ebitda": nums[0], "prior": nums[2] if len(nums)>2 else "",
+                            "source": f"Page {page_idx+1}, Line {i+1}"
+                        }
+                        log.append(f"segment [{seg}] = {nums[0]}")
+                    break
 
     logger.info(
-        f"Extraction done: {len(result['pl'])} P&L, "
-        f"{len(result['ratios'])} ratios, "
-        f"{len(result['segments'])} segments, "
-        f"company='{result['company_name']}'"
+        f"Extraction: {len(result['pl'])} P&L, {len(result['ratios'])} ratios, "
+        f"company='{result['company_name']}', period='{result['period']}'"
     )
     for entry in log:
         logger.debug(f"  {entry}")
