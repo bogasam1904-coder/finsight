@@ -26,7 +26,7 @@ GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 
 executor = ThreadPoolExecutor(max_workers=4)
-app = FastAPI(title="FinSight API v13")
+app = FastAPI(title="FinSight API v14")
 
 # ─── CORS ────────────────────────────────────────────────────────────────────
 from fastapi.middleware.cors import CORSMiddleware
@@ -284,7 +284,6 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
             await c.get("https://www.nseindia.com/", headers=NSE_HEADERS)
-
             r = await c.get(
                 f"https://www.nseindia.com/api/annual-reports?symbol={symbol}&issuer={symbol}&type=annual-report",
                 headers=NSE_HEADERS)
@@ -292,7 +291,6 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
                 try:
                     data = r.json()
                 except Exception:
-                    logger.warning(f"NSE annual-reports JSON decode failed for {symbol}")
                     data = {}
                 items = data.get("data") or (data if isinstance(data, list) else [])
                 for item in items[:10]:
@@ -304,9 +302,7 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
                                     "date": item.get("dt") or item.get("sort_date") or "",
                                     "pdf_url": pdf, "type": "Annual Report", "source": "NSE", "symbol": symbol})
                 if filings:
-                    logger.info(f"NSE annual-reports: {len(filings)} for {symbol}")
                     return filings
-
             for category in ["annual-report", "financial-results"]:
                 r2 = await c.get(
                     f"https://www.nseindia.com/api/corporates-announcements?index=equities&symbol={symbol}&category={category}",
@@ -323,7 +319,6 @@ async def fetch_nse_filings(symbol: str) -> List[dict]:
                     filings.append({"title": title, "date": item.get("an_dt") or item.get("dt") or "",
                                     "pdf_url": pdf, "type": _classify_filing(title), "source": "NSE", "symbol": symbol})
                 if filings:
-                    logger.info(f"NSE announcements ({category}): {len(filings)} for {symbol}")
                     return filings[:10]
     except Exception as e:
         logger.warning(f"NSE filings error for {symbol}: {e}")
@@ -358,20 +353,14 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
 
         async with httpx.AsyncClient(timeout=25, follow_redirects=True) as c:
             await c.get("https://www.bseindia.com/", headers=BSE_HEADERS)
-
             for cat, max_items, forced_type in [("Result", 20, None), ("Annual+Report", 8, "Annual Report")]:
                 r = await c.get(_bse_api(cat), headers=BSE_HEADERS)
-                if r.status_code != 200:
-                    logger.warning(f"BSE API {cat} returned {r.status_code} for {bse_code}")
-                    continue
+                if r.status_code != 200: continue
                 items = r.json().get("Table", [])
-                logger.info(f"BSE {cat}: {len(items)} items for {bse_code}")
-
                 for item in items[:max_items]:
                     pdf_name = item.get("ATTACHMENTNAME", "").strip()
                     if not pdf_name: continue
                     title = item.get("SUBJECT") or item.get("CATEGORYNAME") or "Financial Results"
-
                     candidates = _pdf_candidates(pdf_name)
                     working_url = None
                     for candidate in candidates:
@@ -380,227 +369,203 @@ async def fetch_bse_filings(bse_code: str, symbol: str) -> List[dict]:
                             break
                     if not working_url:
                         working_url = candidates[0]
-                        logger.warning(f"BSE PDF unverified, using default: {pdf_name}")
-
                     filings.append({"title": title, "date": item.get("NEWS_DT", ""),
                                     "pdf_url": working_url,
                                     "type": forced_type or _classify_filing(title),
                                     "source": "BSE", "symbol": symbol, "bse_code": bse_code})
-
-        logger.info(f"BSE total: {len(filings)} filings for {bse_code}")
         return filings[:15]
     except Exception as e:
         logger.warning(f"BSE filings error for {bse_code}: {e}")
     return []
 
 
-# ─── PDF EXTRACTION ──────────────────────────────────────────────────────────
+# ─── PDF PAGE CLASSIFICATION ─────────────────────────────────────────────────
 
-def extract_tables_from_pdf(raw_bytes: bytes):
-    """
-    Extract structured tables using pdfplumber.
-    Returns list of tables with rows preserved.
-    """
-    tables = []
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                extracted = page.extract_tables()
-                for table in extracted:
-                    clean_table = []
-                    for row in table:
-                        cleaned = [str(cell).strip() if cell else "" for cell in row]
-                        if any(cleaned):
-                            clean_table.append(cleaned)
-                    if clean_table:
-                        tables.append({"page": page_num + 1, "rows": clean_table})
-        logger.info(f"Extracted {len(tables)} tables")
-    except Exception as e:
-        logger.warning(f"Table extraction failed: {e}")
-    return tables
+# Pages in Indian quarterly filings that must be EXCLUDED from data extraction:
+# - Auditor review report pages: contain phrases like "total revenues of Rs. X crore"
+#   which are NARRATIVE references to subsidiary numbers, NOT the actual P&L totals.
+#   The AI consistently mistakes these auditor-quoted numbers for consolidated figures.
+# - Cover letter pages
+# - Ratio formula explanation pages
+# - Subsidiaries/JV/Associates list pages
+
+AUDITOR_POISON_PHRASES = [
+    "total revenues of rs",
+    "total revenues of ₹",
+    "reflect total revenues",
+    "total net profit after tax of rs",
+    "total comprehensive income of rs",
+    "group's share of profit",
+    "reviewed by one of us",
+    "independently reviewed",
+    "our conclusion on the statement",
+    "standard on review engagements",
+    "sre 2410",
+    "chartered accountants",
+    "firm's registration no",
+    "membership no",
+    "udin:",
+    "list of subsidiaries",
+    "list of joint ventures",
+    "list of associates",
+    "ceased to be a subsidiary",
+    "merged with another subsidiary",
+    "formulae for computation of ratios",
+    "deloitte haskins",
+    "chaturvedi & shah",
+    "dear sirs",
+    "pursuant to regulation 33",
+    "sebi (listing obligation",
+    "independent auditor",
+    "review report",
+    "moderate assurance",
+]
+
+FINANCIAL_TABLE_PHRASES = [
+    "revenue from operations",
+    "profit before tax",
+    "profit after tax",
+    "total income",
+    "finance costs",
+    "depreciation",
+    "employee benefits expense",
+    "other expenses",
+    "total expenses",
+    "earnings per equity share",
+    "paid-up equity share capital",
+    "net worth",
+    "debt service coverage",
+    "interest service coverage",
+    "debt equity ratio",
+    "current ratio",
+    "operating margin",
+    "net profit margin",
+    "segment results",
+    "segment assets",
+    "segment liabilities",
+    "oil to chemicals",
+    "digital services",
+    "value of sales",
+    "cost of materials",
+    "purchases of stock",
+    "changes in inventories",
+    "excise duty",
+    "deferred tax",
+    "current tax",
+]
+
+CONSOLIDATED_MARKERS = [
+    "unaudited consolidated financial results",
+    "consolidated financial results",
+    "consolidated statement",
+    "consolidated segment",
+]
+
+STANDALONE_MARKERS = [
+    "unaudited standalone financial results",
+    "standalone financial results",
+    "standalone statement",
+    "standalone segment",
+]
 
 
-def parse_financial_metrics(tables):
+def _score_page_for_extraction(page_text: str) -> dict:
     """
-    Extract key financial metrics from tables.
+    Returns a detailed score dict for a page.
+    Pages with high auditor_poison scores must be excluded.
+    Only pages with financial_table scores should be used.
     """
-    metrics = defaultdict(str)
-    keywords = {
-        "revenue": ["revenue", "total income", "income from operations", "net sales", "revenue from operations"],
-        "revenue_previous": ["previous revenue", "prior year revenue"],
-        "gross_profit": ["gross profit", "gross income"],
-        "ebitda": ["ebitda", "operating profit before depreciation"],
-        "ebit": ["ebit", "operating profit"],
-        "net_profit": ["net profit", "profit after tax", "pat", "profit for the period"],
-        "pbt": ["profit before tax", "pbt"],
-        "other_income": ["other income"],
-        "finance_cost": ["finance cost", "interest expense", "finance charges"],
-        "depreciation": ["depreciation", "amortisation", "amortization", "d&a"],
-        "tax_expense": ["tax expense", "income tax", "provision for tax"],
-        "eps_basic": ["basic eps", "basic earnings per share"],
-        "eps_diluted": ["diluted eps", "diluted earnings per share", "earnings per share", "eps"],
-        "total_assets": ["total assets"],
-        "current_assets": ["current assets", "total current assets"],
-        "non_current_assets": ["non-current assets", "non current assets", "fixed assets"],
-        "cash_equivalents": ["cash and cash equivalents", "cash & cash equivalents", "cash and bank"],
-        "inventory": ["inventories", "inventory", "stock in trade"],
-        "accounts_receivable": ["trade receivables", "accounts receivable", "debtors"],
-        "total_liabilities": ["total liabilities"],
-        "current_liabilities": ["current liabilities", "total current liabilities"],
-        "non_current_liabilities": ["non-current liabilities", "non current liabilities"],
-        "borrowings": ["borrowings", "total debt", "loans", "long-term borrowings", "short-term borrowings"],
-        "total_equity": ["total equity", "shareholders equity", "net worth", "stockholders equity"],
-        "reserves_surplus": ["reserves and surplus", "reserves & surplus"],
-        "share_capital": ["share capital", "equity capital"],
-        "operating_cash_flow": ["cash flow from operating", "net cash from operations", "operating cash flow", "ocf"],
-        "investing_cash_flow": ["cash flow from investing", "investing activities"],
-        "financing_cash_flow": ["cash flow from financing", "financing activities"],
-        "free_cash_flow": ["free cash flow", "fcf"],
-        "capex": ["capital expenditure", "capex", "purchase of fixed assets", "additions to property"],
-        "current_ratio": ["current ratio"],
-        "quick_ratio": ["quick ratio", "acid test ratio", "acid-test ratio"],
-        "debt_equity_ratio": ["debt to equity", "debt/equity", "d/e ratio"],
-        "debt_ebitda_ratio": ["debt/ebitda", "debt to ebitda"],
-        "interest_coverage": ["interest coverage", "interest cover", "ebit/interest"],
-        "inventory_turnover": ["inventory turnover", "stock turnover"],
-        "asset_turnover": ["asset turnover", "total asset turnover"],
-        "roe": ["return on equity", "roe"],
-        "roa": ["return on assets", "roa"],
-        "roic": ["return on invested capital", "roic", "return on capital employed", "roce"],
-        "gross_margin": ["gross margin", "gross profit margin"],
-        "ebitda_margin": ["ebitda margin"],
-        "net_margin": ["net profit margin", "net margin", "pat margin"],
-        "dividend_yield": ["dividend yield"],
-        "book_value": ["book value per share", "bvps", "net asset value per share"],
-        "price_earnings": ["price to earnings", "p/e ratio", "pe ratio"],
+    t = page_text.lower()
+
+    poison_hits = sum(1 for p in AUDITOR_POISON_PHRASES if p in t)
+    table_hits  = sum(1 for p in FINANCIAL_TABLE_PHRASES if p in t)
+    consol_hits = sum(1 for p in CONSOLIDATED_MARKERS if p in t)
+    standalone_hits = sum(1 for p in STANDALONE_MARKERS if p in t)
+
+    # A page is "poisoned" if it has many auditor phrases and few actual table rows
+    # Key signal: auditor pages mention specific numbers in prose sentences
+    is_auditor_narrative = (
+        ("reflect total revenues" in t or "total revenues of rs" in t) or
+        ("udin:" in t) or
+        ("firm's registration no" in t) or
+        ("list of subsidiaries" in t and table_hits < 2) or
+        ("formulae for computation of ratios" in t and "revenue from operations" not in t) or
+        (poison_hits >= 4 and table_hits < 3)
+    )
+
+    return {
+        "poison_hits": poison_hits,
+        "table_hits": table_hits,
+        "consol_hits": consol_hits,
+        "standalone_hits": standalone_hits,
+        "is_auditor_narrative": is_auditor_narrative,
+        "net_score": (table_hits * 3) + (consol_hits * 2) - (poison_hits * 2) - (standalone_hits * 1),
     }
 
-    for table in tables:
-        for row in table["rows"]:
-            row_text = " ".join(row).lower()
-            for metric, keys in keywords.items():
-                if metrics.get(metric):
-                    continue
-                if any(k in row_text for k in keys):
-                    numbers = re.findall(r'-?\d[\d,\.]*', row_text)
-                    if numbers:
-                        metrics[metric] = numbers[0]
 
-    logger.info(f"Extracted metrics: {dict(metrics)}")
-    return dict(metrics)
-
-
-def compute_financial_ratios(metrics: dict) -> dict:
+def _select_financial_pages(raw_bytes: bytes) -> list:
     """
-    Compute derived financial ratios from raw extracted metrics.
+    Select only pages containing actual financial tables.
+    CRITICAL: Exclude auditor review report pages which contain
+    narrative references to numbers (e.g. "total revenues of Rs. 3,04,299 crore")
+    that are NOT the consolidated P&L totals.
     """
-    def _to_float(val: str) -> Optional[float]:
-        if not val:
-            return None
-        try:
-            return float(str(val).replace(",", "").replace("%", "").strip())
-        except (ValueError, TypeError):
-            return None
+    reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+    total  = len(reader.pages)
 
-    def _pct(num, denom) -> Optional[str]:
-        n, d = _to_float(num), _to_float(denom)
-        if n is not None and d and d != 0:
-            return f"{round((n / d) * 100, 2)}%"
-        return None
+    page_scores = []
+    has_consolidated = False
 
-    def _ratio(num, denom, decimals=2) -> Optional[str]:
-        n, d = _to_float(num), _to_float(denom)
-        if n is not None and d and d != 0:
-            return str(round(n / d, decimals))
-        return None
+    for i, page in enumerate(reader.pages):
+        t = (page.extract_text() or "")
+        score_info = _score_page_for_extraction(t)
+        page_scores.append((i, score_info))
+        if score_info["consol_hits"] > 0 and not score_info["is_auditor_narrative"]:
+            has_consolidated = True
 
-    ratios: dict = {}
+    selected = set()
 
-    rev      = metrics.get("revenue")
-    pat      = metrics.get("net_profit")
-    ebitda   = metrics.get("ebitda")
-    ebit     = metrics.get("ebit")
-    gross    = metrics.get("gross_profit")
-    debt     = metrics.get("borrowings")
-    equity   = metrics.get("total_equity")
-    curr_a   = metrics.get("current_assets")
-    curr_l   = metrics.get("current_liabilities")
-    cash     = metrics.get("cash_equivalents")
-    inv      = metrics.get("inventory")
-    assets   = metrics.get("total_assets")
-    ocf      = metrics.get("operating_cash_flow")
-    fin_cost = metrics.get("finance_cost")
-    rev_prev = metrics.get("revenue_previous")
+    for i, info in page_scores:
+        # ALWAYS skip auditor narrative pages — they poison AI with wrong numbers
+        if info["is_auditor_narrative"]:
+            logger.info(f"Page {i+1}: EXCLUDED (auditor narrative, poison_hits={info['poison_hits']})")
+            continue
 
-    r = _pct(gross, rev)
-    if r: ratios["gross_margin_pct"] = r
-    r = _pct(ebitda, rev)
-    if r: ratios["ebitda_margin_pct"] = r
-    r = _pct(ebit, rev)
-    if r: ratios["ebit_margin_pct"] = r
-    r = _pct(pat, rev)
-    if r: ratios["net_profit_margin_pct"] = r
-    r = _pct(pat, equity)
-    if r: ratios["return_on_equity_pct"] = r
-    r = _pct(pat, assets)
-    if r: ratios["return_on_assets_pct"] = r
-    r = _ratio(debt, equity)
-    if r: ratios["debt_to_equity"] = r
-    r = _ratio(debt, ebitda)
-    if r: ratios["debt_to_ebitda"] = r
-    r = _ratio(ebit or ebitda, fin_cost)
-    if r: ratios["interest_coverage_ratio"] = r
-    r = _ratio(curr_a, curr_l)
-    if r: ratios["current_ratio"] = r
+        # Skip standalone when consolidated exists
+        if has_consolidated and info["standalone_hits"] > 0 and info["consol_hits"] == 0:
+            logger.info(f"Page {i+1}: EXCLUDED (standalone, consolidated exists)")
+            continue
 
-    ca_f  = _to_float(curr_a)
-    inv_f = _to_float(inv) or 0.0
-    cl_f  = _to_float(curr_l)
-    if ca_f is not None and cl_f and cl_f != 0:
-        ratios["quick_ratio"] = str(round((ca_f - inv_f) / cl_f, 2))
+        # Include pages with meaningful financial table content
+        if info["net_score"] >= 3 or (info["table_hits"] >= 3 and not info["is_auditor_narrative"]):
+            selected.add(i)
+            logger.info(f"Page {i+1}: SELECTED (net_score={info['net_score']}, table_hits={info['table_hits']}, consol={info['consol_hits']})")
 
-    r = _ratio(cash, curr_l)
-    if r: ratios["cash_ratio"] = r
-    r = _ratio(rev, assets)
-    if r: ratios["asset_turnover"] = r
-    r = _ratio(rev, inv)
-    if r: ratios["inventory_turnover"] = r
-    r = _ratio(ocf, curr_l)
-    if r: ratios["ocf_to_current_liabilities"] = r
+    # Safety cap: limit to first 12 pages for large filings
+    if total > 12:
+        selected = {i for i in selected if i < 12}
 
-    if rev and rev_prev:
-        rev_f  = _to_float(rev)
-        prev_f = _to_float(rev_prev)
-        if rev_f is not None and prev_f and prev_f != 0:
-            growth = ((rev_f - prev_f) / abs(prev_f)) * 100
-            ratios["revenue_growth_yoy_pct"] = f"{round(growth, 2)}%"
-
-    logger.info(f"Computed ratios: {ratios}")
-    return ratios
+    result = sorted(selected)
+    logger.info(f"PDF: {total} pages, consolidated={has_consolidated}, selected: {[p+1 for p in result]}")
+    return result
 
 
 def _detect_currency_unit(text: str) -> str:
-    """Detect currency unit from document — critical for correct number interpretation."""
     t = text[:4000].lower()
     if any(x in t for x in ["₹ in crore", "rs. in crore", "inr crore", "in crores",
-                              "(crore)", "crore each", "except per share", "crore, except"]):
+                              "(crore)", "crore each", "except per share", "crore, except",
+                              "in crore, except"]):
         return "INR Crores"
-    if any(x in t for x in ["₹ in lakh", "rs. in lakh", "inr lakh", "in lakhs", "(lakh)", "lakhs each"]):
+    if any(x in t for x in ["₹ in lakh", "rs. in lakh", "inr lakh", "in lakhs", "(lakh)"]):
         return "INR Lakhs"
     if any(x in t for x in ["usd million", "$ million", "in millions", "us$ million"]):
         return "USD Millions"
     if any(x in t for x in ["usd billion", "$ billion", "in billions"]):
         return "USD Billions"
-    return "INR Crores"  # Safe default for large Indian companies
+    return "INR Crores"
 
 
 def _parse_period_header(row: list) -> list:
-    """
-    Detect if a table row is a period header (Quarter Ended, Year Ended, etc.)
-    Returns clean period labels if detected, else empty list.
-    """
-    import re
     row_text = " ".join(str(c) for c in row if c).lower()
     PERIOD_PATTERNS = [
         r"dec['\s\-]*2[0-9]", r"sep['\s\-]*2[0-9]", r"mar['\s\-]*2[0-9]",
@@ -613,22 +578,18 @@ def _parse_period_header(row: list) -> list:
     return []
 
 
-def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> str:
+def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> tuple:
     """
-    The heart of accurate extraction:
-    1. Parse each financial table with column headers
-    2. For each data row: label → current_period: value | prior_year_period: value
-    3. Returns a clean, unambiguous text block the AI can read directly
-
-    This removes multi-column parsing from the AI entirely.
+    Parse financial tables with column-aware extraction.
+    Returns (structured_text, currency).
     """
-    import pdfplumber, io, re
+    import pdfplumber
 
     result_sections = []
     currency = "INR Crores"
-    col_headers = []       # period labels from most recent header row seen
-    current_col_idx = 1    # default: first data column = current period
-    prior_yr_col_idx = 3   # default: third data column = same quarter prior year
+    col_headers = []
+    current_col_idx = 1
+    prior_yr_col_idx = None
 
     try:
         with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
@@ -638,15 +599,17 @@ def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> str:
                 page = pdf.pages[page_idx]
                 raw_text = page.extract_text() or ""
 
-                # Detect currency from page text
-                if page_idx < 3:
-                    currency = _detect_currency_unit(raw_text)
+                if page_idx < 5:
+                    detected_currency = _detect_currency_unit(raw_text)
+                    if detected_currency != "INR Crores":
+                        currency = detected_currency
+                    elif "in crore" in raw_text.lower():
+                        currency = "INR Crores"
 
                 tables = page.extract_tables()
                 if not tables:
-                    # No table — just add raw text
                     if raw_text.strip():
-                        result_sections.append(raw_text.strip())
+                        result_sections.append(f"--- PAGE {page_idx+1} (text) ---\n{raw_text.strip()}")
                     continue
 
                 page_rows = []
@@ -656,37 +619,27 @@ def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> str:
                             continue
                         cleaned = [str(c).strip().replace("\n", " ") if c else "" for c in row]
 
-                        # Check if this is a period header row
                         detected_periods = _parse_period_header(cleaned)
                         if detected_periods:
                             col_headers = detected_periods
-                            # Figure out which column index is "current" and "prior year same quarter"
-                            # Current = first non-empty data column (index 1)
-                            # Prior year same quarter = match "Dec'24" if current is "Dec'25", etc.
                             current_col_idx = 1
                             prior_yr_col_idx = None
                             if len(col_headers) > 1:
                                 cur_label = col_headers[1].lower() if len(col_headers) > 1 else ""
-                                # Extract month from current period label
                                 month_match = re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', cur_label)
                                 cur_month = month_match.group(1) if month_match else ""
-                                # Find same month in prior year columns (skip col 2 = sequential quarter)
                                 for ci in range(2, len(col_headers)):
                                     lbl = col_headers[ci].lower()
                                     if cur_month and cur_month in lbl and ci != current_col_idx:
                                         prior_yr_col_idx = ci
                                         break
-                                # Fallback: col 3 is typically same quarter prior year in standard format
                                 if prior_yr_col_idx is None and len(col_headers) > 3:
                                     prior_yr_col_idx = 3
-                            continue  # Don't add header row to output
-
-                        # Data row — extract label and key columns
-                        label = cleaned[0] if cleaned else ""
-                        if not label or label in ("None", "", "Particulars"):
                             continue
 
-                        # Skip pure separator rows
+                        label = cleaned[0] if cleaned else ""
+                        if not label or label in ("None", "", "Particulars", "Sr.", "Sr. No", "Sr"):
+                            continue
                         if all(c in ("", "-", "—", "None") for c in cleaned[1:]):
                             continue
 
@@ -705,63 +658,38 @@ def _build_structured_financials(raw_bytes: bytes, page_indices: list) -> str:
                             entry = f"{label}: {cur_period}={cur_val}"
                             if prev_val:
                                 entry += f" | {prev_period}={prev_val}"
-                            # Also include 9M/annual if available (col 4 or 5)
                             for extra_idx in [4, 5]:
                                 extra_val = safe_val(cleaned, extra_idx)
                                 extra_lbl = col_headers[extra_idx] if col_headers and extra_idx < len(col_headers) else f"Col{extra_idx}"
-                                if extra_val and extra_idx not in (current_col_idx, prior_yr_col_idx):
+                                if extra_val and extra_idx not in ([current_col_idx] + ([prior_yr_col_idx] if prior_yr_col_idx else [])):
                                     entry += f" | {extra_lbl}={extra_val}"
-                                    break  # Just one extra column
+                                    break
                             page_rows.append(entry)
                         else:
-                            # Include row even without structured match — raw pipe format
                             non_empty = [c for c in cleaned if c and c not in ("None",)]
                             if len(non_empty) >= 2:
                                 page_rows.append(" | ".join(non_empty))
 
                 if page_rows:
-                    result_sections.append("\n".join(page_rows))
+                    result_sections.append(f"--- PAGE {page_idx+1} ---\n" + "\n".join(page_rows))
                 elif raw_text.strip():
-                    result_sections.append(raw_text.strip())
+                    result_sections.append(f"--- PAGE {page_idx+1} (text) ---\n{raw_text.strip()}")
 
     except Exception as e:
-        logger.warning(f"Structured extraction failed: {e}, using fallback")
-        return ""
+        logger.warning(f"Structured extraction failed: {e}")
+        return "", "INR Crores"
 
     structured = "\n\n".join(result_sections)
     logger.info(f"Structured extraction: {len(structured):,} chars, currency={currency}")
     return structured, currency
 
 
-def _detect_currency_unit(text: str) -> str:
-    """Detect currency unit from document — critical for correct number interpretation."""
-    t = text[:4000].lower()
-    if any(x in t for x in ["₹ in crore", "rs. in crore", "inr crore", "in crores",
-                              "(crore)", "crore each", "except per share", "crore, except"]):
-        return "INR Crores"
-    if any(x in t for x in ["₹ in lakh", "rs. in lakh", "inr lakh", "in lakhs", "(lakh)", "lakhs each"]):
-        return "INR Lakhs"
-    if any(x in t for x in ["usd million", "$ million", "in millions", "us$ million"]):
-        return "USD Millions"
-    return "INR Crores"
-
-
 def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
-    """
-    Enhanced extraction: structured multi-column table parsing first,
-    then falls back to raw text.
-    """
     try:
         import pdfplumber
-        result = _build_structured_financials(raw_bytes, page_indices)
-        if isinstance(result, tuple):
-            structured_text, currency = result
-        else:
-            structured_text, currency = result, "INR Crores"
+        structured_text, currency = _build_structured_financials(raw_bytes, page_indices)
 
         if not structured_text.strip():
-            # Fallback to raw extraction
-            import io
             raw_result = ""
             with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
                 for i in page_indices:
@@ -773,16 +701,28 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
             structured_text = raw_result
             currency = _detect_currency_unit(raw_result)
 
-        # Prepend authoritative currency header + consolidation instruction
         header = (
             f"\n[DOCUMENT CURRENCY UNIT: {currency}]\n"
-            f"[CRITICAL: ALL NUMBERS IN THIS DOCUMENT ARE IN {currency}]\n"
-            f"[DO NOT change the unit — if document says Crores, write Crores]\n"
-            f"[CONSOLIDATION RULE: If this filing contains BOTH consolidated AND standalone "
-            f"financial statements, USE ONLY THE CONSOLIDATED FIGURES. "
-            f"Consolidated results appear first (pages 1-2). Standalone results appear later "
-            f"(pages 5-8) and must be IGNORED if consolidated data is present.]\n\n"
+            f"[ALL NUMBERS ARE IN {currency} — DO NOT CHANGE THIS UNIT]\n\n"
+
+            # ── CRITICAL: Anti-hallucination guard for Indian filings ──────────
+            f"[CRITICAL EXTRACTION RULES FOR INDIAN QUARTERLY FILINGS]\n"
+            f"[RULE A — AUDITOR NARRATIVE TRAP: Indian audit reports contain sentences like\n"
+            f"  '247 subsidiaries reflect total revenues of Rs. X crore and net profit of Rs. Y crore'\n"
+            f"  These X and Y numbers are SUBSIDIARY-ONLY figures cited by the auditor.\n"
+            f"  They are NOT the consolidated P&L totals. NEVER use numbers from auditor review text.]\n"
+            f"[RULE B — USE ONLY TABLE DATA: Extract revenue, PAT, EBITDA ONLY from rows in the\n"
+            f"  'UNAUDITED CONSOLIDATED FINANCIAL RESULTS' table with columns like\n"
+            f"  '31st Dec'25 | 30th Sep'25 | 31st Dec'24'. These are the real numbers.]\n"
+            f"[RULE C — CONSOLIDATED FIRST: If both consolidated and standalone tables exist,\n"
+            f"  use ONLY consolidated figures. Standalone values will be significantly lower.]\n"
+            f"[RULE D — USE STATED RATIOS: For D/E ratio, Current Ratio, Interest Coverage —\n"
+            f"  use the printed Ratios section values. Do not recalculate.]\n\n"
+
+            f"[CONSOLIDATION: Use CONSOLIDATED figures only (labeled 'Unaudited Consolidated').\n"
+            f"Standalone figures appear later in the document and must be IGNORED.]\n\n"
         )
+
         logger.info(f"pdfplumber extracted {len(structured_text):,} chars, currency={currency}")
         return header + structured_text
 
@@ -794,93 +734,11 @@ def _extract_with_pdfplumber(raw_bytes: bytes, page_indices: list) -> str:
         return ""
 
 
-
-
-
-def _select_financial_pages(raw_bytes: bytes) -> list:
-    """
-    Score every page by financial keyword density.
-    Critically: CONSOLIDATED results are preferred over STANDALONE.
-    Indian quarterly filings typically have:
-      Pages 1-2:  Consolidated P&L + ratios  ← WE WANT THIS
-      Pages 3-4:  Segment data
-      Pages 5-8:  Standalone P&L + ratios    ← MUST NOT OVERRIDE CONSOLIDATED
-      Pages 9-16: Notes
-    """
-    reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
-    total  = len(reader.pages)
-
-    # Base financial keywords (score 1 each)
-    KEYWORDS = [
-        "total assets", "profit and loss", "statement of profit",
-        "cash flow", "balance sheet", "total income", "borrowing",
-        "finance cost", "total equity", "earnings per share",
-        "debt to equity", "financial highlights", "key financial ratios",
-        "total revenue", "gross income", "net profit", "ebitda",
-        "total liabilities", "current assets", "current liabilities",
-        "revenue from operations", "other income", "tax expense",
-        "depreciation", "amortisation", "reserves and surplus",
-    ]
-    # Consolidated markers (score 3 each — strong signal)
-    CONSOLIDATED_MARKERS = [
-        "consolidated", "unaudited consolidated", "audited consolidated",
-        "consolidated financial results", "consolidated statement",
-    ]
-    # Standalone markers — deprioritise these pages
-    STANDALONE_MARKERS = [
-        "standalone", "unaudited standalone", "audited standalone",
-        "standalone financial results", "standalone statement",
-    ]
-
-    page_scores = []
-    has_consolidated = False
-
-    for i, page in enumerate(reader.pages):
-        t = (page.extract_text() or "").lower()
-        score = sum(1 for kw in KEYWORDS if kw in t)
-        # Boost consolidated pages
-        consol_hits = sum(1 for m in CONSOLIDATED_MARKERS if m in t)
-        if consol_hits > 0:
-            score += consol_hits * 3
-            has_consolidated = True
-        # Penalise standalone pages (they duplicate consolidated data)
-        standalone_hits = sum(1 for m in STANDALONE_MARKERS if m in t)
-        if standalone_hits > 0:
-            score -= standalone_hits * 2
-        page_scores.append((i, score, consol_hits > 0, standalone_hits > 0))
-
-    # Select pages: always include first 2 pages (cover + main results)
-    # Then add high-scoring pages, but if consolidated exists, exclude standalone pages
-    selected = set(range(min(2, total)))
-
-    for i, score, is_consol, is_standalone in page_scores:
-        if score >= 2:
-            # If we found consolidated sections, skip pages marked as standalone
-            if has_consolidated and is_standalone and not is_consol:
-                logger.info(f"Page {i+1}: SKIPPED (standalone, consolidated exists, score={score})")
-                continue
-            selected.add(i)
-
-    # Safety cap: for large filings, limit to first 10 pages
-    # Consolidated results are always in the first half of quarterly filings
-    if total > 12:
-        selected = {i for i in selected if i < 10}
-        # Always keep first 2 pages
-        selected.update(range(min(2, total)))
-
-    result = sorted(selected)
-    logger.info(f"PDF: {total} pages, consolidated_found={has_consolidated}, selected pages: {[p+1 for p in result]}")
-    return result
-
-
 def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
-    """
-    Full extraction pipeline with pdfplumber primary, pypdf fallback.
-    """
-    # Guard: reject FinSight reports fed back as input
+    # Guard: reject FinSight reports
     try:
-        import pdfplumber as _plumber, io as _io
-        with _plumber.open(_io.BytesIO(raw_bytes)) as _chk:
+        import pdfplumber as _plumber
+        with _plumber.open(io.BytesIO(raw_bytes)) as _chk:
             _sample = " ".join((_chk.pages[i].extract_text() or "") for i in range(min(2, len(_chk.pages))))
             if "finsight" in _sample.lower() and "institutional equity research" in _sample.lower():
                 raise ValueError(
@@ -893,6 +751,11 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
         pass
 
     page_indices = _select_financial_pages(raw_bytes)
+
+    if not page_indices:
+        logger.warning("No financial pages selected — falling back to first 3 pages")
+        page_indices = list(range(min(3, pypdf.PdfReader(io.BytesIO(raw_bytes)).pages.__len__())))
+
     result = _extract_with_pdfplumber(raw_bytes, page_indices)
 
     if not result.strip():
@@ -903,7 +766,6 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
             pt = reader.pages[i].extract_text() or ""
             if pt.strip():
                 result += f"\n--- PAGE {i+1} ---\n{pt}\n"
-        logger.info(f"pypdf extracted {len(result):,} chars")
 
     doc_type_hint = ""
     lower_result = result.lower()
@@ -916,23 +778,16 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
     )
     if is_partial:
         doc_type_hint = (
-            "\n\n[SYSTEM NOTE: This appears to be a NEWSPAPER EXTRACT or PARTIAL FILING. "
-            "It likely contains only: Revenue, PBT, PAT, EPS, and Equity Capital. "
-            "DO NOT fabricate Balance Sheet items (Debt, Current Ratio, Cash, OCF) "
-            "that are not present. Mark them as 'Not available in this filing extract'. "
-            "Use only numbers explicitly present in the document.]\n"
+            "\n\n[SYSTEM NOTE: PARTIAL FILING DETECTED. "
+            "Only write numbers explicitly visible. Mark unavailable fields as 'Not available'.]\n"
         )
-        logger.warning("Partial/newspaper extract detected — hallucination guard injected")
 
     final = (doc_type_hint + result)[:max_chars]
-    logger.info(f"Final snippet: {len(final):,} chars (partial={is_partial})")
+    logger.info(f"Final snippet: {len(final):,} chars")
     return final
 
 
 def extract_pdf_text(raw_bytes: bytes) -> str:
-    """
-    Entry point for PDF processing.
-    """
     try:
         reader    = pypdf.PdfReader(io.BytesIO(raw_bytes))
         num_pages = len(reader.pages)
@@ -945,9 +800,8 @@ def extract_pdf_text(raw_bytes: bytes) -> str:
                 "This PDF appears to be scanned/image-based — no selectable text found. "
                 "Please download the digital/searchable version from BSE or NSE.")
 
-        logger.info(f"PDF validated: {num_pages} pages, extracting financial sections...")
+        logger.info(f"PDF validated: {num_pages} pages")
         return extract_financial_snippet(raw_bytes)
-
     except ValueError: raise
     except Exception as e:
         logger.error(f"PDF read error: {e}")
@@ -996,307 +850,206 @@ def _repair_json(s: str) -> str:
 
 # ─── AI PROMPTS ──────────────────────────────────────────────────────────────
 
-def split_into_chunks(text, size=12000, overlap=1200):
-    chunks = []
-    start = 0
-    while start < len(text):
-        chunk = text[start:start + size]
-        chunks.append(chunk)
-        start += size - overlap
-    logger.info(f"Split document into {len(chunks)} chunks of ~{size} chars")
-    return chunks
-
 def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
     snippet = text[:max_doc_chars]
-    logger.info(f"build_prompt: {len(snippet):,} chars (from {len(text):,} total)")
-    return f"""Analyze the provided financial document and return ONLY one valid JSON object. Do not include markdown, explanations, code fences, or additional commentary. The response must strictly conform to the JSON schema provided below.
+    logger.info(f"build_prompt: {len(snippet):,} chars")
+    return f"""You are a senior equity research analyst. Analyze the financial document below and return ONLY one valid JSON object.
 
-ANALYTICAL OBJECTIVE
-Produce an institutional-grade equity research assessment suitable for professional investors. The analysis must interpret financial performance, identify hidden signals, and explain what the data implies for capital allocation decisions. The final output should resemble analysis prepared by a senior equity research analyst at a global investment bank.
+━━━ MANDATORY DATA EXTRACTION RULES (VIOLATIONS = WRONG REPORT) ━━━
 
-━━━ CRITICAL RULES — BREAKING THESE MAKES THE REPORT WRONG ━━━
+RULE 1 — AUDITOR NARRATIVE TRAP (Most Common Source of Errors):
+Indian quarterly filings include an Independent Auditor's Review Report that says things like:
+  "247 subsidiaries reflect total revenues of Rs. 3,04,299 crore and net profit of Rs. 12,966 crore"
+These numbers cited IN THE AUDITOR'S TEXT are SUBSIDIARY-ONLY figures for auditor scope disclosure.
+They are NOT the company's consolidated revenues or profits.
+→ NEVER use numbers from auditor review report paragraphs.
+→ ONLY use numbers from rows in the actual financial results tables.
 
-RULE 1 — NEVER ASSUME OR ESTIMATE:
-If a number is not in the document, write "Not available in this filing". 
-NEVER write "assumed", "estimated", "based on industry trends", or "moderate based on trends".
+RULE 2 — FIND THE ACTUAL P&L TABLE:
+Look for the table titled "UNAUDITED CONSOLIDATED FINANCIAL RESULTS FOR THE QUARTER..."
+It has column headers like: 31st Dec'25 | 30th Sep'25 | 31st Dec'24 | 31st Dec'25 | 31st Dec'24
+Extract from rows: "Revenue from Operations", "Profit After Tax", "Total Income", etc.
+These table values are the real consolidated figures.
 
-RULE 2 — CURRENCY UNIT IS AUTHORITATIVE:
-The document starts with [DOCUMENT CURRENCY UNIT: X]. Use that unit for ALL numbers.
-If it says INR Crores, write "₹2,69,496 Cr" — NEVER "₹2,69,496 Lakhs".
-Wrong currency = every number is wrong by 100x.
+RULE 3 — CURRENCY UNIT IS AUTHORITATIVE:
+The document header says [DOCUMENT CURRENCY UNIT: X]. Use that for ALL numbers.
+Wrong unit = every number wrong by 100x. If it says Crores, write "₹X Cr" not "₹X Lakhs".
 
-RULE 3 — MULTI-COLUMN TABLE FORMAT:
-Each financial row is formatted as: "Label: Period1=Value | Period2=Value | Period3=Value"
-The FIRST period listed after ":" = CURRENT period (most recent).
-The period matching the SAME QUARTER prior year = PREVIOUS period for YoY comparison.
-NEVER use two adjacent listed values as current/previous without checking their period labels.
+RULE 4 — NEVER ASSUME OR ESTIMATE:
+If a value is not in the tables, write "Not available in this filing".
+Never write "assumed", "estimated", "based on industry trends".
 
-RULE 4 — USE STATED RATIOS:
-For D/E ratio, Current Ratio, Interest Coverage — use values explicitly printed in the Ratios section.
-Do NOT recalculate from raw borrowing/equity numbers (may be in different denominators).
+RULE 5 — USE STATED RATIOS:
+The filing prints a Ratios section with: Debt Service Coverage, Interest Service Coverage,
+Debt Equity Ratio, Current Ratio, Operating Margin %, Net Profit Margin %, etc.
+USE THESE PRINTED VALUES. Do not recalculate from raw numbers.
 
-RULE 5 — EVERY TEXT FIELD NEEDS REAL NUMBERS:
+RULE 6 — CONSOLIDATED ONLY:
+Use ONLY consolidated figures (labeled "Unaudited Consolidated Financial Results").
+Standalone figures appear later and must be IGNORED if consolidated data is present.
+
+RULE 7 — EVERY FIELD NEEDS REAL NUMBERS:
 "Strong performance" without a number = REJECTED.
-"Revenue grew 6.1% to ₹2,69,496 Cr vs ₹2,43,865 Cr in Q3FY25" = ACCEPTED.
-
-RULE 6 — CONSOLIDATED vs STANDALONE:
-Many Indian filings contain BOTH consolidated AND standalone financials.
-ALWAYS use CONSOLIDATED figures (appear first, labeled "Consolidated").
-NEVER mix standalone numbers into a consolidated analysis.
-If the document says [CONSOLIDATION RULE], follow it strictly.
+"Revenue grew 10.5% to ₹2,69,496 Cr vs ₹2,43,865 Cr YoY" = ACCEPTED.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CORE PRINCIPLES
-Interpret numbers rather than merely restating them. Always explain what the data implies about the company's underlying business performance.
-Contextualize metrics within the company's business model and industry structure.
-Identify non-obvious signals such as margin trends, working capital shifts, leverage changes, or capital allocation patterns.
-Avoid vague language. Use precise statements supported by extracted numbers.
-Highlight risks even when performance appears strong to maintain intellectual honesty.
+SCORING FRAMEWORK:
+Profitability (max 20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=12 | else=5
+Growth (max 15): Rev>20% AND Profit>25%=15 | Rev 10-20% AND Profit 10-25%=9 | else=4
+Balance Sheet (max 15): D/E<0.5=15 | D/E 0.5-1.5=9 | D/E>1.5=3
+Liquidity (max 10): CR>1.5=10 | CR 1.0-1.5=6 | CR<1.0=2
+Cash Flow (max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3
+Governance (max 15): Clean audit=15 | Minor issues=9 | Major=3
+Industry (max 10): Leader=10 | Average=6 | Lagging=2
+health_label: >=80=Excellent | 60-79=Good | 40-59=Fair | 20-39=Poor | <20=Critical
+investment_label: Strong Buy / Buy / Hold / Reduce / Avoid
 
-DATA EXTRACTION PROTOCOL
-Before performing analysis, scan the entire document for financial data.
-Search the entire document for each metric. Only state "Not reported" when the metric cannot be derived from any section.
-
-Recognize alternate metric names:
-Total Assets may appear as Assets or Balance Sheet Total.
-Total Debt may appear as Borrowings, Loans, or Debt Securities.
-Operating Cash Flow may appear as Net Cash from Operating Activities.
-Interest Coverage may need to be calculated using EBIT divided by Finance Costs.
-Free Cash Flow equals Operating Cash Flow minus Capex.
-
-Sector-specific adjustments:
-For NBFC or financial institutions, Total Debt equals Debt Securities plus Borrowings plus Subordinated Liabilities.
-For defense or PSU companies, carefully examine order book disclosures, government contracts, and advances from customers because these determine revenue visibility.
-
-DERIVED METRICS
-Calculate ratios whenever raw inputs are available.
-ROE = Net Profit divided by Total Equity
-ROA = Net Profit divided by Total Assets
-Debt to Equity = Total Debt divided by Total Equity
-Interest Coverage = EBIT divided by Finance Costs
-Current Ratio = Current Assets divided by Current Liabilities
-Free Cash Flow = Operating Cash Flow minus Capex
-Do not leave ratios blank if they can be calculated.
-
-SCORING FRAMEWORK
-
-Profitability (0-20):
-Strong (score 20): ROE >20% AND Net Margin >15%
-Average (score 12): ROE 12-20% OR Net Margin 8-15%
-Weak (score 5): ROE <12% OR Net Margin <8%
-
-Growth (0-15):
-Strong (score 15): Revenue growth >20% AND Profit growth >25%
-Average (score 9): Revenue growth 10-20% AND Profit growth 10-25%
-Weak (score 4): Revenue growth <10% OR Profit growth <10%
-
-Balance Sheet (0-15):
-Strong (score 15): Debt-to-Equity <0.5
-Average (score 9): Debt-to-Equity 0.5-1.5
-Weak (score 3): Debt-to-Equity >1.5
-
-Liquidity (0-10):
-Strong (score 10): Current Ratio >1.5
-Average (score 6): Current Ratio 1.0-1.5
-Weak (score 2): Current Ratio <1.0
-
-Cash Flow (0-15):
-Strong (score 15): Operating cash flow exceeds net profit
-Average (score 9): Operating cash flow approximately equal to net profit
-Weak (score 3): Operating cash flow materially below net profit
-
-Governance & Risk (0-15):
-Strong (score 15): Clean audit opinion, strong ratings, minimal promoter pledging
-Average (score 9): Minor governance concerns
-Weak (score 3): Auditor qualifications or major governance risks
-
-Industry Position (0-10):
-Strong (score 10): Market leadership and durable competitive advantages
-Average (score 6): Comparable to peers
-Weak (score 2): Lagging peers or losing competitive position
-
-Health Label thresholds: score >=80 = Excellent | 60-79 = Good | 40-59 = Fair | 20-39 = Poor | 0-19 = Critical
-investment_label options: Strong Buy / Buy / Hold / Reduce / Avoid
-
-ANALYTICAL EXPECTATIONS
-The analysis must clearly evaluate profitability quality, growth durability, capital allocation efficiency, cash flow integrity, balance sheet resilience, and competitive positioning.
-
-RISK IDENTIFICATION
-Explicitly surface hidden risks such as working capital stress, margin compression, revenue concentration, government dependency, order book volatility, customer concentration, accounting anomalies, or excessive capex intensity. Each risk must include explanation, investor relevance, and a measurable trigger to monitor.
-
-INVESTOR-ORIENTED OUTPUT
-Address both long-term investors and short-term traders.
-Long-term analysis should evaluate moat durability, compounding potential, and permanent capital loss risk.
-Short-term analysis should focus on catalysts, triggers for the next earnings cycle, and operational momentum indicators.
-
-ANALYTICAL STYLE
-Write in the tone of professional sell-side equity research: concise, analytical, and evidence-based. Avoid boilerplate commentary or generic financial explanations.
-
-Return ONLY this exact JSON object with every field populated. Use specific numbers in every commentary field:
+Return ONLY this JSON (all fields required, every commentary field must contain specific numbers from the tables):
 
 {{
-  "company_name": "Full legal name from document",
-  "statement_type": "Annual Report / Half-Year Results / Quarterly Results",
-  "period": "Reporting period e.g. Q3FY26 / FY2024-25",
-  "currency": "INR Lakhs / INR Crores / USD Millions",
+  "company_name": "",
+  "statement_type": "",
+  "period": "",
+  "currency": "",
   "health_score": 0,
-  "health_label": "Excellent / Good / Fair / Poor / Critical",
+  "health_label": "",
 
   "health_score_breakdown": {{
     "total": 0,
     "components": [
-      {{"category": "Profitability", "weight": 20, "score": 0, "max": 20, "rating": "Strong / Average / Weak", "reasoning": "Explain ROE, margins, and profitability trend with specific numbers."}},
-      {{"category": "Growth",        "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Explain revenue and profit growth drivers with specific numbers."}},
-      {{"category": "Balance Sheet", "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Discuss leverage, debt structure, and asset quality with specific numbers."}},
-      {{"category": "Liquidity",     "weight": 10, "score": 0, "max": 10, "rating": "Strong / Average / Weak", "reasoning": "Evaluate short-term financial strength with specific numbers."}},
-      {{"category": "Cash Flow",     "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Explain OCF vs PAT relationship and cash generation quality."}},
-      {{"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "Strong / Average / Weak", "reasoning": "Evaluate governance, audit opinion, and structural risks."}},
-      {{"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "Strong / Average / Weak", "reasoning": "Compare position versus industry peers."}}
+      {{"category": "Profitability", "weight": 20, "score": 0, "max": 20, "rating": "", "reasoning": ""}},
+      {{"category": "Growth",        "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": ""}},
+      {{"category": "Balance Sheet", "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": ""}},
+      {{"category": "Liquidity",     "weight": 10, "score": 0, "max": 10, "rating": "", "reasoning": ""}},
+      {{"category": "Cash Flow",     "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": ""}},
+      {{"category": "Governance & Risk", "weight": 15, "score": 0, "max": 15, "rating": "", "reasoning": ""}},
+      {{"category": "Industry Position", "weight": 10, "score": 0, "max": 10, "rating": "", "reasoning": ""}}
     ]
   }},
 
-  "headline": "One concise memorable sentence summarizing the result",
-  "executive_summary": "5-6 sentences explaining the most important story behind the numbers. Every sentence must contain specific numbers.",
-  "investment_label": "Strong Buy / Buy / Hold / Reduce / Avoid",
-  "investor_verdict": "Direct institutional recommendation with reasoning and specific numbers",
-  "for_long_term_investors": "Moat durability, compounding potential, long-term risk with specific numbers",
-  "for_short_term_traders": "Near-term catalysts and earnings triggers with specific numbers",
-  "bottom_line": "Single memorable sentence capturing the key investment insight",
+  "headline": "",
+  "executive_summary": "",
+  "investment_label": "",
+  "investor_verdict": "",
+  "for_long_term_investors": "",
+  "for_short_term_traders": "",
+  "bottom_line": "",
 
   "key_metrics": [
-    {{"label": "Revenue",             "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
-    {{"label": "Net Profit",          "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
-    {{"label": "EBITDA Margin",       "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
-    {{"label": "ROE",                 "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
-    {{"label": "Debt to Equity",      "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}},
-    {{"label": "Operating Cash Flow", "current": "", "previous": "", "change": "", "trend": "up/down/flat", "signal": "Bullish/Bearish/Neutral", "comment": ""}}
+    {{"label": "Revenue",             "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": ""}},
+    {{"label": "Net Profit",          "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": ""}},
+    {{"label": "EBITDA Margin",       "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": ""}},
+    {{"label": "ROE",                 "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": ""}},
+    {{"label": "Debt to Equity",      "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": ""}},
+    {{"label": "Operating Cash Flow", "current": "", "previous": "", "change": "", "trend": "", "signal": "", "comment": ""}}
   ],
 
   "cash_flow_deep_dive": {{
-    "operating_cf":          "extracted value with unit",
-    "investing_cf":          "extracted value with unit",
-    "financing_cf":          "extracted value with unit",
-    "free_cash_flow":        "calculated: OCF minus Capex with unit",
-    "capex":                 "extracted value with unit",
-    "cash_conversion_quality": "Strong / Moderate / Weak",
-    "ocf_vs_pat_insight":    "Is OCF greater than PAT? What does this say about earnings quality? Use specific numbers."
+    "operating_cf": "",
+    "investing_cf": "",
+    "financing_cf": "",
+    "free_cash_flow": "",
+    "capex": "",
+    "cash_conversion_quality": "",
+    "ocf_vs_pat_insight": ""
   }},
 
   "balance_sheet_deep_dive": {{
-    "asset_quality":         "Institutional commentary on fixed vs current asset mix with numbers",
-    "debt_profile":          "ST vs LT split, maturity profile, rates if available",
-    "working_capital_insight": "Receivables, payables, inventory cycle commentary with days",
-    "total_debt":            "extracted value with unit",
-    "net_worth":             "extracted value with unit",
-    "debt_to_equity":        "calculated ratio",
-    "interest_coverage":     "calculated ratio",
-    "debt_comfort_level":    "Comfortable / Elevated / Stressed"
+    "asset_quality": "",
+    "debt_profile": "",
+    "working_capital_insight": "",
+    "total_debt": "",
+    "net_worth": "",
+    "debt_to_equity": "",
+    "interest_coverage": "",
+    "debt_comfort_level": ""
   }},
 
   "growth_quality": {{
-    "revenue_growth_context":  "Organic vs inorganic, volume vs price drivers with numbers",
-    "profit_growth_context":   "Operating leverage, margin expansion/compression drivers",
-    "margin_trend":            "Direction and magnitude of margin changes with basis points",
-    "growth_outlook":          "Forward-looking assessment based on order book, guidance, or sector trends",
-    "catalysts":               ["List of specific near-term growth catalysts"],
-    "headwinds":               ["List of specific risks that could impair growth"]
+    "revenue_growth_context": "",
+    "profit_growth_context": "",
+    "margin_trend": "",
+    "growth_outlook": "",
+    "catalysts": [],
+    "headwinds": []
   }},
 
   "industry_context": {{
-    "sector_tailwinds":       ["List of structural or cyclical tailwinds"],
-    "sector_headwinds":       ["List of structural or cyclical headwinds"],
-    "competitive_position":   "Market share, pricing power, barriers to entry",
-    "peer_benchmarks":        "How key ratios compare to sector averages or named peers",
-    "regulatory_environment": "Relevant regulations, government policies, or compliance risks"
+    "sector_tailwinds": [],
+    "sector_headwinds": [],
+    "competitive_position": "",
+    "peer_benchmarks": "",
+    "regulatory_environment": ""
   }},
 
-  "red_flags":          ["Each as a specific, evidence-backed concern with numbers"],
-  "strengths_and_moats": ["Each as a specific, defensible competitive advantage"],
+  "red_flags": [],
+  "strengths_and_moats": [],
 
   "investor_faq": [
-    {{"question": "Is this company a good investment right now?", "answer": "Direct answer with numbers and reasoning"}},
-    {{"question": "What is the biggest risk to monitor?",         "answer": "Specific risk with measurable trigger"}},
-    {{"question": "How sustainable is the current growth rate?",  "answer": "Evidence-based assessment"}}
+    {{"question": "Is this company a good investment right now?", "answer": ""}},
+    {{"question": "What is the biggest risk to monitor?", "answer": ""}},
+    {{"question": "How sustainable is the current growth rate?", "answer": ""}}
   ],
 
-  "key_monitorables": ["Specific metric or event to track each quarter with threshold"],
+  "key_monitorables": [],
 
   "profitability": {{
-    "analysis":             "2-3 sentence institutional commentary with specific numbers",
-    "net_margin_current":   "",
-    "ebitda_margin_current":"",
-    "roe":                  "",
-    "roa":                  ""
+    "analysis": "",
+    "net_margin_current": "",
+    "ebitda_margin_current": "",
+    "roe": "",
+    "roa": ""
   }},
 
   "liquidity": {{
-    "analysis":          "2-3 sentence institutional commentary with specific numbers",
-    "current_ratio":     "",
-    "quick_ratio":       "",
-    "cash_position":     "",
-    "operating_cash_flow":"",
-    "free_cash_flow":    ""
+    "analysis": "",
+    "current_ratio": "",
+    "quick_ratio": "",
+    "cash_position": "",
+    "operating_cash_flow": "",
+    "free_cash_flow": ""
   }},
 
-  "highlights":    ["Key positive takeaways with specific numbers"],
-  "risks":         ["Key risk factors with specific numbers and triggers"],
-  "what_to_watch": ["Forward-looking items to monitor next quarter"]
+  "highlights": [],
+  "risks": [],
+  "what_to_watch": []
 }}
 
-FINAL INSTRUCTIONS:
-- Use only numbers extracted from the document. Do not fabricate data.
-- Calculate all ratios where inputs are available.
-- Ensure scores match the scoring framework exactly.
-- Every commentary field must contain specific numbers, not vague statements.
-- Return only the JSON object, nothing else.
-
-FINANCIAL DOCUMENT:
+FINANCIAL DOCUMENT (extract numbers ONLY from tables, not from auditor narrative text):
 {snippet}
 """
 
 
 def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
     snippet = text[:max_doc_chars]
-    logger.info(f"build_lean_prompt: {len(snippet):,} chars (from {len(text):,} total)")
-    return f"""Analyze this financial document and return ONLY valid JSON — no markdown, no preamble, no code fences.
+    return f"""Senior equity analyst. Analyze this financial document. Return ONLY valid JSON.
 
 CRITICAL RULES:
-1. NEVER write "assumed", "estimated", "based on trends" → write "Not available in this filing" instead.
-2. CURRENCY: Use [DOCUMENT CURRENCY UNIT] from document header. If Crores, ALL values are Crores.
-3. TABLE FORMAT: Rows are "Label: Period1=Value | Period2=Value". First period = CURRENT. Same-quarter prior year = PREVIOUS for YoY.
-4. RATIOS: Use D/E, Current Ratio as explicitly printed in the Ratios section — do NOT recalculate.
-5. Every field needs 2+ real numbers. No vague statements.
-6. CONSOLIDATED vs STANDALONE: Always use consolidated figures (appear first). Never use standalone numbers if consolidated are present.
+1. AUDITOR TRAP: Text like "subsidiaries reflect total revenues of Rs. X crore" = AUDITOR SCOPE NOTE.
+   These are NOT consolidated figures. Only use numbers from the actual P&L table rows.
+2. CURRENCY: Use [DOCUMENT CURRENCY UNIT] from header. If Crores, ALL values are Crores.
+3. STATED RATIOS: Use D/E, Current Ratio exactly as printed in the Ratios section.
+4. NO ESTIMATES: Write "Not available" not guesses.
+5. CONSOLIDATED ONLY: Ignore standalone figures if consolidated data present.
+6. NUMBERS IN EVERY FIELD: No vague statements.
 
-You are a senior equity research analyst. Extract all numbers exactly as written. Calculate all derivable ratios. Write institutional-quality commentary with specific numbers in every field.
+SCORING: Profitability(20): ROE>20%+Margin>15%=20|12-20%=12|else=5 | Growth(15): Rev>20%+Profit>25%=15|10-20%=9|else=4 | BalanceSheet(15): D/E<0.5=15|0.5-1.5=9|>1.5=3 | Liquidity(10): CR>1.5=10|1-1.5=6|<1=2 | CashFlow(15): OCF>PAT=15|~PAT=9|<PAT=3 | Governance(15): Clean=15|Minor=9|Major=3 | Industry(10): Leader=10|Avg=6|Lag=2
+health_label: >=80=Excellent|60-79=Good|40-59=Fair|20-39=Poor|<20=Critical
+investment_label: Strong Buy/Buy/Hold/Reduce/Avoid
 
-SCORING (use exact scores):
-Profitability(max 20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=12 | else=5
-Growth(max 15): Rev>20% AND Profit>25%=15 | Rev 10-20% AND Profit 10-25%=9 | else=4
-Balance Sheet(max 15): D/E<0.5=15 | D/E 0.5-1.5=9 | D/E>1.5=3
-Liquidity(max 10): CR>1.5=10 | CR 1.0-1.5=6 | CR<1.0=2
-Cash Flow(max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3
-Governance(max 15): Clean audit=15 | Minor issues=9 | Major issues=3
-Industry(max 10): Leader=10 | Average=6 | Lagging=2
-health_label: >=80=Excellent | 60-79=Good | 40-59=Fair | 20-39=Poor | <20=Critical
-investment_label: Strong Buy / Buy / Hold / Reduce / Avoid
-
-Return ONLY this JSON (all fields required, use specific numbers in all commentary):
+Return ONLY this JSON:
 {{
   "company_name":"","statement_type":"","period":"","currency":"","health_score":0,"health_label":"",
-  "health_score_breakdown":{{
-    "total":0,
-    "components":[
-      {{"category":"Profitability","weight":20,"score":0,"max":20,"rating":"","reasoning":""}},
-      {{"category":"Growth","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
-      {{"category":"Balance Sheet","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
-      {{"category":"Liquidity","weight":10,"score":0,"max":10,"rating":"","reasoning":""}},
-      {{"category":"Cash Flow","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
-      {{"category":"Governance & Risk","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
-      {{"category":"Industry Position","weight":10,"score":0,"max":10,"rating":"","reasoning":""}}
-    ]
-  }},
+  "health_score_breakdown":{{"total":0,"components":[
+    {{"category":"Profitability","weight":20,"score":0,"max":20,"rating":"","reasoning":""}},
+    {{"category":"Growth","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+    {{"category":"Balance Sheet","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+    {{"category":"Liquidity","weight":10,"score":0,"max":10,"rating":"","reasoning":""}},
+    {{"category":"Cash Flow","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+    {{"category":"Governance & Risk","weight":15,"score":0,"max":15,"rating":"","reasoning":""}},
+    {{"category":"Industry Position","weight":10,"score":0,"max":10,"rating":"","reasoning":""}}
+  ]}},
   "headline":"","executive_summary":"","investment_label":"","investor_verdict":"",
   "for_long_term_investors":"","for_short_term_traders":"","bottom_line":"",
   "key_metrics":[
@@ -1307,14 +1060,8 @@ Return ONLY this JSON (all fields required, use specific numbers in all commenta
     {{"label":"Debt to Equity","current":"","previous":"","change":"","trend":"","signal":"","comment":""}},
     {{"label":"Operating Cash Flow","current":"","previous":"","change":"","trend":"","signal":"","comment":""}}
   ],
-  "cash_flow_deep_dive":{{
-    "operating_cf":"","investing_cf":"","financing_cf":"","free_cash_flow":"","capex":"",
-    "cash_conversion_quality":"","ocf_vs_pat_insight":""
-  }},
-  "balance_sheet_deep_dive":{{
-    "asset_quality":"","debt_profile":"","working_capital_insight":"",
-    "total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":""
-  }},
+  "cash_flow_deep_dive":{{"operating_cf":"","investing_cf":"","financing_cf":"","free_cash_flow":"","capex":"","cash_conversion_quality":"","ocf_vs_pat_insight":""}},
+  "balance_sheet_deep_dive":{{"asset_quality":"","debt_profile":"","working_capital_insight":"","total_debt":"","net_worth":"","debt_to_equity":"","interest_coverage":"","debt_comfort_level":""}},
   "growth_quality":{{"revenue_growth_context":"","profit_growth_context":"","margin_trend":"","growth_outlook":"","catalysts":[],"headwinds":[]}},
   "industry_context":{{"sector_tailwinds":[],"sector_headwinds":[],"competitive_position":"","peer_benchmarks":"","regulatory_environment":""}},
   "red_flags":[],"strengths_and_moats":[],
@@ -1334,68 +1081,9 @@ FINANCIAL DOCUMENT:
 """
 
 
-def _extract_metrics_from_text(text: str) -> dict:
-    """
-    Regex-based metric extraction directly from extracted text.
-    """
-    metrics = defaultdict(str)
-    NUM = r'[-]?\d{1,3}(?:,\d{2,3})*(?:\.\d+)?'
-
-    patterns = {
-        "revenue":            [r'(?:revenue from operations|net revenue|total revenue|income from operations)[^\n]{0,40}?(' + NUM + r')', r'(?:net sales|sales)[^\n]{0,30}?(' + NUM + r')'],
-        "total_income":       [r'total income[^\n]{0,30}?(' + NUM + r')'],
-        "gross_profit":       [r'gross profit[^\n]{0,30}?(' + NUM + r')'],
-        "ebitda":             [r'ebitda[^\n]{0,30}?(' + NUM + r')', r'operating profit before[^\n]{0,40}?(' + NUM + r')'],
-        "ebit":               [r'\bebit\b[^\n]{0,30}?(' + NUM + r')', r'operating profit[^\n]{0,30}?(' + NUM + r')'],
-        "finance_cost":       [r'finance costs?[^\n]{0,30}?(' + NUM + r')', r'interest expense[^\n]{0,30}?(' + NUM + r')', r'finance charges[^\n]{0,30}?(' + NUM + r')'],
-        "depreciation":       [r'depreciation[^\n]{0,60}?(' + NUM + r')', r'amortis[^\n]{0,40}?(' + NUM + r')'],
-        "pbt":                [r'profit before tax[^\n]{0,30}?(' + NUM + r')', r'\bpbt\b[^\n]{0,30}?(' + NUM + r')'],
-        "tax_expense":        [r'tax expense[^\n]{0,30}?(' + NUM + r')', r'income tax[^\n]{0,30}?(' + NUM + r')'],
-        "net_profit":         [r'profit (?:after tax|for the (?:year|period|quarter))[^\n]{0,30}?(' + NUM + r')', r'(?:^|\s)pat\b[^\n]{0,30}?(' + NUM + r')', r'net profit[^\n]{0,30}?(' + NUM + r')'],
-        "eps_basic":          [r'basic (?:eps|earnings per share)[^\n]{0,30}?(' + NUM + r')', r'(?:eps|earnings per share)[^\n\-]{0,20}basic[^\n]{0,20}?(' + NUM + r')'],
-        "eps_diluted":        [r'diluted (?:eps|earnings per share)[^\n]{0,30}?(' + NUM + r')'],
-        "total_assets":       [r'total assets[^\n]{0,30}?(' + NUM + r')'],
-        "current_assets":     [r'total current assets[^\n]{0,30}?(' + NUM + r')', r'current assets[^\n]{0,30}?(' + NUM + r')'],
-        "inventories":        [r'inventor(?:y|ies)[^\n]{0,30}?(' + NUM + r')'],
-        "trade_receivables":  [r'trade receivables[^\n]{0,30}?(' + NUM + r')', r'accounts receivable[^\n]{0,30}?(' + NUM + r')'],
-        "cash_equivalents":   [r'cash and (?:cash )?equivalents[^\n]{0,30}?(' + NUM + r')', r'cash & (?:cash )?equivalents[^\n]{0,30}?(' + NUM + r')'],
-        "total_equity":       [r'total equity[^\n]{0,30}?(' + NUM + r')', r'(?:shareholders|stockholders)[\'s]* equity[^\n]{0,30}?(' + NUM + r')', r'net worth[^\n]{0,30}?(' + NUM + r')'],
-        "reserves_surplus":   [r'reserves and surplus[^\n]{0,30}?(' + NUM + r')', r'reserves & surplus[^\n]{0,30}?(' + NUM + r')'],
-        "total_borrowings":   [r'total borrowings[^\n]{0,30}?(' + NUM + r')', r'total debt[^\n]{0,30}?(' + NUM + r')'],
-        "long_term_borrowings":[r'long[- ]term borrowings[^\n]{0,30}?(' + NUM + r')'],
-        "short_term_borrowings":[r'short[- ]term borrowings[^\n]{0,30}?(' + NUM + r')'],
-        "current_liabilities":[r'total current liabilities[^\n]{0,30}?(' + NUM + r')', r'current liabilities[^\n]{0,30}?(' + NUM + r')'],
-        "total_liabilities":  [r'total liabilities[^\n]{0,30}?(' + NUM + r')'],
-        "operating_cash_flow":[r'(?:net )?cash (?:from|generated (?:from|by)) operating[^\n]{0,30}?(' + NUM + r')', r'operating cash flow[^\n]{0,30}?(' + NUM + r')'],
-        "investing_cash_flow":[r'cash (?:from|used in) investing[^\n]{0,30}?(' + NUM + r')'],
-        "financing_cash_flow":[r'cash (?:from|used in) financing[^\n]{0,30}?(' + NUM + r')'],
-        "capex":              [r'capital expenditure[^\n]{0,30}?(' + NUM + r')', r'purchase of (?:property|fixed assets|ppe)[^\n]{0,30}?(' + NUM + r')', r'\bcapex\b[^\n]{0,30}?(' + NUM + r')'],
-        "current_ratio":      [r'current ratio[^\n]{0,30}?(' + NUM + r')'],
-        "debt_equity_ratio":  [r'debt[- /](?:to[- ])?equity[^\n]{0,30}?(' + NUM + r')', r'd/e ratio[^\n]{0,30}?(' + NUM + r')'],
-        "interest_coverage":  [r'interest coverage[^\n]{0,30}?(' + NUM + r')', r'interest cover[^\n]{0,30}?(' + NUM + r')'],
-        "roe":                [r'return on equity[^\n]{0,30}?(' + NUM + r')', r'\broe\b[^\n]{0,30}?(' + NUM + r')'],
-        "roa":                [r'return on assets[^\n]{0,30}?(' + NUM + r')', r'\broa\b[^\n]{0,30}?(' + NUM + r')'],
-        "roce":               [r'return on capital employed[^\n]{0,30}?(' + NUM + r')', r'\broce\b[^\n]{0,30}?(' + NUM + r')'],
-    }
-
-    t_lower = text.lower()
-    for metric, pats in patterns.items():
-        for pat in pats:
-            m = re.search(pat, t_lower)
-            if m:
-                metrics[metric] = m.group(1)
-                break
-
-    return dict(metrics)
-
-
 # ─── AI PROVIDER FUNCTIONS ───────────────────────────────────────────────────
 
 def _sync_gemini(text: str) -> dict:
-    """
-    Google Gemini — primary AI provider.
-    Uses gemini-2.0-flash first, falls back through flash and pro variants.
-    """
     if not GEMINI_API_KEY:
         raise Exception("GEMINI_API_KEY not configured")
 
@@ -1417,10 +1105,7 @@ def _sync_gemini(text: str) -> dict:
                 headers={"Content-Type": "application/json"},
                 json={
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "temperature": 0.1,
-                        "maxOutputTokens": 16384,
-                    },
+                    "generationConfig": {"temperature": 0.1, "maxOutputTokens": 16384},
                 },
                 timeout=120,
             )
@@ -1432,17 +1117,14 @@ def _sync_gemini(text: str) -> dict:
                 if candidates:
                     raw = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                     if raw:
-                        logger.info("Gemini %s: received %d chars", model, len(raw))
                         return safe_parse_json(raw)
                     logger.warning("Gemini %s: empty response", model)
                 else:
                     last_error = f"No candidates: {body.get('promptFeedback', '')}"
-                    logger.warning("Gemini %s: %s", model, last_error)
                 continue
 
             if resp.status_code == 429:
                 last_error = "Rate limited (429)"
-                logger.warning("Gemini %s rate limited, trying next model", model)
                 continue
 
             last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
@@ -1450,20 +1132,15 @@ def _sync_gemini(text: str) -> dict:
 
         except requests.exceptions.Timeout:
             last_error = "Timeout after 120s"
-            logger.warning("Gemini %s timed out", model)
             continue
         except Exception as e:
             last_error = str(e)[:200]
-            logger.warning("Gemini %s error: %s", model, last_error)
             continue
 
     raise Exception(f"All Gemini models failed. Last: {last_error}")
 
 
 def _sync_groq(text: str) -> dict:
-    """
-    Groq — ultra-fast inference, free tier.
-    """
     if not GROQ_API_KEY:
         raise Exception("GROQ_API_KEY not configured")
 
@@ -1490,38 +1167,24 @@ def _sync_groq(text: str) -> dict:
                 },
                 timeout=120,
             )
-            logger.info("Groq %s: HTTP %d", model, resp.status_code)
-
             if resp.status_code == 200:
                 raw = resp.json()["choices"][0]["message"]["content"]
                 if raw:
-                    logger.info("Groq %s: received %d chars", model, len(raw))
                     return safe_parse_json(raw)
-                logger.warning("Groq %s: empty response", model)
                 continue
-
             if resp.status_code == 429:
                 last_error = "Rate limited (429)"
-                logger.warning("Groq %s rate limited, trying next model", model)
                 continue
-
             last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
-            logger.warning("Groq %s: %s", model, last_error)
-
         except requests.exceptions.Timeout:
             last_error = "Timeout after 120s"
-            logger.warning("Groq %s timed out", model)
         except Exception as e:
             last_error = str(e)[:200]
-            logger.warning("Groq %s error: %s", model, last_error)
 
     raise Exception(f"All Groq models failed. Last: {last_error}")
 
 
 def _sync_together(text: str) -> dict:
-    """
-    Together AI — strong open models with generous free tier.
-    """
     api_key = os.getenv("TOGETHER_API_KEY", "")
     if not api_key:
         raise Exception("TOGETHER_API_KEY not configured")
@@ -1536,45 +1199,26 @@ def _sync_together(text: str) -> dict:
     for model, max_doc, lean in models:
         try:
             prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
-            logger.info("Together %s: sending %d chars", model, len(prompt))
             resp = requests.post(
                 "https://api.together.xyz/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 16384,
-                    "temperature": 0.1,
-                },
+                json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 16384, "temperature": 0.1},
                 timeout=120,
             )
-            logger.info("Together %s: HTTP %d", model, resp.status_code)
-
             if resp.status_code == 200:
                 raw = resp.json()["choices"][0]["message"]["content"]
                 if raw:
-                    logger.info("Together %s: received %d chars", model, len(raw))
                     return safe_parse_json(raw)
-                logger.warning("Together %s: empty response", model)
-                continue
-
             last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
-            logger.warning("Together %s: %s", model, last_error)
-
         except requests.exceptions.Timeout:
             last_error = "Timeout after 120s"
-            logger.warning("Together %s timed out", model)
         except Exception as e:
             last_error = str(e)[:200]
-            logger.warning("Together %s error: %s", model, last_error)
 
     raise Exception(f"All Together models failed. Last: {last_error}")
 
 
 def _sync_openrouter(text: str) -> dict:
-    """
-    OpenRouter — routes to multiple providers with generous free tier.
-    """
     api_key = os.getenv("OPENROUTER_API_KEY", "")
     if not api_key:
         raise Exception("OPENROUTER_API_KEY not configured")
@@ -1583,57 +1227,33 @@ def _sync_openrouter(text: str) -> dict:
         ("meta-llama/llama-3.3-70b-instruct", 44000, False),
         ("meta-llama/llama-3.1-70b-instruct", 44000, False),
         ("google/gemma-2-27b-it",             20000, True),
-        ("mistralai/mistral-7b-instruct",     20000, True),
     ]
 
     last_error = "unknown"
     for model, max_doc, lean in models:
         try:
             prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
-            logger.info("OpenRouter %s: sending %d chars", model, len(prompt))
             resp = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://finsight-vert.vercel.app",
-                    "X-Title": "FinSight",
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 16384,
-                    "temperature": 0.1,
-                },
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+                         "HTTP-Referer": "https://finsight-vert.vercel.app", "X-Title": "FinSight"},
+                json={"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 16384, "temperature": 0.1},
                 timeout=120,
             )
-            logger.info("OpenRouter %s: HTTP %d", model, resp.status_code)
-
             if resp.status_code == 200:
                 raw = resp.json()["choices"][0]["message"]["content"]
                 if raw:
-                    logger.info("OpenRouter %s: received %d chars", model, len(raw))
                     return safe_parse_json(raw)
-                logger.warning("OpenRouter %s: empty response", model)
-                continue
-
             last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
-            logger.warning("OpenRouter %s: %s", model, last_error)
-
         except requests.exceptions.Timeout:
             last_error = "Timeout after 120s"
-            logger.warning("OpenRouter %s timed out", model)
         except Exception as e:
             last_error = str(e)[:200]
-            logger.warning("OpenRouter %s error: %s", model, last_error)
 
     raise Exception(f"All OpenRouter models failed. Last: {last_error}")
 
 
 def _sync_cloudflare(text: str) -> dict:
-    """
-    Cloudflare Workers AI — free 10,000 requests/day, no rate limiting issues.
-    """
     cf_account = os.getenv("CF_ACCOUNT_ID", "")
     cf_token   = os.getenv("CF_API_TOKEN", "")
     if not cf_account or not cf_token:
@@ -1641,65 +1261,37 @@ def _sync_cloudflare(text: str) -> dict:
 
     models = [
         ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 12000, False),
-        ("@cf/meta/llama-3.1-8b-instruct-fast",        10000, True),
-        ("@cf/mistral/mistral-7b-instruct-v0.2-lora",   8000, True),
+        ("@cf/meta/llama-3.1-8b-instruct-fast",       10000, True),
     ]
-
-    headers = {
-        "Authorization": f"Bearer {cf_token}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {cf_token}", "Content-Type": "application/json"}
 
     last_error = "unknown"
     for model, max_doc, lean in models:
         try:
             prompt = build_lean_prompt(text, max_doc_chars=max_doc) if lean else build_prompt(text, max_doc_chars=max_doc)
             url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/run/{model}"
-            logger.info("Cloudflare %s: sending %d chars", model, len(prompt))
             resp = requests.post(
-                url,
-                headers=headers,
-                json={
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 16384,
-                    "temperature": 0.1,
-                },
+                url, headers=headers,
+                json={"messages": [{"role": "user", "content": prompt}], "max_tokens": 16384, "temperature": 0.1},
                 timeout=120,
             )
-            logger.info("Cloudflare %s: HTTP %d", model, resp.status_code)
-
             if resp.status_code == 200:
                 body = resp.json()
                 if body.get("success"):
                     raw = body.get("result", {}).get("response", "")
                     if raw:
-                        logger.info("Cloudflare %s: received %d chars", model, len(raw))
                         return safe_parse_json(raw)
-                    logger.warning("Cloudflare %s: empty response", model)
-                else:
-                    errors = body.get("errors", [])
-                    last_error = str(errors)[:200]
-                    logger.warning("Cloudflare %s: API error: %s", model, last_error)
-                continue
-
             last_error = f"HTTP {resp.status_code}: {resp.text[:150]}"
-            logger.warning("Cloudflare %s: %s", model, last_error)
-
         except requests.exceptions.Timeout:
             last_error = "Timeout after 120s"
-            logger.warning("Cloudflare %s timed out", model)
-            continue
         except Exception as e:
             last_error = str(e)[:200]
-            logger.warning("Cloudflare %s error: %s", model, last_error)
-            continue
 
     raise Exception(f"All Cloudflare models failed. Last: {last_error}")
 
 
 # ─── MAIN ANALYSIS ORCHESTRATOR ──────────────────────────────────────────────
 async def run_analysis(text: str) -> dict:
-
     if not text or len(text.strip()) < 100:
         raise Exception("PDF extraction returned insufficient text.")
 
@@ -1711,39 +1303,13 @@ async def run_analysis(text: str) -> dict:
     if len(found_kw) < 2:
         raise Exception(
             f"Extracted text does not appear to contain financial data "
-            f"(found only: {found_kw}). "
-            f"Please verify the PDF is a financial results document. "
-            f"Text preview: {full_text[:200]}"
+            f"(found only: {found_kw}). Preview: {full_text[:200]}"
         )
 
-    logger.info(f"Analysis starting — text: {len(full_text):,} chars, keywords found: {found_kw}")
+    logger.info(f"Analysis starting — text: {len(full_text):,} chars")
 
     loop   = asyncio.get_event_loop()
     errors = []
-
-    metrics = _extract_metrics_from_text(full_text)
-    ratios  = compute_financial_ratios(metrics)
-    logger.info(f"Text-based metrics: {metrics}")
-    logger.info(f"Computed ratios: {ratios}")
-
-    metrics_block = ""
-    if any(metrics.values()):
-        metrics_block = f"""
-REGEX-EXTRACTED HINTS (TREAT WITH CAUTION — may contain errors from wrong table rows):
-These are regex-extracted numbers. They may be wrong due to unit mismatches or wrong row matches.
-DO NOT trust these blindly. Always verify against the actual tables in the document below.
-Use only as a starting-point cross-reference:
-{json.dumps(metrics, indent=2)}
-
-COMPUTED RATIOS (derived from above hints — verify independently):
-{json.dumps(ratios, indent=2)}
-
-IMPORTANT: If the document tables show different numbers, ALWAYS use the document tables.
-The regex hints above are frequently wrong on Indian quarterly filings due to mixed units.
-
-"""
-
-    enhanced_text = metrics_block + full_text
 
     providers = [
         ("Gemini",      _sync_gemini,      GEMINI_API_KEY),
@@ -1758,8 +1324,8 @@ The regex hints above are frequently wrong on Indian quarterly filings due to mi
             logger.info(f"Skipping {provider_name} (no API key)")
             continue
         try:
-            logger.info(f"Trying {provider_name} with {len(enhanced_text):,} chars...")
-            result = await loop.run_in_executor(executor, func, enhanced_text)
+            logger.info(f"Trying {provider_name} with {len(full_text):,} chars...")
+            result = await loop.run_in_executor(executor, func, full_text)
             logger.info(f"{provider_name} succeeded!")
             return result
         except Exception as e:
@@ -1772,9 +1338,8 @@ The regex hints above are frequently wrong on Indian quarterly filings due to mi
 
 
 # ─── FMP HELPERS ─────────────────────────────────────────────────────────────
-
 _fmp_cache: dict = {}
-_FMP_CACHE_TTL   = 300  # 5 minutes
+_FMP_CACHE_TTL   = 300
 
 def _fmp_cached(key: str):
     entry = _fmp_cache.get(key)
@@ -1824,7 +1389,6 @@ async def get_fmp_quote(symbol: str) -> dict:
     sym = symbol.upper().strip()
     cached = _fmp_cached(f"quote:{sym}")
     if cached:
-        logger.info(f"FMP cache hit: {sym}")
         return cached
 
     fmp_sym = _fmp_symbol(sym)
@@ -1941,7 +1505,6 @@ async def get_quote_history(symbol: str, period: str = "1y"):
 
     sym     = symbol.upper().strip()
     fmp_sym = _fmp_symbol(sym)
-
     period_map = {"1m": 30, "3m": 90, "6m": 180, "1y": 365, "3y": 1095, "5y": 1825}
     if period not in period_map:
         raise HTTPException(400, f"Invalid period. Valid: {list(period_map.keys())}")
@@ -1952,24 +1515,12 @@ async def get_quote_history(symbol: str, period: str = "1y"):
         return cached
 
     try:
-        data = await _fmp_get(f"/v3/historical-price-full/{fmp_sym}",
-                              {"timeseries": period_map[period]})
-        records = []
-        for d in (data.get("historical") or []):
-            records.append({
-                "date":   d.get("date"),
-                "open":   _safe(d.get("open")),
-                "high":   _safe(d.get("high")),
-                "low":    _safe(d.get("low")),
-                "close":  _safe(d.get("close")),
-                "volume": d.get("volume"),
-            })
-        result = {
-            "symbol": sym, "fmp_symbol": fmp_sym,
-            "period": period, "count": len(records),
-            "data": records,
-            "fetched_at": datetime.utcnow().isoformat() + "Z",
-        }
+        data = await _fmp_get(f"/v3/historical-price-full/{fmp_sym}", {"timeseries": period_map[period]})
+        records = [{"date": d.get("date"), "open": _safe(d.get("open")), "high": _safe(d.get("high")),
+                    "low": _safe(d.get("low")), "close": _safe(d.get("close")), "volume": d.get("volume")}
+                   for d in (data.get("historical") or [])]
+        result = {"symbol": sym, "fmp_symbol": fmp_sym, "period": period, "count": len(records),
+                  "data": records, "fetched_at": datetime.utcnow().isoformat() + "Z"}
         return _fmp_store(cache_key, result)
     except Exception as e:
         raise HTTPException(404, str(e))
@@ -1982,7 +1533,6 @@ async def get_financials(symbol: str):
 
     sym     = symbol.upper().strip()
     fmp_sym = _fmp_symbol(sym)
-
     cache_key = f"financials:{sym}"
     cached = _fmp_cached(cache_key)
     if cached:
@@ -1994,14 +1544,9 @@ async def get_financials(symbol: str):
             _fmp_get(f"/v3/balance-sheet-statement/{fmp_sym}", {"limit": 4}),
             _fmp_get(f"/v3/cash-flow-statement/{fmp_sym}",     {"limit": 4}),
         )
-        result = {
-            "symbol": sym, "fmp_symbol": fmp_sym,
-            "source": "Financial Modeling Prep",
-            "income_statement": income or [],
-            "balance_sheet":    balance or [],
-            "cash_flow":        cashflow or [],
-            "fetched_at": datetime.utcnow().isoformat() + "Z",
-        }
+        result = {"symbol": sym, "fmp_symbol": fmp_sym, "source": "Financial Modeling Prep",
+                  "income_statement": income or [], "balance_sheet": balance or [],
+                  "cash_flow": cashflow or [], "fetched_at": datetime.utcnow().isoformat() + "Z"}
         return _fmp_store(cache_key, result)
     except Exception as e:
         raise HTTPException(404, str(e))
@@ -2025,15 +1570,13 @@ async def get_batch_quotes(body: dict):
         except Exception as e:
             results[s] = {"symbol": s, "error": str(e), "status": "failed"}
 
-    return {"count": len(results), "results": results,
-            "fetched_at": datetime.utcnow().isoformat() + "Z"}
+    return {"count": len(results), "results": results, "fetched_at": datetime.utcnow().isoformat() + "Z"}
 
 
 @app.get("/api/market/movers")
 async def get_market_movers():
     if not FMP_API_KEY:
         raise HTTPException(503, "FMP_API_KEY not configured on server")
-
     cached = _fmp_cached("market:movers")
     if cached:
         return cached
@@ -2049,24 +1592,17 @@ async def get_market_movers():
     ]
 
     async def _safe_quote(sym):
-        try:
-            return await get_fmp_quote(sym)
-        except Exception:
-            return None
+        try: return await get_fmp_quote(sym)
+        except: return None
 
     results = await asyncio.gather(*[_safe_quote(s) for s in NIFTY50])
     quotes  = [r for r in results if r and r.get("day_change_pct") is not None]
     quotes.sort(key=lambda x: x.get("day_change_pct", 0), reverse=True)
 
-    gainers = [{"symbol": q["symbol"], "name": q["company_name"],
-                "price": q["price"], "change_pct": q["day_change_pct"]}
-               for q in quotes[:5]]
-    losers  = [{"symbol": q["symbol"], "name": q["company_name"],
-                "price": q["price"], "change_pct": q["day_change_pct"]}
-               for q in quotes[-5:][::-1]]
+    gainers = [{"symbol": q["symbol"], "name": q["company_name"], "price": q["price"], "change_pct": q["day_change_pct"]} for q in quotes[:5]]
+    losers  = [{"symbol": q["symbol"], "name": q["company_name"], "price": q["price"], "change_pct": q["day_change_pct"]} for q in quotes[-5:][::-1]]
 
-    result = {"gainers": gainers, "losers": losers, "universe": "Nifty 50",
-              "fetched_at": datetime.utcnow().isoformat() + "Z"}
+    result = {"gainers": gainers, "losers": losers, "universe": "Nifty 50", "fetched_at": datetime.utcnow().isoformat() + "Z"}
     return _fmp_store("market:movers", result)
 
 
@@ -2190,15 +1726,13 @@ async def analyze_from_url(req: AnalyzeFromURLRequest, user=Depends(get_optional
             elif req.source == "bse": await c.get("https://www.bseindia.com/", headers=BSE_HEADERS)
             r = await c.get(req.pdf_url, headers=headers)
         if r.status_code != 200:
-            raise Exception(f"Could not fetch PDF — HTTP {r.status_code}. File may have moved or expired.")
+            raise Exception(f"Could not fetch PDF — HTTP {r.status_code}.")
         if "html" in r.headers.get("content-type", "").lower():
             raise Exception("Server returned HTML instead of PDF. Filing link may have expired.")
-        logger.info(f"Downloaded {len(r.content):,} bytes from {req.source}")
         loop = asyncio.get_event_loop()
         text = await loop.run_in_executor(executor, extract_pdf_text, r.content)
         result = await run_analysis(text)
         await analyses_col.update_one({"analysis_id": analysis_id}, {"$set": {"status": "completed", "result": result}})
-        logger.info(f"URL analysis complete: {analysis_id}")
         return {"analysis_id": analysis_id, "status": "completed", "result": result}
     except Exception as e:
         msg = str(e); logger.error(f"URL analysis failed {analysis_id}: {msg}")
@@ -2238,21 +1772,18 @@ async def generate_pdf(req: PDFRequest):
     last_error = None
     for attempt in range(1, 4):
         try:
-            logger.info(f"PDF generation attempt {attempt}/3 — {len(html_content)} chars")
             async with httpx.AsyncClient(timeout=90) as c:
                 r = await c.post("https://api.html2pdf.app/v1/generate",
                     json={"html": html_content, "apiKey": HTML2PDF_KEY, "zoom": 1, "landscape": False,
                           "marginTop": 10, "marginBottom": 10, "marginLeft": 10, "marginRight": 10},
                     headers={"Content-Type": "application/json"})
             if r.status_code == 200:
-                logger.info(f"PDF generated on attempt {attempt} — {len(r.content):,} bytes")
                 return Response(content=r.content, media_type="application/pdf",
                     headers={"Content-Disposition": "attachment; filename=FinSight_Analysis.pdf"})
             last_error = f"html2pdf.app {r.status_code}: {r.text[:200]}"
-            logger.warning(f"Attempt {attempt}: {last_error}")
         except httpx.TimeoutException:
-            last_error = f"Attempt {attempt} timed out after 90s"; logger.warning(last_error)
+            last_error = f"Attempt {attempt} timed out"
         except Exception as e:
-            last_error = str(e); logger.warning(f"Attempt {attempt} error: {last_error}")
+            last_error = str(e)
         if attempt < 3: await asyncio.sleep(3)
     raise HTTPException(504, f"PDF generation failed after 3 attempts. {last_error}")
