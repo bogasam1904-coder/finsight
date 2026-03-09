@@ -1414,12 +1414,13 @@ def _extract_company_name(text: str) -> str:
 
 def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
     """
-    Main entry point for PDF processing.
-    New architecture:
-      1. Deterministically extract all key numbers with source citations
-      2. Build a VERIFIED DATA BLOCK (ground truth for AI)
-      3. Append raw structured text as supporting context
-      4. AI only writes commentary — never finds new numbers
+    Extract text from PDF and return it for AI analysis.
+    Strategy:
+      1. Select the right pages (consolidated P&L, ratios, segment)
+      2. Extract text via pdfplumber first, pypdf fallback
+      3. Prepend a compact cheat-sheet of the PRINTED RATIOS TABLE values
+         (ratios extract reliably; P&L column 1 has font encoding issues in some PDFs)
+      4. Return combined text for the AI prompt
     """
     # Guard: reject FinSight reports
     try:
@@ -1437,73 +1438,125 @@ def extract_financial_snippet(raw_bytes: bytes, max_chars: int = 60000) -> str:
         pass
 
     page_indices = _select_financial_pages(raw_bytes)
-
     if not page_indices:
-        logger.warning("No financial pages selected — falling back to first 3 pages")
-        page_indices = list(range(min(3, pypdf.PdfReader(io.BytesIO(raw_bytes)).pages.__len__())))
+        logger.warning("No financial pages selected — falling back to first 5 pages")
+        page_indices = list(range(min(5, pypdf.PdfReader(io.BytesIO(raw_bytes)).pages.__len__())))
 
-    result = _extract_with_pdfplumber(raw_bytes, page_indices)
-
-    if not result.strip():
-        logger.info("Falling back to pypdf extraction")
+    # ── Extract text ──────────────────────────────────────────────────────────
+    text = _extract_with_pdfplumber(raw_bytes, page_indices)
+    if not text.strip():
+        logger.info("pdfplumber empty, falling back to pypdf")
         reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
-        result = ""
+        text = ""
         for i in page_indices:
             pt = reader.pages[i].extract_text() or ""
             if pt.strip():
-                result += f"\n--- PAGE {i+1} ---\n{pt}\n"
+                text += f"\n--- PAGE {i+1} ---\n{pt}\n"
 
-    doc_type_hint = ""
-    lower_result = result.lower()
+    # ── Build ratios cheat-sheet from the printed Ratios table ────────────────
+    # Ratios page text extracts cleanly; pre-extract and pin these for the AI.
+    ratios_hint = _extract_ratios_hint(raw_bytes, page_indices)
+    if ratios_hint:
+        text = ratios_hint + "\n\n" + text
+
     is_partial = (
-        "newspaper" in lower_result or
-        "business standard" in lower_result or
-        "extract of" in lower_result or
-        "advertisement" in lower_result or
-        len(result) < 3000
+        "newspaper" in text.lower() or
+        "business standard" in text.lower() or
+        "extract of" in text.lower() or
+        len(text) < 3000
     )
     if is_partial:
-        doc_type_hint = (
-            "\n\n[SYSTEM NOTE: PARTIAL FILING DETECTED. "
-            "Only write numbers explicitly visible. Mark unavailable fields as 'Not available'.]\n"
+        text = (
+            "[SYSTEM NOTE: PARTIAL FILING DETECTED. "
+            "Only write numbers explicitly visible. Mark unavailable fields as 'Not available'.\n\n"
+            + text
         )
 
-    # ── STEP 1: Deterministic extraction ─────────────────────────────────────
-    extracted = _extract_deterministic(raw_bytes, page_indices)
-    verified_block = _build_verified_block(extracted)
-    logger.info(f"Verified block built: {len(extracted['pl'])} P&L rows, "
-                f"{len(extracted['ratios'])} ratios, company={extracted['company_name']}")
-
-    # ── STEP 2: Raw structured text (context only) ────────────────────────────
-    raw_text = _extract_with_pdfplumber(raw_bytes, page_indices)
-    if not raw_text.strip():
-        logger.info("Falling back to pypdf extraction")
-        reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
-        raw_text = ""
-        for i in page_indices:
-            pt = reader.pages[i].extract_text() or ""
-            if pt.strip():
-                raw_text += f"\n--- PAGE {i+1} ---\n{pt}\n"
-
-    is_partial = (
-        "newspaper" in raw_text.lower() or
-        "business standard" in raw_text.lower() or
-        len(raw_text) < 3000
-    )
-    partial_note = (
-        "\n[NOTE: PARTIAL FILING — only use numbers from VERIFIED block above.]\n"
-        if is_partial else ""
-    )
-
-    context_section = (
-        "\n\n━━━ SUPPORTING DOCUMENT TEXT (context only — use VERIFIED block above for all numbers) ━━━\n"
-        + partial_note
-        + raw_text
-    )
-
-    final = (verified_block + context_section)[:max_chars]
+    final = text[:max_chars]
     logger.info(f"Final snippet: {len(final):,} chars")
     return final
+
+
+def _extract_ratios_hint(raw_bytes: bytes, page_indices: list) -> str:
+    """
+    Extract the printed Ratios table values and return as a pinned hint block.
+    These values extract cleanly (no font encoding issues) and are critical
+    to prevent AI from recalculating ratios incorrectly.
+    """
+    RATIO_ROWS = [
+        ("Debt Service Coverage Ratio",   ["debt service coverage"]),
+        ("Interest Service Coverage",     ["interest service coverage", "interest coverage ratio"]),
+        ("Debt Equity Ratio",             ["debt equity ratio"]),
+        ("Current Ratio",                 ["current ratio"]),
+        ("Long-term Debt to Working Cap", ["long-term debt to working capital", "long term debt to working"]),
+        ("Current Liability Ratio",       ["current liability ratio"]),
+        ("Total Debts to Total Assets",   ["total debts to total assets", "total debt to total assets"]),
+        ("Debtors Turnover",              ["debtors turnover"]),
+        ("Inventory Turnover",            ["inventory turnover"]),
+        ("Operating Margin (%)",          ["operating margin"]),
+        ("Net Profit Margin (%)",         ["net profit margin"]),
+    ]
+
+    found = {}
+    net_worth_val = ""
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+        for page_idx in page_indices:
+            if page_idx >= len(reader.pages):
+                continue
+            page_text = reader.pages[page_idx].extract_text() or ""
+            tl = page_text.lower()
+
+            # Only process pages that have a ratios section
+            if "ratios" not in tl:
+                continue
+            if "debt equity" not in tl and "operating margin" not in tl:
+                continue
+
+            lines = page_text.split("\n")
+            for line in lines:
+                ll = line.lower().strip()
+
+                # Net worth
+                if "net worth" in ll and ("including" in ll or "retained" in ll):
+                    nums = re.findall(r"[\d,]+", line)
+                    nums = [n.replace(",","") for n in nums if len(n.replace(",","")) >= 4]
+                    if nums and not net_worth_val:
+                        net_worth_val = nums[0]
+
+                # EPS
+                if "basic (in" in ll or "basic (in ₹" in ll:
+                    nums = re.findall(r"\d+\.\d+|\d+", line)
+                    nums = [n for n in nums if 0 < float(n) < 1000]
+                    if nums:
+                        found["EPS Basic (₹)"] = nums[0]
+
+                # Ratios
+                for label, patterns in RATIO_ROWS:
+                    if label in found:
+                        continue
+                    if any(p in ll for p in patterns):
+                        nums = re.findall(r"[-]?\d+\.\d+|[-]?\d+", line)
+                        nums = [n for n in nums if n not in ("0", "-0")]
+                        if nums:
+                            found[label] = nums[0]
+                        break
+
+    except Exception as e:
+        logger.warning(f"Ratios hint extraction failed: {e}")
+        return ""
+
+    if not found:
+        return ""
+
+    lines = ["[PRINTED RATIOS FROM FILING — USE THESE EXACT VALUES, DO NOT RECALCULATE]"]
+    for label, val in found.items():
+        lines.append(f"  {label}: {val}")
+    if net_worth_val:
+        lines.append(f"  Net Worth (₹ Cr): {net_worth_val}")
+    lines.append("[END RATIOS]")
+    return "\n".join(lines)
 
 
 def extract_pdf_text(raw_bytes: bytes) -> str:
@@ -1574,67 +1627,60 @@ def build_prompt(text: str, max_doc_chars: int = 44000) -> str:
     logger.info(f"build_prompt: {len(snippet):,} chars")
     return f"""You are a senior equity research analyst. Analyze the financial document below and return ONLY one valid JSON object.
 
-━━━ MANDATORY DATA EXTRACTION RULES (VIOLATIONS = WRONG REPORT) ━━━
+━━━ HOW TO READ THIS DOCUMENT (READ CAREFULLY) ━━━
 
-RULE 1 — AUDITOR NARRATIVE TRAP (Most Common Source of Errors):
-Indian quarterly filings include an Independent Auditor's Review Report that says things like:
+RULE 1 — AUDITOR NARRATIVE TRAP (Most Common Error Source):
+The document begins with an Independent Auditor's Review Report containing sentences like:
   "247 subsidiaries reflect total revenues of Rs. 3,04,299 crore and net profit of Rs. 12,966 crore"
-These numbers cited IN THE AUDITOR'S TEXT are SUBSIDIARY-ONLY figures for auditor scope disclosure.
-They are NOT the company's consolidated revenues or profits.
-→ NEVER use numbers from auditor review report paragraphs.
-→ ONLY use numbers from rows in the actual financial results tables.
+These are SUBSIDIARY-SCOPE figures cited for audit disclosure only — NOT the company's financials.
+→ NEVER extract any number from the auditor narrative section (pages 1–9 in BSE filings).
+→ The real financials start at the page titled "UNAUDITED CONSOLIDATED FINANCIAL RESULTS".
 
-RULE 2 — FIND THE ACTUAL P&L TABLE:
-Look for the table titled "UNAUDITED CONSOLIDATED FINANCIAL RESULTS FOR THE QUARTER..."
-It has column headers like: 31st Dec'25 | 30th Sep'25 | 31st Dec'24 | 31st Dec'25 | 31st Dec'24
-Extract from rows: "Revenue from Operations", "Profit After Tax", "Total Income", etc.
-These table values are the real consolidated figures.
+RULE 2 — THE P&L TABLE:
+Find the table "UNAUDITED CONSOLIDATED FINANCIAL RESULTS FOR THE QUARTER / NINE MONTHS ENDED..."
+Column headers: 31st Dec'25 | 30th Sep'25 | 31st Dec'24 | 31st Dec'25 (9M) | 31st Dec'24 (9M)
+The FIRST data column (31st Dec'25) = current quarter. Use this column for all current metrics.
+Row names to find: "Revenue from Operations", "Profit Before Tax", "Profit After Tax", "Finance Costs", etc.
+The number in the cell at the intersection of the row and current quarter column = the value.
 
-RULE 3 — CURRENCY UNIT IS AUTHORITATIVE:
-The document header says [DOCUMENT CURRENCY UNIT: X]. Use that for ALL numbers.
-Wrong unit = every number wrong by 100x. If it says Crores, write "₹X Cr" not "₹X Lakhs".
+NOTE ON PDF RENDERING: Some PDFs have font encoding issues where a number in column 1 may appear
+garbled (e.g. "J,912" instead of "7,912", or "-Aoa,245:" instead of "2,93,829").
+If column 1 appears garbled for a row, use the SEGMENT INFORMATION page which always has clean
+"Revenue from Operations" values, or use the Nine Months figure and note it.
 
-RULE 4 — NEVER ASSUME OR ESTIMATE:
-If a value is not in the tables, write "Not available in this filing".
-Never write "assumed", "estimated", "based on industry trends".
+RULE 3 — RATIOS (ALREADY EXTRACTED FOR YOU):
+If the document begins with a [PRINTED RATIOS FROM FILING] block, those are the exact values
+from the filing's printed Ratios section. USE THOSE EXACT VALUES.
+Do NOT recalculate D/E, Current Ratio, Interest Coverage, Operating Margin, Net Profit Margin.
+The printed values are already correct — recalculation introduces errors.
 
-RULE 5 — USE STATED RATIOS:
-The filing prints a Ratios section with: Debt Service Coverage, Interest Service Coverage,
-Debt Equity Ratio, Current Ratio, Operating Margin %, Net Profit Margin %, etc.
-USE THESE PRINTED VALUES. Do not recalculate from raw numbers.
+RULE 4 — CONSOLIDATED ONLY:
+Use "UNAUDITED CONSOLIDATED" tables. Ignore standalone tables that appear later.
 
-RULE 6 — CONSOLIDATED ONLY:
-Use ONLY consolidated figures (labeled "Unaudited Consolidated Financial Results").
-Standalone figures appear later and must be IGNORED if consolidated data is present.
+RULE 5 — CURRENCY UNIT:
+Check the table header — it will say "₹ in crore" or "₹ in lakhs". Use that unit for ALL numbers.
 
-RULE 7 — EVERY FIELD NEEDS REAL NUMBERS:
-"Strong performance" without a number = REJECTED.
-"Revenue grew 10.5% to ₹2,69,496 Cr vs ₹2,43,865 Cr YoY" = ACCEPTED.
+RULE 6 — CASH FLOW:
+Quarterly filings (Q1/Q2/Q3) do NOT include Cash Flow Statements. Set all CF fields to
+"Not available in this filing" and Cash Flow score to 9.
 
-RULE 8 — CASH FLOW: Indian quarterly filings (Q1/Q2/Q3/Q4) DO NOT include Cash Flow Statements.
-Cash Flow Statements only appear in Annual Reports (full year filings).
-If this is a quarterly filing: set operating_cf, investing_cf, financing_cf, free_cash_flow, capex ALL to "Not available in this filing".
-DO NOT fabricate or estimate cash flow numbers. DO NOT use PAT as a proxy for OCF.
-The Cash Flow score should be set to 9 (neutral/average) when cash flow data is unavailable.
+RULE 7 — SPECIFIC NUMBERS REQUIRED:
+Every commentary field must contain actual numbers from the tables.
+"Revenue grew strongly" → REJECTED.
+"Revenue ₹2,69,496 Cr, up 10.5% YoY from ₹2,43,865 Cr" → ACCEPTED.
 
-RULE 9 — COMPANY NAME: Extract the company name from the document header or title page.
-Look for lines like "RELIANCE INDUSTRIES LIMITED" or "Infosys Limited" near the top.
-Set company_name to the exact company name found. Never set it to "Not available in this filing".
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SCORING FRAMEWORK:
+━━━ SCORING FRAMEWORK ━━━
 Profitability (max 20): ROE>20% AND Margin>15%=20 | ROE 12-20% OR Margin 8-15%=12 | else=5
 Growth (max 15): Rev>20% AND Profit>25%=15 | Rev 10-20% AND Profit 10-25%=9 | else=4
 Balance Sheet (max 15): D/E<0.5=15 | D/E 0.5-1.5=9 | D/E>1.5=3
 Liquidity (max 10): CR>1.5=10 | CR 1.0-1.5=6 | CR<1.0=2
-Cash Flow (max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3 | Not available in quarterly filing=9
+Cash Flow (max 15): OCF>PAT=15 | OCF~PAT=9 | OCF<PAT=3 | Not available=9
 Governance (max 15): Clean audit=15 | Minor issues=9 | Major=3
 Industry (max 10): Leader=10 | Average=6 | Lagging=2
 health_label: >=80=Excellent | 60-79=Good | 40-59=Fair | 20-39=Poor | <20=Critical
 investment_label: Strong Buy / Buy / Hold / Reduce / Avoid
 
-Return ONLY this JSON (all fields required, every commentary field must contain specific numbers from the tables):
+Return ONLY this JSON (all fields required):
 
 {{
   "company_name": "",
@@ -1745,9 +1791,10 @@ Return ONLY this JSON (all fields required, every commentary field must contain 
   "what_to_watch": []
 }}
 
-FINANCIAL DOCUMENT (extract numbers ONLY from tables, not from auditor narrative text):
+FINANCIAL DOCUMENT:
 {snippet}
 """
+
 
 
 def build_lean_prompt(text: str, max_doc_chars: int = 18000) -> str:
