@@ -13,7 +13,9 @@ const LIGHT = { bg:'#F4F7FF', card:'#FFFFFF',  cardAlt:'#F0F4FF', text:'#0A0E1A'
 
 // ─── Safe helpers ─────────────────────────────────────────────────────────────
 const safe = (v: any): string | null =>
-  v && v !== 'N/A' && v !== '' && v !== 'Not reported' && v !== 'null' ? String(v) : null;
+  v && v !== 'N/A' && v !== '' && v !== 'Not reported' && v !== 'null' &&
+  !String(v).toLowerCase().startsWith('not available')
+    ? String(v) : null;
 
 // ─── Color helpers ────────────────────────────────────────────────────────────
 const scoreColor  = (s: number) => s >= 80 ? '#22c55e' : s >= 60 ? '#3b82f6' : s >= 40 ? '#f59e0b' : '#ef4444';
@@ -22,8 +24,21 @@ const trendColor  = (t: string, accent: string) => t === 'up' ? '#22c55e' : t ==
 const signalColor = (s: string) => s === 'Bullish' ? '#22c55e' : s === 'Bearish' ? '#ef4444' : '#94a3b8';
 const labelColor  = (l: string) => ({ 'Strong Buy':'#22c55e', Buy:'#4ade80', Hold:'#f59e0b', Reduce:'#ef4444', Avoid:'#dc2626' }[l] || '#4F8AFF');
 const debtColor   = (l: string) => l === 'Comfortable' ? '#22c55e' : l === 'Elevated' ? '#f59e0b' : '#ef4444';
-const toneColor   = (t: string) => t === 'Positive' ? '#22c55e' : t === 'Cautious' || t === 'Concerned' ? '#ef4444' : '#f59e0b';
-const cfqColor    = (q: string) => q === 'Strong' ? '#22c55e' : q === 'Moderate' ? '#f59e0b' : '#ef4444';
+
+// ─── FIX: cfqColor only operates on short label words, not long sentences ────
+const cfqLabel = (q: string): string => {
+  if (!q) return '';
+  const ql = q.toLowerCase();
+  if (ql.startsWith('strong')) return 'Strong';
+  if (ql.startsWith('moderate')) return 'Moderate';
+  if (ql.startsWith('weak')) return 'Weak';
+  // backend now sends cash_conversion_quality_label — use that if available
+  return '';
+};
+const cfqColor = (q: string): string => {
+  const label = cfqLabel(q);
+  return label === 'Strong' ? '#22c55e' : label === 'Moderate' ? '#f59e0b' : label === 'Weak' ? '#ef4444' : '#6B82A8';
+};
 
 // ─── PDF builder ─────────────────────────────────────────────────────────────
 function buildPDF(r: any, dark: boolean): string {
@@ -45,18 +60,22 @@ function buildPDF(r: any, dark: boolean): string {
   const pill = (t: string, c: string) =>
     `<span style="display:inline-block;background:${c}22;color:${c};font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;margin:2px 4px 2px 0">${t}</span>`;
 
-  const box = (label: string, val: string | null, col = accentC) =>
-    val ? `<div style="display:inline-block;background:${cardBg};border:1px solid ${borderC};border-radius:10px;padding:12px 16px;margin:4px;text-align:center;min-width:90px">
-      <div style="font-size:17px;font-weight:900;color:${col}">${val}</div>
+  // FIX: box() now skips "Not available" values so they don't render as red boxes
+  const box = (label: string, val: string | null | undefined, col = accentC) => {
+    if (!val) return '';
+    const v = String(val);
+    if (v.toLowerCase().startsWith('not available') || v === 'N/A' || v === '') return '';
+    return `<div style="display:inline-block;background:${cardBg};border:1px solid ${borderC};border-radius:10px;padding:12px 16px;margin:4px;text-align:center;min-width:90px">
+      <div style="font-size:17px;font-weight:900;color:${col}">${v}</div>
       <div style="font-size:10px;color:${subC};margin-top:4px;font-weight:600">${label}</div>
-    </div>` : '';
+    </div>`;
+  };
 
   const li = (arr: any[], col = textC) =>
     (arr || []).filter(Boolean).map(x =>
       `<li style="margin-bottom:7px;font-size:13px;color:${col};line-height:1.75">${typeof x === 'string' ? x : (x.question ? `<strong>${x.question}</strong><br/>${x.answer}` : JSON.stringify(x))}</li>`
     ).join('');
 
-  // Score breakdown
   const scoreRows = (r.health_score_breakdown?.components || []).map((c: any) => {
     const col = ratingColor(c.rating);
     const pct = c.max > 0 ? Math.round((c.score / c.max) * 100) : 0;
@@ -71,7 +90,6 @@ function buildPDF(r: any, dark: boolean): string {
     <tr><td colspan="4" style="padding:4px 12px 10px;border-bottom:1px solid ${borderC};font-size:11px;color:${subC};line-height:1.65">${c.reasoning}</td></tr>`;
   }).join('');
 
-  // Key metrics
   const metricRows = (r.key_metrics || []).filter((m: any) => safe(m.current)).map((m: any) =>
     `<tr>
       <td style="padding:9px 12px;border-bottom:1px solid ${borderC};font-weight:700;font-size:13px;color:${textC}">${m.label}</td>
@@ -89,6 +107,8 @@ function buildPDF(r: any, dark: boolean): string {
   const indc = r.industry_context || {};
   const pa = r.profitability || {};
   const lq = r.liquidity || {};
+  // Use the short label for color rendering
+  const cfQualityLabel = cfd.cash_conversion_quality_label || cfqLabel(cfd.cash_conversion_quality || '');
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,'Segoe UI',Helvetica,sans-serif;background:${bg};color:${textC};-webkit-print-color-adjust:exact;print-color-adjust:exact}.wrap{max-width:860px;margin:0 auto;padding:44px 40px}ul{padding-left:18px;margin:6px 0}table{width:100%;border-collapse:collapse}@page{margin:0.6in}</style>
@@ -119,7 +139,6 @@ ${r.headline ? `<div style="font-size:15px;font-weight:700;background:${cardBg};
 </div>
 
 ${scoreRows ? sec('📐 Score Breakdown', `<table><tbody>${scoreRows}</tbody></table>`) : ''}
-
 ${r.executive_summary ? sec('📋 Executive Summary', `<p style="font-size:13px;line-height:1.9;color:${textC}">${r.executive_summary}</p>`) : ''}
 
 ${r.for_long_term_investors || r.for_short_term_traders ? sec('👥 Investor Perspectives', `
@@ -162,7 +181,7 @@ ${cfd.ocf_vs_pat_insight ? sec('🌊 Cash Flow Quality', `
     ${box('Operating CF', cfd.operating_cf)}
     ${box('Free CF', cfd.free_cash_flow, '#22c55e')}
     ${box('Capex', cfd.capex)}
-    ${cfd.cash_conversion_quality ? box('Quality', cfd.cash_conversion_quality, cfqColor(cfd.cash_conversion_quality)) : ''}
+    ${cfQualityLabel ? box('Quality', cfQualityLabel, cfqColor(cfQualityLabel)) : ''}
   </div>
   <p style="font-size:13px;line-height:1.85;color:${textC}">${cfd.ocf_vs_pat_insight}</p>
 `) : ''}
@@ -256,34 +275,60 @@ export default function AnalysisScreen() {
     } finally { setLoading(false); }
   };
 
+  // ─── FIX: PDF download with proper error handling ─────────────────────────
   const handleDownloadPDF = async () => {
     if (!analysis?.result) return;
     setDownloading(true);
     try {
       const company = (analysis.result.company_name || 'FinSight').replace(/[^a-z0-9]/gi, '_');
       const html = buildPDF(analysis.result, dark);
+
       if (Platform.OS === 'web') {
-        const resp = await fetch(`${BACKEND}/api/generate-pdf`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/pdf' },
-          body: JSON.stringify({ html }),
-        });
-        if (!resp.ok) throw new Error(`PDF failed (${resp.status})`);
-        const blob = await resp.blob();
-        if (blob.size < 1000) throw new Error('PDF too small');
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = `${company}_Analysis.pdf`;
-        document.body.appendChild(a); a.click();
-        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+        // Try backend PDF generation first
+        try {
+          const resp = await fetch(`${BACKEND}/api/generate-pdf`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/pdf' },
+            body: JSON.stringify({ html }),
+          });
+          if (resp.ok) {
+            const blob = await resp.blob();
+            if (blob.size > 1000) {
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `${company}_FinSight_Analysis.pdf`;
+              document.body.appendChild(a);
+              a.click();
+              setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 200);
+              return;
+            }
+          }
+        } catch { /* fall through to print */ }
+
+        // Fallback: open print dialog
+        const win = window.open('', '_blank');
+        if (win) {
+          win.document.write(html);
+          win.document.close();
+          win.onload = () => { win.focus(); win.print(); };
+        } else {
+          Alert.alert('PDF', 'Please allow popups to download the PDF, or use the print shortcut (Ctrl+P / Cmd+P).');
+        }
       } else {
         const [P, S] = await Promise.all([import('expo-print'), import('expo-sharing')]);
         const { uri } = await P.printToFileAsync({ html, base64: false });
-        if (await S.isAvailableAsync()) await S.shareAsync(uri, { mimeType: 'application/pdf', UTI: 'com.adobe.pdf' });
+        if (await S.isAvailableAsync()) {
+          await S.shareAsync(uri, { mimeType: 'application/pdf', UTI: 'com.adobe.pdf' });
+        } else {
+          Alert.alert('Saved', 'PDF saved to your device.');
+        }
       }
     } catch (e: any) {
-      Alert.alert('Download Failed', e.message || 'Could not generate PDF.');
-    } finally { setDownloading(false); }
+      Alert.alert('Download Failed', e.message || 'Could not generate PDF. Please try again.');
+    } finally {
+      setDownloading(false);
+    }
   };
 
   const shareUrl = `https://finsight-vert.vercel.app/share/${id}`;
@@ -330,7 +375,6 @@ export default function AnalysisScreen() {
     else router.replace('/(tabs)');
   };
 
-  // ── Loading ────────────────────────────────────────────────────────────────
   if (loading) return (
     <View style={[s.center, { backgroundColor: t.bg }]}>
       <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} />
@@ -339,7 +383,6 @@ export default function AnalysisScreen() {
     </View>
   );
 
-  // ── Not found ──────────────────────────────────────────────────────────────
   if (!analysis?.result) return (
     <View style={[s.center, { backgroundColor: t.bg }]}>
       <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} />
@@ -358,11 +401,9 @@ export default function AnalysisScreen() {
   const sc = scoreColor(r.health_score || 0);
   const ic = labelColor(r.investment_label || '');
 
-  // ── Sub-components ─────────────────────────────────────────────────────────
   const Card = ({ title, leftBorder, children }: any) => (
     <View style={[s.card, {
-      backgroundColor: t.card,
-      borderColor: t.border,
+      backgroundColor: t.card, borderColor: t.border,
       borderLeftColor: leftBorder || t.border,
       borderLeftWidth: leftBorder ? 3 : 1,
     }]}>
@@ -386,7 +427,7 @@ export default function AnalysisScreen() {
       <View style={[s.dotCircle, { backgroundColor: (color || t.accent) + '22' }]}>
         <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: color || t.accent }} />
       </View>
-      <Text style={{ flex: 1, fontSize: 14, lineHeight: 22, color: t.text }}>{text}</Text>
+      <Text style={{ flex: 1, fontSize: 14, lineHeight: 22, color: t.text }}>{String(text)}</Text>
     </View>
   );
 
@@ -443,7 +484,6 @@ export default function AnalysisScreen() {
     );
   };
 
-  // ── Destructure JSON ───────────────────────────────────────────────────────
   const pa = r.profitability || {};
   const lq = r.liquidity || {};
   const cfd = r.cash_flow_deep_dive || {};
@@ -451,13 +491,14 @@ export default function AnalysisScreen() {
   const gq = r.growth_quality || {};
   const indc = r.industry_context || {};
   const faq = r.investor_faq || [];
+  // Use short label for color logic
+  const cfQualityLabel = cfd.cash_conversion_quality_label || cfqLabel(cfd.cash_conversion_quality || '');
 
   return (
     <View style={{ flex: 1, backgroundColor: t.bg }}>
       <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} />
       <Animated.ScrollView style={{ opacity: fadeAnim }} showsVerticalScrollIndicator={false}>
 
-        {/* ── Top bar ── */}
         <View style={[s.topBar, { borderBottomColor: t.border }]}>
           <TouchableOpacity onPress={handleBack}>
             <Text style={{ color: t.accent, fontSize: 15, fontWeight: '600' }}>← Back</Text>
@@ -468,18 +509,14 @@ export default function AnalysisScreen() {
           </View>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
             <Text style={{ fontSize: 14 }}>{dark ? '🌙' : '☀️'}</Text>
-            <Switch
-              value={dark} onValueChange={setDark}
+            <Switch value={dark} onValueChange={setDark}
               trackColor={{ false: '#CBD5E1', true: t.accent }}
-              thumbColor="#fff"
-              style={{ transform: [{ scale: 0.8 }] }}
-            />
+              thumbColor="#fff" style={{ transform: [{ scale: 0.8 }] }} />
           </View>
         </View>
 
         <View style={{ paddingHorizontal: 16 }}>
 
-          {/* ── Company header ── */}
           <View style={{ paddingTop: 20, paddingBottom: 14 }}>
             <Text style={{ fontSize: 26, fontWeight: '900', letterSpacing: -0.8, color: t.text, marginBottom: 5 }}>
               {r.company_name}
@@ -501,14 +538,12 @@ export default function AnalysisScreen() {
             )}
           </View>
 
-          {/* ── Headline ── */}
           {r.headline && (
             <View style={{ backgroundColor: t.accentBg, borderLeftWidth: 3, borderLeftColor: t.accent, borderRadius: 12, padding: 14, marginBottom: 14 }}>
               <Text style={{ fontSize: 14, fontWeight: '700', color: t.text, lineHeight: 22 }}>{r.headline}</Text>
             </View>
           )}
 
-          {/* ── Health Score Card ── */}
           <View style={[s.scoreCard, { backgroundColor: t.card, borderColor: t.border }]}>
             <Text style={{ fontSize: 10, fontWeight: '700', letterSpacing: 2, textTransform: 'uppercase', color: t.sub, marginBottom: 10 }}>
               Financial Health Score
@@ -530,36 +565,29 @@ export default function AnalysisScreen() {
             )}
           </View>
 
-          {/* ── Executive Summary ── */}
           {r.executive_summary && (
             <Card title="📋 Executive Summary">
               <Text style={{ fontSize: 14, lineHeight: 23, color: t.text }}>{r.executive_summary}</Text>
             </Card>
           )}
 
-          {/* ── Investor Perspectives ── */}
           {(r.for_long_term_investors || r.for_short_term_traders) && (
             <Card title="👥 Investor Perspectives">
               {r.for_long_term_investors && (
                 <View style={{ marginBottom: 16 }}>
-                  <Text style={{ fontSize: 11, fontWeight: '800', color: '#22c55e', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 7 }}>
-                    🏛 Long-Term Investors
-                  </Text>
+                  <Text style={{ fontSize: 11, fontWeight: '800', color: '#22c55e', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 7 }}>🏛 Long-Term Investors</Text>
                   <Text style={{ fontSize: 13, lineHeight: 21, color: t.text }}>{r.for_long_term_investors}</Text>
                 </View>
               )}
               {r.for_short_term_traders && (
                 <View>
-                  <Text style={{ fontSize: 11, fontWeight: '800', color: '#f59e0b', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 7 }}>
-                    ⚡ Short-Term Traders
-                  </Text>
+                  <Text style={{ fontSize: 11, fontWeight: '800', color: '#f59e0b', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 7 }}>⚡ Short-Term Traders</Text>
                   <Text style={{ fontSize: 13, lineHeight: 21, color: t.text }}>{r.for_short_term_traders}</Text>
                 </View>
               )}
             </Card>
           )}
 
-          {/* ── Bottom Line ── */}
           {r.bottom_line && (
             <Card title="💡 Bottom Line" leftBorder={ic}>
               <View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 16 }}>
@@ -568,7 +596,6 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Investor Verdict ── */}
           {r.investor_verdict && (
             <Card title="🎯 Investor Verdict" leftBorder={t.accent}>
               <View style={{ backgroundColor: t.accentBg, borderRadius: 12, padding: 16 }}>
@@ -577,7 +604,6 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Key Metrics ── */}
           {r.key_metrics?.filter((m: any) => safe(m?.current)).length > 0 && (
             <Card title="📊 Key Metrics">
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: t.border, marginBottom: 4 }}>
@@ -588,7 +614,6 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Profitability ── */}
           {pa.analysis && (
             <Card title="💹 Profitability">
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
@@ -601,7 +626,6 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Liquidity ── */}
           {lq.analysis && (
             <Card title="💧 Liquidity">
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
@@ -614,26 +638,28 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Cash Flow Quality ── */}
           {cfd.ocf_vs_pat_insight && (
             <Card title="🌊 Cash Flow Quality">
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
                 <Stat label="Operating CF" value={cfd.operating_cf} />
                 <Stat label="Free CF" value={cfd.free_cash_flow} color="#22c55e" />
                 <Stat label="Capex" value={cfd.capex} />
-                {cfd.cash_conversion_quality && (
-                  <View style={[s.stat, { backgroundColor: cfqColor(cfd.cash_conversion_quality) + '20', borderColor: t.border }]}>
-                    <Text style={{ fontSize: 14, fontWeight: '800', color: cfqColor(cfd.cash_conversion_quality) }}>{cfd.cash_conversion_quality}</Text>
+                {cfQualityLabel ? (
+                  <View style={[s.stat, { backgroundColor: cfqColor(cfQualityLabel) + '20', borderColor: t.border }]}>
+                    <Text style={{ fontSize: 14, fontWeight: '800', color: cfqColor(cfQualityLabel) }}>{cfQualityLabel}</Text>
                     <Text style={{ fontSize: 10, color: t.sub, marginTop: 4, fontWeight: '600' }}>Quality</Text>
                   </View>
-                )}
+                ) : null}
               </View>
               <Text style={{ fontSize: 14, lineHeight: 22, color: t.text }}>{cfd.ocf_vs_pat_insight}</Text>
-              {cfd.investing_cf && <Text style={{ fontSize: 13, color: t.sub, marginTop: 8 }}>Investing CF: {cfd.investing_cf} · Financing CF: {cfd.financing_cf || '—'}</Text>}
+              {safe(cfd.investing_cf) && (
+                <Text style={{ fontSize: 13, color: t.sub, marginTop: 8 }}>
+                  Investing CF: {cfd.investing_cf}{safe(cfd.financing_cf) ? ` · Financing CF: ${cfd.financing_cf}` : ''}
+                </Text>
+              )}
             </Card>
           )}
 
-          {/* ── Balance Sheet ── */}
           {bsd.debt_to_equity && (
             <Card title="🏗️ Balance Sheet Health">
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 }}>
@@ -654,7 +680,6 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Growth Quality ── */}
           {(gq.revenue_growth_context || gq.catalysts?.length || gq.headwinds?.length) && (
             <Card title="📈 Growth Quality">
               {safe(gq.revenue_growth_context) && (
@@ -684,32 +709,31 @@ export default function AnalysisScreen() {
               {gq.catalysts?.length > 0 && (
                 <>
                   <Text style={{ fontSize: 11, fontWeight: '800', color: '#22c55e', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>Catalysts</Text>
-                  {gq.catalysts.map((x: string, i: number) => <Dot key={i} text={x} color="#22c55e" />)}
+                  {gq.catalysts.map((x: any, i: number) => <Dot key={i} text={x} color="#22c55e" />)}
                 </>
               )}
               {gq.headwinds?.length > 0 && (
                 <>
                   <Text style={{ fontSize: 11, fontWeight: '800', color: '#ef4444', textTransform: 'uppercase', letterSpacing: 1, marginTop: 10, marginBottom: 8 }}>Headwinds</Text>
-                  {gq.headwinds.map((x: string, i: number) => <Dot key={i} text={x} color="#ef4444" />)}
+                  {gq.headwinds.map((x: any, i: number) => <Dot key={i} text={x} color="#ef4444" />)}
                 </>
               )}
             </Card>
           )}
 
-          {/* ── Industry Context ── */}
           {indc.competitive_position && (
             <Card title="🏭 Industry Context">
               <Text style={{ fontSize: 14, lineHeight: 22, color: t.text, marginBottom: 14 }}>{indc.competitive_position}</Text>
               {indc.sector_tailwinds?.length > 0 && (
                 <>
                   <Text style={{ fontSize: 11, fontWeight: '800', color: '#22c55e', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>Tailwinds</Text>
-                  {indc.sector_tailwinds.map((x: string, i: number) => <Dot key={i} text={x} color="#22c55e" />)}
+                  {indc.sector_tailwinds.map((x: any, i: number) => <Dot key={i} text={x} color="#22c55e" />)}
                 </>
               )}
               {indc.sector_headwinds?.length > 0 && (
                 <>
                   <Text style={{ fontSize: 11, fontWeight: '800', color: '#ef4444', textTransform: 'uppercase', letterSpacing: 1, marginTop: 10, marginBottom: 8 }}>Headwinds</Text>
-                  {indc.sector_headwinds.map((x: string, i: number) => <Dot key={i} text={x} color="#ef4444" />)}
+                  {indc.sector_headwinds.map((x: any, i: number) => <Dot key={i} text={x} color="#ef4444" />)}
                 </>
               )}
               {safe(indc.peer_benchmarks) && (
@@ -724,50 +748,43 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Strengths / Red Flags / Highlights / Risks / Watch ── */}
           {r.strengths_and_moats?.length > 0 && (
             <Card title="✅ Strengths & Moats">
-              {r.strengths_and_moats.map((h: string, i: number) => <Dot key={i} text={h} color="#22c55e" />)}
+              {r.strengths_and_moats.map((h: any, i: number) => <Dot key={i} text={h} color="#22c55e" />)}
             </Card>
           )}
-
           {r.red_flags?.length > 0 && (
             <Card title="🚩 Red Flags">
-              {r.red_flags.map((f: string, i: number) => <Dot key={i} text={f} color="#ef4444" />)}
+              {r.red_flags.map((f: any, i: number) => <Dot key={i} text={f} color="#ef4444" />)}
             </Card>
           )}
-
           {r.highlights?.length > 0 && (
             <Card title="🌟 Highlights">
-              {r.highlights.map((h: string, i: number) => <Dot key={i} text={h} color="#22c55e" />)}
+              {r.highlights.map((h: any, i: number) => <Dot key={i} text={h} color="#22c55e" />)}
             </Card>
           )}
-
           {r.risks?.length > 0 && (
             <Card title="⚠️ Key Risks">
-              {r.risks.map((x: string, i: number) => <Dot key={i} text={x} color="#ef4444" />)}
+              {r.risks.map((x: any, i: number) => <Dot key={i} text={x} color="#ef4444" />)}
             </Card>
           )}
-
           {r.key_monitorables?.length > 0 && (
             <Card title="🔭 Key Monitorables">
-              {r.key_monitorables.map((x: string, i: number) => <Dot key={i} text={x} color={t.accent} />)}
+              {r.key_monitorables.map((x: any, i: number) => <Dot key={i} text={x} color={t.accent} />)}
             </Card>
           )}
-
           {r.what_to_watch?.length > 0 && (
             <Card title="👁️ What to Watch">
-              {r.what_to_watch.map((x: string, i: number) => <Dot key={i} text={x} color={t.accent} />)}
+              {r.what_to_watch.map((x: any, i: number) => <Dot key={i} text={x} color={t.accent} />)}
             </Card>
           )}
 
-          {/* ── Investor FAQ ── */}
           {faq.length > 0 && (
             <Card title="❓ Investor FAQ">
               {faq.map((f: any, i: number) => (
                 <View key={i} style={{ marginBottom: i < faq.length - 1 ? 18 : 0 }}>
                   <Text style={{ fontSize: 13, fontWeight: '700', color: t.text, marginBottom: 5 }}>
-                    {f.question || f}
+                    {f.question || String(f)}
                   </Text>
                   {f.answer && (
                     <Text style={{ fontSize: 13, lineHeight: 21, color: t.sub }}>{f.answer}</Text>
@@ -777,12 +794,10 @@ export default function AnalysisScreen() {
             </Card>
           )}
 
-          {/* ── Save & Share ── */}
           <View style={[s.sharePanel, { backgroundColor: t.card, borderColor: t.border }]}>
             <Text style={{ fontSize: 10, fontWeight: '800', letterSpacing: 2, textTransform: 'uppercase', color: t.sub, textAlign: 'center', marginBottom: 18 }}>
               SAVE & SHARE
             </Text>
-
             <TouchableOpacity
               style={[s.pdfBtn, { backgroundColor: t.accent, opacity: downloading ? 0.7 : 1 }]}
               onPress={handleDownloadPDF}
@@ -800,7 +815,6 @@ export default function AnalysisScreen() {
                 </>
               )}
             </TouchableOpacity>
-
             <View style={{ flexDirection: 'row', gap: 10, marginBottom: 12 }}>
               <TouchableOpacity style={[s.shareBtn, { backgroundColor: '#25D366' }]} onPress={handleWhatsApp}>
                 <Text style={{ fontSize: 18, marginBottom: 3 }}>💬</Text>
@@ -815,12 +829,8 @@ export default function AnalysisScreen() {
                 <Text style={{ color: '#fff', fontSize: 11, fontWeight: '700' }}>Share</Text>
               </TouchableOpacity>
             </View>
-
             <TouchableOpacity
-              style={[s.copyBtn, {
-                borderColor: copied ? '#22c55e' : t.accent,
-                backgroundColor: copied ? '#22c55e15' : t.accentBg,
-              }]}
+              style={[s.copyBtn, { borderColor: copied ? '#22c55e' : t.accent, backgroundColor: copied ? '#22c55e15' : t.accentBg }]}
               onPress={handleCopyLink}
             >
               <Text style={{ color: copied ? '#22c55e' : t.accent, fontSize: 15, fontWeight: '700' }}>
@@ -844,7 +854,6 @@ export default function AnalysisScreen() {
   );
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   center:      { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 },
   btn:         { borderRadius: 14, padding: 16, paddingHorizontal: 32 },
