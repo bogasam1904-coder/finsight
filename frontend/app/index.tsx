@@ -64,9 +64,7 @@ export default function Landing() {
             <Text style={ls.navEmoji}>📊</Text>
             <Text style={ls.navName}>FinSight</Text>
           </View>
-          <TouchableOpacity style={ls.navSignIn} onPress={() => router.push('/login')}>
-            <Text style={ls.navSignInText}>Sign In</Text>
-          </TouchableOpacity>
+<View />
         </View>
 
         {/* Hero */}
@@ -78,9 +76,7 @@ export default function Landing() {
             <TouchableOpacity style={ls.heroCtaBtn} onPress={() => router.push('/register')}>
               <Text style={ls.heroCtaBtnText}>Start Free →</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={ls.heroGhostBtn} onPress={() => router.push('/login')}>
-              <Text style={ls.heroGhostBtnText}>Sign In</Text>
-            </TouchableOpacity>
+
           </View>
           <Text style={ls.heroNote}>No credit card · Free to use</Text>
         </Animated.View>

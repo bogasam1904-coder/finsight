@@ -61,9 +61,9 @@ export default function Login() {
     }
   };
 
-  // Goes back to landing page — the layout allows this without login
-  const continueAsGuest = () => {
-    router.replace('/');
+  const continueAsGuest = async () => {
+    await AsyncStorage.setItem('guest', 'true');
+    router.replace('/(tabs)');
   };
 
   return (

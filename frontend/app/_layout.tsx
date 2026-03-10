@@ -3,6 +3,7 @@ import { Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
 import { View, ActivityIndicator } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 function RootLayoutNav() {
   const { user, loading } = useAuth();
@@ -23,9 +24,12 @@ function RootLayoutNav() {
     }
 
     // Guest trying to access tabs → send to login
-    // (landing page and /analysis/ share links are allowed freely)
+    // UNLESS they explicitly chose "Continue without account" (guest flag set)
+    // (landing page and /analysis/ share links are always allowed freely)
     if (!user && inTabsGroup) {
-      router.replace('/(auth)/login');
+      AsyncStorage.getItem('guest').then(isGuest => {
+        if (!isGuest) router.replace('/(auth)/login');
+      });
       return;
     }
 
