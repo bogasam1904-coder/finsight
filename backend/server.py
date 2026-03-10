@@ -489,39 +489,121 @@ def _score_page_for_extraction(page_text: str) -> dict:
 
 
 def _select_financial_pages(raw_bytes: bytes) -> list:
+    """
+    Smart page selector — finds the exact quarterly/annual results table pages.
+    Priority order:
+      1. Pages with 'UNAUDITED CONSOLIDATED FINANCIAL RESULTS' headline (the primary table)
+      2. Pages with the Ratios section (Debt Equity, Current Ratio, EPS etc.)
+      3. Other high-scoring financial pages as fallback
+    Pages beyond 20 are excluded (they are almost always Notes/Annexures).
+    """
     reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
     total  = len(reader.pages)
+    scan_limit = min(total, 20)  # quarterly filings are always in first 20 pages
 
-    page_scores = []
+    # Tier-1: tight keyword-set matching — ALL keywords in a set must appear on the same page.
+    # Sets are deliberately strict (3-4 co-occurring words) so that cover pages, notes,
+    # director's reports, and auditor narratives — which may contain "financial" or "results"
+    # individually — are NOT falsely promoted to Tier-1.
+    # The key insight: the actual results TABLE page always has BOTH a period header
+    # ("quarter ended" / "nine months" / "year ended") AND financial line items
+    # ("revenue from operations" / "profit before tax" / "profit after tax").
+    # A cover page or notes page never has all of these together.
+    HEADLINE_KEYWORD_SETS = [
+        # Most common: quarterly/half-year/annual results table
+        # "quarter ended" OR "nine months" OR "year ended" + "revenue" + "profit"
+        {"quarter ended", "revenue from operations", "profit"},
+        {"quarter ended", "profit before tax", "profit after tax"},
+        {"nine months", "revenue from operations", "profit"},
+        {"nine months", "profit before tax", "profit after tax"},
+        {"year ended", "revenue from operations", "profit before tax"},
+        {"half year", "revenue from operations", "profit"},
+        # Annual report P&L / Income Statement pages
+        {"statement of profit", "revenue from operations", "profit before tax"},
+        {"profit and loss", "revenue from operations", "profit before tax"},
+        {"income statement", "revenue", "profit before tax"},
+        # Fallback: any page that has the period header + both profit line items
+        {"profit before tax", "profit after tax", "quarter"},
+        {"profit before tax", "profit after tax", "year ended"},
+    ]
+    # Tier-2: ratios / EPS / balance sheet continuation pages
+    RATIOS_PATTERNS = [
+        "earnings per equity share",
+        "debt service coverage ratio",
+        "debt equity ratio",
+        "net worth (including",
+        "earnings per share",
+        "basic (in",
+    ]
+
+    tier1_pages = set()   # primary financial results table
+    tier2_pages = set()   # ratios / EPS / balance sheet
     has_consolidated = False
 
-    for i, page in enumerate(reader.pages):
-        t = (page.extract_text() or "")
+    page_texts = {}
+    for i in range(scan_limit):
+        t = (reader.pages[i].extract_text() or "")
+        page_texts[i] = t
+        tl = t.lower()
+
         score_info = _score_page_for_extraction(t)
-        page_scores.append((i, score_info))
-        if score_info["consol_hits"] > 0 and not score_info["is_auditor_narrative"]:
+        if score_info["is_auditor_narrative"]:
+            logger.info(f"Page {i+1}: EXCLUDED (auditor narrative)")
+            continue
+
+        # Check for consolidated marker
+        if score_info["consol_hits"] > 0:
             has_consolidated = True
 
-    selected = set()
-
-    for i, info in page_scores:
-        if info["is_auditor_narrative"]:
-            logger.info(f"Page {i+1}: EXCLUDED (auditor narrative, poison_hits={info['poison_hits']})")
+        # Tier-1 check: tight keyword-set match AND confirmed financial table data.
+        # Requiring table_hits >= 2 ensures a narrative page that happens to contain
+        # "quarter ended" and "profit" in prose text does NOT get falsely selected —
+        # the actual results table page will always score much higher on table_hits.
+        is_headline = any(all(kw in tl for kw in kw_set) for kw_set in HEADLINE_KEYWORD_SETS)
+        has_table   = score_info["table_hits"] >= 2
+        not_narrative = not score_info["is_auditor_narrative"]
+        if is_headline and has_table and not_narrative:
+            tier1_pages.add(i)
+            logger.info(f"Page {i+1}: TIER-1 primary results table")
             continue
 
-        if has_consolidated and info["standalone_hits"] > 0 and info["consol_hits"] == 0:
-            logger.info(f"Page {i+1}: EXCLUDED (standalone, consolidated exists)")
+        # Tier-2 check: ratios / EPS continuation page
+        is_ratios = any(p in tl for p in RATIOS_PATTERNS)
+        if is_ratios and score_info["table_hits"] >= 1:
+            tier2_pages.add(i)
+            logger.info(f"Page {i+1}: TIER-2 ratios/EPS page")
             continue
 
-        if info["net_score"] >= 3 or (info["table_hits"] >= 3 and not info["is_auditor_narrative"]):
-            selected.add(i)
-            logger.info(f"Page {i+1}: SELECTED (net_score={info['net_score']}, table_hits={info['table_hits']}, consol={info['consol_hits']})")
+        # General scoring fallback
+        if score_info["net_score"] >= 3 or score_info["table_hits"] >= 3:
+            tier2_pages.add(i)
+            logger.info(f"Page {i+1}: TIER-2 fallback (net_score={score_info['net_score']})")
 
-    if total > 20:
-        selected = {i for i in selected if i < 20}
+    # If consolidated pages exist, drop standalone-only pages from tier2
+    if has_consolidated:
+        tier2_pages = {
+            i for i in tier2_pages
+            if not (_score_page_for_extraction(page_texts[i])["standalone_hits"] > 0
+                    and _score_page_for_extraction(page_texts[i])["consol_hits"] == 0)
+        }
 
-    result = sorted(selected)
-    logger.info(f"PDF: {total} pages, consolidated={has_consolidated}, selected: {[p+1 for p in result]}")
+    # Build final list: tier1 first, then tier2 (avoid duplicates)
+    if tier1_pages:
+        # Include tier1 + adjacent page (ratios often on next page)
+        extended = set(tier1_pages)
+        for p in list(tier1_pages):
+            if p + 1 < scan_limit:
+                extended.add(p + 1)
+        result = sorted(extended | tier2_pages)
+    else:
+        # No clear headline found — use general scoring
+        result = sorted(tier2_pages)
+        if not result:
+            result = list(range(min(8, scan_limit)))
+            logger.warning("No financial pages found — falling back to first 8 pages")
+
+    logger.info(f"PDF: {total} pages, consolidated={has_consolidated}, "
+                f"tier1={sorted(tier1_pages)}, selected={[p+1 for p in result]}")
     return result
 
 
@@ -1140,7 +1222,9 @@ def _build_verified_block(extracted: dict) -> str:
     if company:
         lines.append(f"COMPANY: {company}")
     if period:
-        lines.append(f"CURRENT PERIOD: {period}   COMPARISON PERIOD: {prior}")
+        lines.append(f"⚠️  CURRENT PERIOD (USE THIS COLUMN ONLY): {period}")
+        lines.append(f"    COMPARISON PERIOD (YoY reference only): {prior}")
+        lines.append(f"    ⚠️  ALL FIGURES BELOW ARE FOR {period} — NOT nine-months, NOT full-year")
     lines.append(f"CURRENCY: All values in {currency}")
     lines.append(f"FILING TYPE: {extracted.get('filing_type', 'Quarterly')}")
     lines.append("")
@@ -1742,6 +1826,15 @@ These numbers were deterministically extracted from the filing tables with sourc
 TREAT THEM AS ABSOLUTE GROUND TRUTH. Do not override them with numbers from the document text.
 
 ━━━ DOCUMENT RULES ━━━
+RULE 0 — COLUMN DISCIPLINE (READ THIS FIRST — MOST CRITICAL):
+Indian quarterly results tables have multiple date columns. Example layout:
+  Particulars | 31st Dec 25 | 30th Sep 25 | 31st Dec 24 | 9M Dec 25 | Year Mar 25
+YOU MUST USE ONLY THE FIRST DATA COLUMN (= latest/current quarter) for current-period figures.
+DO NOT use nine-months totals (e.g. ₹74,994 Cr) when the quarterly figure is ₹22,167 Cr.
+DO NOT use the year-ended column as the current result.
+The VERIFIED DATA BLOCK "CURRENT PERIOD" label is the single source of truth for which column.
+If you cite a PAT figure 3-4x larger than one quarter's reasonable result, you used the wrong column.
+
 RULE 1 — AUDITOR TRAP: Text like "subsidiaries reflect revenues of Rs. X crore" = audit scope note.
 These are NOT consolidated results. Only use numbers from the P&L table rows.
 
@@ -1759,6 +1852,7 @@ RULE 4 — CASH FLOW:
 RULE 5 — HALLUCINATION BAN (CRITICAL):
 If a number is NOT explicitly in the document or verified block → write "Not available in this filing".
 NEVER invent, estimate, or calculate values not shown. One wrong number destroys user trust.
+NEVER confuse nine-months ended figures with single-quarter figures. Check: Q3 PAT for Reliance should be ~₹22,000 Cr, not ₹75,000 Cr (that is 9M).
 
 RULE 6 — SPECIFICITY (MOST IMPORTANT FOR QUALITY):
 Every analysis field MUST cite actual numbers. Vague commentary is waste.
