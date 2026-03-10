@@ -4,6 +4,7 @@ import { StatusBar } from 'expo-status-bar';
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
 import { View, ActivityIndicator } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Analytics } from '@vercel/analytics/react';
 
 function RootLayoutNav() {
   const { user, loading } = useAuth();
@@ -55,6 +56,7 @@ export default function RootLayout() {
   return (
     <AuthProvider>
       <StatusBar style="light" />
+      <Analytics />
       <RootLayoutNav />
     </AuthProvider>
   );

@@ -12,6 +12,7 @@
     "@expo/metro-runtime": "~6.1.2",
     "@expo/vector-icons": "^15.0.3",
     "@react-native-async-storage/async-storage": "2.2.0",
+    "@vercel/analytics": "^1.6.1",
     "expo": "~54.0.33",
     "expo-document-picker": "~14.0.8",
     "expo-image-picker": "~17.0.10",
