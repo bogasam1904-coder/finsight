@@ -1,10 +1,8 @@
-// COMPLETE FILE - app/(auth)/login.tsx
-// FIXES: Issue #1 (Guest mode)
-
+// app/(auth)/login.tsx
 import React, { useState, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
-  ActivityIndicator, KeyboardAvoidingView, Platform, Animated, StatusBar, ScrollView, Alert
+  ActivityIndicator, KeyboardAvoidingView, Platform, Animated, StatusBar, Alert
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -39,62 +37,33 @@ export default function Login() {
       shake();
       return;
     }
-    
     setLoading(true);
     setError('');
-    
     try {
       const res = await fetch(`${BACKEND}/api/auth/login`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ email: trimEmail, password }),
       });
-      
       let data: any;
       const text = await res.text();
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error(`Server error (${res.status}): ${text.substring(0, 100)}`);
-      }
-      
-      if (!res.ok) {
-        throw new Error(data.detail || data.message || `Login failed (${res.status})`);
-      }
-      
-      if (!data.token) {
-        throw new Error('No token received from server');
-      }
-      
+      try { data = JSON.parse(text); } catch { throw new Error(`Server error (${res.status})`); }
+      if (!res.ok) throw new Error(data.detail || data.message || `Login failed (${res.status})`);
+      if (!data.token) throw new Error('No token received from server');
       await AsyncStorage.setItem('token', data.token);
-      await AsyncStorage.setItem('user', JSON.stringify({
-        name: data.name,
-        email: data.email,
-        user_id: data.user_id
-      }));
-      
+      await AsyncStorage.setItem('user', JSON.stringify({ name: data.name, email: data.email, user_id: data.user_id }));
       router.replace('/(tabs)');
-      
     } catch (e: any) {
-      const msg = e.message || 'Sign in failed. Please try again.';
-      setError(msg);
+      setError(e.message || 'Sign in failed. Please try again.');
       shake();
     } finally {
       setLoading(false);
     }
   };
 
-  // ✅ FIX #1: Guest mode - clear old data and navigate
-  const continueAsGuest = async () => {
-    try {
-      await AsyncStorage.multiRemove(['token', 'user']);
-      router.replace('/(tabs)');
-    } catch (error) {
-      router.replace('/(tabs)');
-    }
+  // Goes back to landing page — the layout allows this without login
+  const continueAsGuest = () => {
+    router.replace('/');
   };
 
   return (
@@ -104,14 +73,14 @@ export default function Login() {
         <View style={[s.blob, { width: 380, height: 380, backgroundColor: 'rgba(79,138,255,0.11)', top: -130, right: -110 }]} />
         <View style={[s.blob, { width: 260, height: 260, backgroundColor: 'rgba(34,197,94,0.07)', bottom: -60, left: -80 }]} />
       </View>
-      
+
       <Animated.ScrollView
         contentContainerStyle={s.scroll}
         keyboardShouldPersistTaps="handled"
         style={{ opacity: fadeAnim }}
         showsVerticalScrollIndicator={false}
       >
-        <TouchableOpacity style={s.back} onPress={() => router.canGoBack() ? router.back() : router.replace('/')}>
+        <TouchableOpacity style={s.back} onPress={() => router.replace('/')}>
           <Text style={s.backText}>← Back</Text>
         </TouchableOpacity>
 
@@ -184,9 +153,7 @@ export default function Login() {
           </View>
 
           <TouchableOpacity onPress={() => router.push('/register')} style={{ alignItems: 'center' }}>
-            <Text style={s.switchText}>
-              No account? <Text style={s.switchLink}>Create one free</Text>
-            </Text>
+            <Text style={s.switchText}>No account? <Text style={s.switchLink}>Create one free</Text></Text>
           </TouchableOpacity>
         </Animated.View>
       </Animated.ScrollView>

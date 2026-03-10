@@ -1,4 +1,4 @@
-﻿import { useEffect } from 'react';
+import { useEffect } from 'react';
 import { Stack, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
@@ -11,19 +11,35 @@ function RootLayoutNav() {
 
   useEffect(() => {
     if (loading) return;
+
     const inAuthGroup = segments[0] === '(auth)';
-    if (!user && !inAuthGroup) router.replace('/(auth)/login');
-    else if (user && inAuthGroup) router.replace('/(tabs)');
+    const inTabsGroup = segments[0] === '(tabs)';
+    const onLanding   = segments.length === 0;
+
+    // Logged-in user on auth screen → go straight to app
+    if (user && inAuthGroup) {
+      router.replace('/(tabs)');
+      return;
+    }
+
+    // Guest trying to access tabs → send to login
+    // (landing page and /analysis/ share links are allowed freely)
+    if (!user && inTabsGroup) {
+      router.replace('/(auth)/login');
+      return;
+    }
+
   }, [user, loading, segments]);
 
   if (loading) return (
-    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff' }}>
-      <ActivityIndicator size="large" color="#0052FF" />
+    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#060B18' }}>
+      <ActivityIndicator size="large" color="#4F8AFF" />
     </View>
   );
 
   return (
     <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="index" />
       <Stack.Screen name="(auth)" />
       <Stack.Screen name="(tabs)" />
       <Stack.Screen name="analysis/[id]" options={{ presentation: 'card' }} />
@@ -34,7 +50,7 @@ function RootLayoutNav() {
 export default function RootLayout() {
   return (
     <AuthProvider>
-      <StatusBar style="dark" />
+      <StatusBar style="light" />
       <RootLayoutNav />
     </AuthProvider>
   );
