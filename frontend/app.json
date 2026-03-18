@@ -26,10 +26,16 @@
     "web": {
       "bundler": "metro",
       "output": "static",
-      "favicon": "./assets/images/favicon.png"
+      "favicon": "./assets/images/favicon.png",
+      "name": "Finsight – AI-Powered Financial SEO Analytics",
+      "shortName": "Finsight",
+      "description": "Discover data-driven SEO insights, keyword analysis, and performance dashboards with Finsight. Boost rankings with actionable AI-powered recommendations.",
+      "lang": "en",
+      "themeColor": "#0052FF",
+      "backgroundColor": "#030B1A"
     },
     "plugins": [
-      "expo-router",
+      "expo-router"
     ],
     "experiments": {
       "typedRoutes": true
